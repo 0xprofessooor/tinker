@@ -399,7 +399,7 @@ if __name__ == "__main__":
 
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
-        project="RL Bench",
+        project="Tinker",
         tags=["PPO", config["ENV_NAME"].upper(), f"jax_{jax.__version__}"],
         name=f'purejaxrl_ppo_{config["ENV_NAME"]}',
         config=config,
