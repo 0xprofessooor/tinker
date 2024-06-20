@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "tinker"
+version = "0.1.0"
+description = "Implementations of reinforcement learning algorithms"
+authors = ["Rohan Tangri <rohan.tangri@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+jax = "^0.4.30"
+flax = "^0.8.4"
+chex = "^0.1.86"
+gymnax = "^0.0.8"
+optax = "^0.2.2"
+wandb = "^0.17.2"
+flashbax = "^0.1.2"
+distrax = "^0.1.5"
+
+
+[tool.poetry.group.dev.dependencies]
+black = "^24.4.2"
+isort = "^5.13.2"
+pre-commit = "^3.7.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
