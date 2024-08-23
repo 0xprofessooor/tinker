@@ -21,6 +21,7 @@ distrax = "^0.1.5"
 black = "^24.4.2"
 isort = "^5.13.2"
 pre-commit = "^3.7.1"
+ipykernel = "^6.29.5"
 
 [build-system]
 requires = ["poetry-core"]
