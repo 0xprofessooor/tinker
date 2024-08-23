@@ -25,12 +25,12 @@ class WorldModel(nn.Module):
     unimix: float = 0.01
 
     def setup(self) -> None:
-        self.rnn = nn.recurrent.GRUCell(self.hidden_size)
-        self.encoder = [nn.Dense(self.encoder_size) for _ in range(self.encoder_layers)]
+        self.sequence_model = nn.recurrent.GRUCell(self.hidden_size)
+        self.encoder = nn.Dense(self.stoch_size * self.one_hot_size)
+        self.dynamics_model = nn.Dense(self.stoch_size * self.one_hot_size)
         self.decoder = [
             nn.Dense(self.decoder_size) for _ in range(self.decoder_layers)
         ] + [nn.Dense(self.obs_size)]
-        self.representation = nn.Dense(self.stoch_size * self.one_hot_size)
         self.reward_model = nn.Dense(1)
         self.continue_model = nn.Dense(1)
 
@@ -41,6 +41,52 @@ class WorldModel(nn.Module):
             probs = (1 - self.unimix) * probs + self.unimix * uniform
             stoch_logits = scipy.special.logit(probs)
         return stoch_logits
+
+    def forward_sequence(
+        self, h: jnp.ndarray, z: jnp.ndarray, action: jnp.ndarray
+    ) -> jnp.ndarray:
+        """Calculate the deterministic part of the latent state."""
+        h, _ = self.sequence_model(
+            inputs=jnp.concatenate([z, action], axis=-1), carry=h
+        )
+        return h
+
+    def forward_encoder(
+        self, h: jnp.ndarray, obs: jnp.ndarray, rng: chex.PRNGKey
+    ) -> jnp.ndarray:
+        """Calculate the stochastic part of the latent state with the observation."""
+        stoch_logits = self.encoder(jnp.concatenate([h, obs], axis=-1)).reshape(
+            (-1, self.stoch_size, self.one_hot_size)
+        )
+        stoch_logits = self._uniform_mix(stoch_logits)
+        stoch_latent_values = jax.random.categorical(rng, stoch_logits, axis=-1)
+        z = nn.one_hot(stoch_latent_values, self.one_hot_size)
+        return z
+
+    def forward_dynamics(self, h: jnp.ndarray, rng: chex.PRNGKey) -> jnp.ndarray:
+        """Calculate the stochastic part of the latent state without the observation."""
+        stoch_logits = self.dynamics_model(h).reshape(
+            (-1, self.stoch_size, self.one_hot_size)
+        )
+        stoch_logits = self._uniform_mix(stoch_logits)
+        stoch_latent_values = jax.random.categorical(rng, stoch_logits, axis=-1)
+        z = nn.one_hot(stoch_latent_values, self.one_hot_size)
+        return z
+
+    def forward_reward(self, latent_state: jnp.ndarray) -> jnp.ndarray:
+        """Predict the reward from the latent state."""
+        return self.reward_model(latent_state)
+
+    def forward_continue(self, latent_state: jnp.ndarray) -> jnp.ndarray:
+        """Predict the continue signal from the latent state."""
+        return self.continue_model(latent_state)
+
+    def forward_decoder(self, latent_state: jnp.ndarray) -> jnp.ndarray:
+        """Predict the observation from the latent state."""
+        obs_pred = latent_state
+        for layer in self.decoder:
+            obs_pred = layer(obs_pred)
+        return obs_pred
 
     def __call__(
         self,
@@ -53,30 +99,16 @@ class WorldModel(nn.Module):
         h = latent_state[:, : self.hidden_size]
         z = latent_state[:, self.hidden_size :]
 
-        # Encode the observation
-        encoded_obs = obs
-        for layer in self.encoder:
-            encoded_obs = layer(encoded_obs)
-
-        # Get the deterministic latent state h
-        h, out = self.rnn(inputs=jnp.concatenate([z, action], axis=-1), carry=h)
-
-        # Get the discrete stochastic latent state z
-        stoch_logits = self.representation(
-            jnp.concatenate([h, encoded_obs], axis=-1)
-        ).reshape((-1, self.stoch_size, self.one_hot_size))
-        stoch_logits = self._uniform_mix(stoch_logits)
-        stoch_latent_values = jax.random.categorical(rng, stoch_logits, axis=-1)
-        z = nn.one_hot(stoch_latent_values, self.one_hot_size)
-
+        # Get latent state
+        h = self.forward_sequence(h, z, action)
+        z = self.forward_encoder(h, obs, rng)
         z = z.reshape(-1, self.one_hot_size * self.stoch_size)
         next_latent_state = jnp.concatenate([h, z], axis=-1)
 
-        obs_pred = next_latent_state
-        for layer in self.decoder:
-            obs_pred = layer(obs_pred)
-        reward_pred = self.reward_model(next_latent_state)
-        continue_pred = self.continue_model(next_latent_state)
+        # Predict next observation, reward, and continue
+        obs_pred = self.forward_decoder(next_latent_state)
+        reward_pred = self.forward_reward(next_latent_state)
+        continue_pred = self.forward_continue(next_latent_state)
 
         return obs_pred, reward_pred, continue_pred, next_latent_state
 
