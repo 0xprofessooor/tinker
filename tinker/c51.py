@@ -9,7 +9,6 @@ import flax
 import jax
 import numpy as np
 import optax
-import wandb
 from flashbax.buffers.trajectory_buffer import BufferState
 from flax import linen as nn
 from flax.training.train_state import TrainState
@@ -17,6 +16,8 @@ from gymnax import EnvState
 from gymnax.environments.environment import Environment
 from gymnax.wrappers import LogWrapper
 from jax import numpy as jnp
+
+import wandb
 
 
 class ZNetwork(nn.Module):

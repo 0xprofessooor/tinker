@@ -11,11 +11,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import wandb
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from gymnax.environments.environment import Environment
 from gymnax.wrappers import LogWrapper
+
+import wandb
 
 
 class ActorCritic(nn.Module):
