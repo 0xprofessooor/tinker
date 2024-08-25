@@ -11,106 +11,140 @@ from jax import numpy as jnp
 from jax import scipy
 
 
+@jax.jit
+def symlog(x: jnp.ndarray) -> jnp.ndarray:
+    """Symmetric log transform."""
+    return jnp.sign(x) * jnp.log1p(jnp.abs(x))
+
+
+@jax.jit
+def symexp(x: jnp.ndarray) -> jnp.ndarray:
+    """Symmetric exponential transform."""
+    return jnp.sign(x) * jnp.expm1(jnp.abs(x))
+
+
+@jax.jit
+def _uniform_mix(logits: jnp.ndarray, mix_coeff: float = 0.01) -> jnp.ndarray:
+    probs = nn.softmax(logits, axis=-1)
+    uniform = jnp.ones_like(probs) / logits.shape[-1]
+    probs = (1 - mix_coeff) * probs + mix_coeff * uniform
+    logits = scipy.special.logit(probs)
+    return logits
+
+
+@jax.jit
+def _one_hot_state(logits: jnp.ndarray, rng: chex.PRNGKey) -> jnp.ndarray:
+    stoch_latent_values = jax.random.categorical(rng, logits, axis=-1)
+    z = nn.one_hot(stoch_latent_values, logits.shape[-1])
+    return z
+
+
 class WorldModel(nn.Module):
     """Learn latent state representation"""
 
     obs_size: int
-    hidden_size: int = 512
-    encoder_size: int = 512
-    encoder_layers: int = 4
-    decoder_size: int = 512
-    decoder_layers: int = 4
+    recurrent_size: int = 256
     stoch_size: int = 32
     one_hot_size: int = 32
-    unimix: float = 0.01
+    mlp_layers: int = 1
+    mlp_size: int = 256
 
     def setup(self) -> None:
-        self.sequence_model = nn.recurrent.GRUCell(self.hidden_size)
-        self.encoder = nn.Dense(self.stoch_size * self.one_hot_size)
-        self.dynamics_model = nn.Dense(self.stoch_size * self.one_hot_size)
-        self.decoder = [
-            nn.Dense(self.decoder_size) for _ in range(self.decoder_layers)
-        ] + [nn.Dense(self.obs_size)]
-        self.reward_model = nn.Dense(1)
-        self.continue_model = nn.Dense(1)
-
-    def _uniform_mix(self, stoch_logits: jnp.ndarray) -> jnp.ndarray:
-        if self.unimix > 0:
-            probs = nn.softmax(stoch_logits, axis=-1)
-            uniform = jnp.ones_like(probs) / self.one_hot_size
-            probs = (1 - self.unimix) * probs + self.unimix * uniform
-            stoch_logits = scipy.special.logit(probs)
-        return stoch_logits
+        self.sequence_model = nn.recurrent.GRUCell(self.recurrent_size)
+        self.encoder = [nn.Dense(self.mlp_size) for _ in range(self.mlp_layers)] + [
+            nn.Dense(self.stoch_size * self.one_hot_size)
+        ]
+        self.dynamics_model = [
+            nn.Dense(self.mlp_size) for _ in range(self.mlp_layers)
+        ] + [nn.Dense(self.stoch_size * self.one_hot_size)]
+        self.decoder = [nn.Dense(self.mlp_size) for _ in range(self.mlp_layers)] + [
+            nn.Dense(self.obs_size)
+        ]
+        self.reward_model = [
+            nn.Dense(self.mlp_size) for _ in range(self.mlp_layers)
+        ] + [nn.Dense(1)]
+        self.continue_model = [
+            nn.Dense(self.mlp_size) for _ in range(self.mlp_layers)
+        ] + [nn.Dense(1)]
 
     def forward_sequence(
         self, h: jnp.ndarray, z: jnp.ndarray, action: jnp.ndarray
     ) -> jnp.ndarray:
         """Calculate the deterministic part of the latent state."""
-        h, _ = self.sequence_model(
-            inputs=jnp.concatenate([z, action], axis=-1), carry=h
+        x = jnp.concatenate(
+            [z.reshape(-1, self.one_hot_size * self.stoch_size), action], axis=-1
         )
+        h, _ = self.sequence_model(inputs=x, carry=h)
+        h = nn.silu(h)
         return h
 
-    def forward_encoder(
-        self, h: jnp.ndarray, obs: jnp.ndarray, rng: chex.PRNGKey
-    ) -> jnp.ndarray:
+    def forward_encoder(self, h: jnp.ndarray, obs: jnp.ndarray) -> jnp.ndarray:
         """Calculate the stochastic part of the latent state with the observation."""
-        stoch_logits = self.encoder(jnp.concatenate([h, obs], axis=-1)).reshape(
-            (-1, self.stoch_size, self.one_hot_size)
-        )
-        stoch_logits = self._uniform_mix(stoch_logits)
-        stoch_latent_values = jax.random.categorical(rng, stoch_logits, axis=-1)
-        z = nn.one_hot(stoch_latent_values, self.one_hot_size)
-        return z
+        x = jnp.concatenate([h, obs], axis=-1)
+        for layer in self.encoder:
+            x = layer(x)
+            x = nn.silu(x)
+        stoch_logits = x.reshape((-1, self.stoch_size, self.one_hot_size))
+        return stoch_logits
 
-    def forward_dynamics(self, h: jnp.ndarray, rng: chex.PRNGKey) -> jnp.ndarray:
+    def forward_dynamics(self, h: jnp.ndarray) -> jnp.ndarray:
         """Calculate the stochastic part of the latent state without the observation."""
-        stoch_logits = self.dynamics_model(h).reshape(
-            (-1, self.stoch_size, self.one_hot_size)
-        )
-        stoch_logits = self._uniform_mix(stoch_logits)
-        stoch_latent_values = jax.random.categorical(rng, stoch_logits, axis=-1)
-        z = nn.one_hot(stoch_latent_values, self.one_hot_size)
-        return z
+        x = h
+        for layer in self.dynamics_model:
+            x = layer(x)
+            x = nn.silu(x)
+        stoch_logits = x.reshape((-1, self.stoch_size, self.one_hot_size))
+        return stoch_logits
 
-    def forward_reward(self, latent_state: jnp.ndarray) -> jnp.ndarray:
+    def forward_reward(self, h: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
         """Predict the reward from the latent state."""
-        return self.reward_model(latent_state)
+        x = jnp.concatenate(
+            [h, z.reshape(-1, self.one_hot_size * self.stoch_size)], axis=-1
+        )
+        for layer in self.reward_model:
+            x = layer(x)
+            x = nn.silu(x)
+        return x
 
-    def forward_continue(self, latent_state: jnp.ndarray) -> jnp.ndarray:
+    def forward_continue(self, h: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
         """Predict the continue signal from the latent state."""
-        return self.continue_model(latent_state)
+        x = jnp.concatenate(
+            [h, z.reshape(-1, self.one_hot_size * self.stoch_size)], axis=-1
+        )
+        for layer in self.continue_model:
+            x = layer(x)
+            x = nn.silu(x)
+        return x
 
-    def forward_decoder(self, latent_state: jnp.ndarray) -> jnp.ndarray:
+    def forward_decoder(self, h: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
         """Predict the observation from the latent state."""
-        obs_pred = latent_state
+        x = jnp.concatenate(
+            [h, z.reshape(-1, self.one_hot_size * self.stoch_size)], axis=-1
+        )
         for layer in self.decoder:
-            obs_pred = layer(obs_pred)
-        return obs_pred
+            x = layer(x)
+            x = nn.silu(x)
+        return x
 
     def __call__(
         self,
         obs: jnp.ndarray,
         action: jnp.ndarray,
-        latent_state: jnp.ndarray,
-        rng: chex.PRNGKey,
+        h: jnp.ndarray,
+        z: jnp.ndarray,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """Predict the next latent state and reward."""
-        h = latent_state[:, : self.hidden_size]
-        z = latent_state[:, self.hidden_size :]
+        """Dummy method only required for parameter initialization."""
 
         # Get latent state
         h = self.forward_sequence(h, z, action)
-        z = self.forward_encoder(h, obs, rng)
-        z = z.reshape(-1, self.one_hot_size * self.stoch_size)
-        next_latent_state = jnp.concatenate([h, z], axis=-1)
+        z = self.forward_encoder(h, obs)
 
         # Predict next observation, reward, and continue
-        obs_pred = self.forward_decoder(next_latent_state)
-        reward_pred = self.forward_reward(next_latent_state)
-        continue_pred = self.forward_continue(next_latent_state)
+        obs_pred = self.forward_decoder(h, z)
+        reward_pred = self.forward_reward(h, z)
+        continue_pred = self.forward_continue(h, z)
 
-        return obs_pred, reward_pred, continue_pred, next_latent_state
+        return obs_pred, reward_pred, continue_pred, h, z
 
 
 class ActorCriticDiscrete(nn.Module):
@@ -167,34 +201,16 @@ class ActorCriticDiscrete(nn.Module):
         return pi, jnp.squeeze(critic, axis=-1)
 
 
-@jax.jit
-def symlog(x: jnp.ndarray) -> jnp.ndarray:
-    """Symmetric log transform."""
-    return jnp.sign(x) * jnp.log1p(jnp.abs(x))
-
-
-@jax.jit
-def symexp(x: jnp.ndarray) -> jnp.ndarray:
-    """Symmetric exponential transform."""
-    return jnp.sign(x) * jnp.expm1(jnp.abs(x))
-
-
 def make_train(
     env: Environment,
     num_steps: int,
-    num_envs: int,
-    train_freq: int,
-    num_minibatches: int,
-    num_epochs: int,
-    activation: str,
-    lr: float,
-    anneal_lr: bool,
-    gamma: float,
-    gae_lambda: float,
-    entropy_coef: float,
-    value_coef: float,
-    max_grad_norm: float,
-    clip_eps: float,
-    log_wandb: bool = False,
 ):
     """Generate a jittable JAX DreamerV3 train function."""
+
+    def train(rng: chex.PRNGKey):
+        # Initialize networks
+        world_model = WorldModel(env.observation_space().shape[0])
+        actor_critic = ActorCriticDiscrete(env.action_space().n)
+        params_rng, forward_rng = jax.random.split(rng)
+
+    return train
