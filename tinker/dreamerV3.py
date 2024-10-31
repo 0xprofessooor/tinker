@@ -224,7 +224,6 @@ def make_train(
     lr: float,
     world_model_update_freq: int,
     uniform_mix_coeff: float = 0.01,
-    log_wandb: bool = False,
     log_freq: int = 100,
 ):
     """Generate a jittable JAX DreamerV3 train function."""
@@ -380,13 +379,8 @@ def make_train(
                 "episode_lengths": info["returned_episode_lengths"],
             }
 
-            if log_wandb:
-
-                def callback(metrics):
-                    if metrics["timesteps"] % log_freq == 0:
-                        wandb.log(metrics)
-
-                jax.debug.callback(callback, metrics)
+            if log_freq > 0 and metrics["timesteps"] % log_freq == 0:
+                jax.debug.callback(wandb.log, metrics)
 
             runner_state = (
                 env_state,
