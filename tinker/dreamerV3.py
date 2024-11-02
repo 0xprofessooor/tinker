@@ -261,12 +261,12 @@ def make_train(
         actor_critic = ActorCriticDiscrete(env.action_space().n, **actor_critic_config)
         world_model_params = world_model.init(
             world_model_rng,
-            dummy_obs[None],
-            dummy_action[None],
-            h[None],
-            z[None],  # add batch dimension
+            dummy_obs,
+            dummy_action,
+            h,
+            z,
         )
-        actor_critic_params = actor_critic.init(actor_critic_rng, latent_state[None])
+        actor_critic_params = actor_critic.init(actor_critic_rng, latent_state)
 
         # INIT OPTIMIZER
         tx_world_model = optax.adam(learning_rate=lr_world_model)
