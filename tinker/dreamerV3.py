@@ -273,6 +273,7 @@ def make_train(
         tx_actor_critic = optax.adam(learning_rate=lr_actor_critic)
 
         # INIT BUFFER
+        # shape = (add_batch_size, time, element_dim)
         buffer = fbx.make_trajectory_buffer(
             add_batch_size=1,
             sample_batch_size=batch_size,
@@ -368,11 +369,11 @@ def make_train(
 
             # ADD TO BUFFER
             transition = Transition(
-                obs=obs[None],
-                action=action[None],
-                reward=reward[None][None],
-                next_obs=next_obs[None],
-                done=done[None][None],
+                obs=obs[None][None],  # (1, 1, obs_dim)
+                action=action[None][None],  # (1, 1, action_dim)
+                reward=reward[None][None],  # (1, 1)
+                next_obs=next_obs[None][None],  # (1, 1, obs_dim)
+                done=done[None][None],  # (1, 1)
             )
             buffer_state = buffer.add(buffer_state, transition)
 
