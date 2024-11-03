@@ -379,7 +379,7 @@ def make_train(
 
             # UPDATE WORLD MODEL
             is_world_model_update_step = (buffer.can_sample(buffer_state)) & (
-                world_model_state.step % world_model_update_freq == 0
+                env_step % world_model_update_freq == 0
             )
 
             world_model_state, total_world_loss, pred_loss, dyn_loss, rep_loss = (
