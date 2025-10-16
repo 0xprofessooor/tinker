@@ -1,6 +1,5 @@
 """DreamerV3 Model-Based Deep Reinforcement Learning Algorithm."""
 
-import os
 from typing import Sequence, Tuple
 
 import chex
@@ -438,7 +437,9 @@ def make_train(
             world_model_state, total_world_loss, pred_loss, dyn_loss, rep_loss = (
                 jax.lax.cond(
                     is_world_model_update_step,
-                    lambda world_model_state, buffer_state, world_model_update_rng: update_world_model(
+                    lambda world_model_state,
+                    buffer_state,
+                    world_model_update_rng: update_world_model(
                         world_model_state, buffer_state, world_model_update_rng
                     ),
                     lambda world_model_state, buffer_state, world_model_update_rng: (

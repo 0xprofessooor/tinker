@@ -1,5 +1,3 @@
-import os
-
 import chex
 import flashbax as fbx
 import flax
@@ -42,7 +40,6 @@ class CustomTrainState(TrainState):
 
 
 def make_train(config):
-
     config["NUM_UPDATES"] = config["TOTAL_TIMESTEPS"] // config["NUM_ENVS"]
 
     basic_env, env_params = gymnax.make(config["ENV_NAME"])
@@ -57,7 +54,6 @@ def make_train(config):
     )(jax.random.split(rng, n_envs), env_state, action, env_params)
 
     def train(rng):
-
         # INIT ENV
         rng, _rng = jax.random.split(rng)
         init_obs, env_state = vmap_reset(config["NUM_ENVS"])(_rng)
@@ -132,7 +128,6 @@ def make_train(config):
 
         # TRAINING LOOP
         def _update_step(runner_state, unused):
-
             train_state, buffer_state, env_state, last_obs, rng = runner_state
 
             # STEP THE ENV
@@ -154,7 +149,6 @@ def make_train(config):
 
             # NETWORKS UPDATE
             def _learn_phase(train_state, rng):
-
                 learn_batch = buffer.sample(buffer_state, rng).experience
 
                 q_next_target = network.apply(
@@ -247,7 +241,6 @@ def make_train(config):
 
 
 def main():
-
     config = {
         "NUM_ENVS": 10,
         "BUFFER_SIZE": 10000,
@@ -275,7 +268,7 @@ def main():
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["DQN", config["ENV_NAME"].upper(), f"jax_{jax.__version__}"],
-        name=f'purejaxrl_dqn_{config["ENV_NAME"]}',
+        name=f"purejaxrl_dqn_{config['ENV_NAME']}",
         config=config,
         mode=config["WANDB_MODE"],
     )
@@ -283,7 +276,7 @@ def main():
     rng = jax.random.PRNGKey(config["SEED"])
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
     train_vjit = jax.jit(jax.vmap(make_train(config)))
-    outs = jax.block_until_ready(train_vjit(rngs))
+    _ = jax.block_until_ready(train_vjit(rngs))
 
 
 if __name__ == "__main__":

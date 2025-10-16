@@ -256,9 +256,9 @@ def make_train(
                 rng, _rng = jax.random.split(rng)
                 # Batching and Shuffling
                 batch_size = minibatch_size * num_minibatches
-                assert (
-                    batch_size == train_freq * num_envs
-                ), "batch size must be equal to number of steps * number of envs"
+                assert batch_size == train_freq * num_envs, (
+                    "batch size must be equal to number of steps * number of envs"
+                )
                 permutation = jax.random.permutation(_rng, batch_size)
                 batch = (traj_batch, advantages, targets)
                 batch = jax.tree_util.tree_map(
@@ -402,7 +402,7 @@ if __name__ == "__main__":
     wandb.init(
         project="Tinker",
         tags=["PPO", config["ENV_NAME"].upper(), f"jax_{jax.__version__}"],
-        name=f'purejaxrl_ppo_{config["ENV_NAME"]}',
+        name=f"purejaxrl_ppo_{config['ENV_NAME']}",
         config=config,
         mode=config["WANDB_MODE"],
     )
