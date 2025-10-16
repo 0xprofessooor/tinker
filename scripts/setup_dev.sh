@@ -1,15 +1,15 @@
 #!/bin/sh
 echo ---------------------
-echo Installing and creating poetry virtual environment
+echo Installing and creating uv virtual environment
 echo ---------------------
-curl -sSL https://install.python-poetry.org | python3 -
-poetry install
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync
 echo ""
 
 echo ---------------------
 echo Installing pre-commit hooks
 echo ---------------------
-poetry run pre-commit install
+uv run pre-commit install
 echo ""
 
 echo ---------------------
@@ -20,12 +20,9 @@ echo ""
 echo =================================================================================
 echo ""
 
-echo A python virtual environment has been created at:
-poetry config --local virtualenvs.path
-
 echo ""
 echo To run unit tests locally:
-echo    poetry run pytest
+echo    uv run pytest
 
 echo ""
 echo =================================================================================
