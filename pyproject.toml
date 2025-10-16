@@ -12,6 +12,7 @@ dependencies = [
     "gymnax>=0.0.9",
     "jax>=0.8.0",
     "optax>=0.2.6",
+    "polars>=1.34.0",
     "wandb>=0.22.2",
 ]
 
