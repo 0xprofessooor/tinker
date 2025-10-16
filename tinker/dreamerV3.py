@@ -114,29 +114,26 @@ class WorldModel(nn.Module):
             z_logits = nn.silu(z_logits)
         return z_logits
 
-    def forward_reward(self, h: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
+    def forward_reward(self, latent_state: jnp.ndarray) -> jnp.ndarray:
         """Predict the reward from the latent state."""
-        x = jnp.concatenate([h, z], axis=-1)
         for layer in self.reward_model:
-            x = layer(x)
-            x = nn.silu(x)
-        return x
+            latent_state = layer(latent_state)
+            latent_state = nn.silu(latent_state)
+        return latent_state
 
-    def forward_continue(self, h: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
+    def forward_continue(self, latent_state: jnp.ndarray) -> jnp.ndarray:
         """Predict the continue signal from the latent state."""
-        x = jnp.concatenate([h, z], axis=-1)
         for layer in self.continue_model:
-            x = layer(x)
-            x = nn.silu(x)
-        return x
+            latent_state = layer(latent_state)
+            latent_state = nn.silu(latent_state)
+        return latent_state
 
-    def forward_decoder(self, h: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
+    def forward_decoder(self, latent_state: jnp.ndarray) -> jnp.ndarray:
         """Predict the observation from the latent state."""
-        x = jnp.concatenate([h, z], axis=-1)
         for layer in self.decoder:
-            x = layer(x)
-            x = nn.silu(x)
-        return x
+            latent_state = layer(latent_state)
+            latent_state = nn.silu(latent_state)
+        return latent_state
 
     def __call__(
         self,
@@ -149,9 +146,10 @@ class WorldModel(nn.Module):
         h = self.forward_sequence(h, z, action)
         _ = self.forward_dynamics(h)
         z = self.forward_encoder(h, obs)
-        obs_pred = self.forward_decoder(h, z)
-        reward_pred = self.forward_reward(h, z)
-        continue_pred = self.forward_continue(h, z)
+        latent_state = jnp.concatenate([h, z], axis=-1)
+        obs_pred = self.forward_decoder(latent_state)
+        reward_pred = self.forward_reward(latent_state)
+        continue_pred = self.forward_continue(latent_state)
         return obs_pred, reward_pred, continue_pred, h, z
 
 
@@ -222,7 +220,7 @@ def make_train(
     env: Environment,
     num_steps: int,
     buffer_size: int,
-    batch_size: int,
+    epochs_world_model: int,
     sequence_length: int = 50,
     imagination_horizon: int = 15,
     world_model_update_freq: int = 1,
@@ -276,11 +274,11 @@ def make_train(
         # shape = (add_batch_size, time, element_dim)
         buffer = fbx.make_trajectory_buffer(
             add_batch_size=1,
-            sample_batch_size=batch_size,
+            sample_batch_size=epochs_world_model,
             sample_sequence_length=sequence_length,
             period=1,
             min_length_time_axis=sequence_length,
-            max_size=buffer_size,
+            max_length_time_axis=buffer_size,
         )
         buffer: fbx.trajectory_buffer.TrajectoryBuffer = buffer.replace(
             init=jax.jit(buffer.init),
@@ -313,9 +311,64 @@ def make_train(
         _, env_rng = jax.random.split(rng)
         obs, env_state = env.reset(env_rng)
 
+        def eval_latent_state(carry: tuple, x: jnp.ndarray):
+            """Evaluate the world model latent state from an observation and action."""
+            h, world_model_state, rng = carry
+            obs = x[: world_model.obs_size]
+            action = x[world_model.obs_size : -1]
+            done = x[-1]
+
+            z_logits = world_model.apply(
+                world_model_state.params,
+                h,
+                symlog(obs),
+                method=world_model.forward_encoder,
+            ).reshape((world_model.stoch_size, world_model.one_hot_size))
+            z_logits = _uniform_mix(z_logits, mix_coeff=uniform_mix_coeff)
+            _, rng_one_hot = jax.random.split(rng)
+            z = _one_hot_state(z_logits, rng_one_hot)
+            z_model_in = z.reshape((world_model.stoch_size * world_model.one_hot_size))
+            h = jax.lax.cond(  # reset deterministic state if done
+                done == 1,
+                lambda _: jnp.zeros_like(h),
+                lambda _: world_model.apply(
+                    world_model_state.params,
+                    h,
+                    z_model_in,
+                    action,
+                    method=world_model.forward_sequence,
+                ),
+                None,
+            )
+            latent_state = jnp.concatenate([h, z_model_in], axis=-1)
+            return (h, world_model_state), latent_state
+
         def update_world_model(
             world_model_state: TrainState, buffer_state: BufferState, rng: chex.PRNGKey
         ):
+            """Run an update step on the world model."""
+            rng_epoch, rng_sample = jax.random.split(rng)
+            buffer_sample = buffer.sample(buffer_state, rng_sample).experience
+            obs = buffer_sample.obs
+            action = buffer_sample.action
+            done = jnp.expand_dims(buffer_sample.done, axis=-1)
+            data = jnp.concatenate(
+                [obs, action, done], axis=-1
+            )  # (num_epochs, time, obs_dim + action_dim + 1)
+
+            def epoch_update(carry: tuple, sequence: jnp.ndarray):
+                """Update the world model for a single epoch."""
+                world_model_state, rng = carry
+                h = jnp.zeros((world_model.recurrent_size,))
+                _, rng_ = jax.random.split(rng)
+                _, latent_states = jax.lax.scan(
+                    eval_latent_state, (h, world_model_state, rng_), sequence
+                )
+
+            _, _ = jax.lax.scan(
+                epoch_update, init=(world_model_state, rng_epoch), xs=data
+            )
+
             return world_model_state, 0.0, 0.0, 0.0, 0.0
 
         def update_actor_critic():
