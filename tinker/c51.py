@@ -13,7 +13,7 @@ from flashbax.buffers.trajectory_buffer import BufferState
 from flax import linen as nn
 from flax.training.train_state import TrainState
 from gymnax import EnvState
-from gymnax.environments.environment import Environment
+from gymnax.environments.environment import Environment, EnvParams
 from gymnax.wrappers import LogWrapper
 from jax import numpy as jnp
 
@@ -71,6 +71,7 @@ def linear_schedule(start: float, end: float, duration: int, step: int) -> jnp.n
 
 def make_train(
     env: Environment,
+    env_params: EnvParams,
     num_steps: int,
     num_atoms: int,
     value_min: float,
@@ -92,6 +93,7 @@ def make_train(
     """Generate a jitted JAX C51 train function.
 
     :param env: The environment to train on.
+    :param env_params: The environment parameters.
     :param num_steps: The number of training steps to run.
     :param num_atoms: The number of atoms in the distribution (e.g. 51).
     :param value_min: The minimum value of the distribution.
@@ -115,9 +117,9 @@ def make_train(
     def train(key: chex.PRNGKey) -> dict:
         # INIT DUMMY VARIABLES
         dummy_key = jax.random.PRNGKey(0)
-        _action = env.action_space().sample(dummy_key)
-        _, _state = env.reset(dummy_key)
-        _obs, _, _reward, _done, _ = env.step(dummy_key, _state, _action)
+        _action = env.action_space(env_params).sample(dummy_key)
+        _, _state = env.reset(dummy_key, env_params)
+        _obs, _, _reward, _done, _ = env.step(dummy_key, _state, _action, env_params)
         _transition = Transition(
             obs=_obs,
             action=_action,
@@ -161,7 +163,7 @@ def make_train(
 
         # INIT ENV
         key, subkey = jax.random.split(key)
-        obs, env_state = env.reset(subkey)
+        obs, env_state = env.reset(subkey, env_params)
 
         def eps_greedy_exploration(key: chex.PRNGKey, q_vals: jnp.ndarray, step: int):
             key, subkey = jax.random.split(
@@ -241,7 +243,9 @@ def make_train(
             pmfs = network.apply(train_state.params, obs)
             q_vals = (pmfs * train_state.atoms).sum(axis=-1)
             action = eps_greedy_exploration(key_a, q_vals, train_state.env_steps)
-            next_obs, env_state, reward, done, info = env.step(key_s, env_state, action)
+            next_obs, env_state, reward, done, info = env.step(
+                key_s, env_state, action, env_params
+            )
 
             # ADD TO BUFFER
             transition = Transition(
@@ -325,6 +329,7 @@ def make_train(
 
 def run(
     env: Environment,
+    env_params: EnvParams,
     num_steps: int,
     network: ZNetwork,
     network_params: dict,
@@ -333,6 +338,7 @@ def run(
     """Rollout a jitted gymnax episode with lax.scan.
 
     :param env: Gymnax environment.
+    :param env_params: Environment parameters.
     :param num_steps: Number of steps to rollout.
     :param network: Flax network module.
     :param network_params: Network parameters.
@@ -350,7 +356,7 @@ def run(
     # Reset the environment
     atoms = jnp.asarray(np.linspace(0, 1, num=network.n_atoms))
     rng_reset, rng_episode = jax.random.split(rng_input)
-    obs, state = env.reset(rng_reset)
+    obs, state = env.reset(rng_reset, env_params)
 
     def policy_step(state_input, tmp):
         """lax.scan compatible step transition in jax env."""
@@ -359,7 +365,9 @@ def run(
         pmfs = network.apply(network_params, obs)
         q_vals = (pmfs * atoms).sum(axis=-1)
         action = jnp.argmax(q_vals, axis=-1)
-        next_obs, next_state, reward, done, _ = env.step(rng_step, state, action)
+        next_obs, next_state, reward, done, _ = env.step(
+            rng_step, state, action, env_params
+        )
         carry = [next_obs, next_state, rng]
         return carry, [
             state,
@@ -383,8 +391,10 @@ if __name__ == "__main__":
     from gymnax.environments import CartPole
 
     env = CartPole()
+    env_params = env.default_params
     train = make_train(
         env=env,
+        env_params=env_params,
         num_steps=int(1e6),
         num_atoms=51,
         value_min=0,

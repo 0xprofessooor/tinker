@@ -13,7 +13,7 @@ import numpy as np
 import optax
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
-from gymnax.environments.environment import Environment
+from gymnax.environments.environment import Environment, EnvParams
 from gymnax.wrappers import LogWrapper
 
 import wandb
@@ -75,6 +75,7 @@ class Transition(NamedTuple):
 
 def make_train(
     env: Environment,
+    env_params: EnvParams,
     num_steps: int,
     num_envs: int,
     train_freq: int,
@@ -94,6 +95,7 @@ def make_train(
     """Generate a jitted JAX PPO train function.
 
     :param env: Gymnax environment.
+    :param env_params: Environment parameters.
     :param num_steps: Total number of steps to train for.
     :param num_envs: Number of parallel environments to run.
     :param train_freq: Number of steps to run between training updates.
@@ -113,7 +115,6 @@ def make_train(
 
     num_updates = num_steps // train_freq // num_envs
     minibatch_size = num_envs * train_freq // num_minibatches
-    env_params = env.default_params
     env = LogWrapper(env)
 
     def linear_schedule(count):
@@ -320,6 +321,7 @@ def make_train(
 
 def run(
     env: Environment,
+    env_params: EnvParams,
     num_steps: int,
     network: nn.Module,
     network_params: dict,
@@ -328,6 +330,7 @@ def run(
     """Rollout a jitted gymnax episode with lax.scan.
 
     :param env: Gymnax environment.
+    :param env_params: Environment parameters.
     :param num_steps: Number of steps to rollout.
     :param network: Flax network module.
     :param network_params: Network parameters.
@@ -345,7 +348,7 @@ def run(
     """
     # Reset the environment
     rng_reset, rng_episode = jax.random.split(rng_input)
-    obs, state = env.reset(rng_reset)
+    obs, state = env.reset(rng_reset, env_params)
 
     def policy_step(state_input, tmp):
         """lax.scan compatible step transition in jax env."""
@@ -353,7 +356,9 @@ def run(
         rng, rng_step, rng_net = jax.random.split(rng, 3)
         pi, value = network.apply(network_params, obs)
         action = pi.sample(seed=rng_net)
-        next_obs, next_state, reward, done, _ = env.step(rng_step, state, action)
+        next_obs, next_state, reward, done, _ = env.step(
+            rng_step, state, action, env_params
+        )
         carry = [next_obs, next_state, rng]
         return carry, [
             state,
@@ -409,6 +414,7 @@ if __name__ == "__main__":
 
     train_fn = make_train(
         env=basic_env,
+        env_params=env_params,
         num_steps=config["TOTAL_TIMESTEPS"],
         num_envs=config["NUM_ENVS"],
         train_freq=config["TRAIN_FREQ"],
