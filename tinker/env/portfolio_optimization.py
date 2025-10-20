@@ -38,8 +38,9 @@ class EnvState:
     step: int
     time: int
     prices: chex.Array
-    portfolio: chex.Array
-    portfolio_value: float
+    holdings: chex.Array
+    values: chex.Array
+    total_value: float
 
 
 @struct.dataclass
@@ -101,7 +102,7 @@ class PortfolioOptimizationV0(Environment):
 
     def is_terminal(self, state: EnvState, params: EnvParams) -> chex.Array:
         max_steps_reached = state.step >= params.max_steps
-        portfolio_bankrupt = state.portfolio_value <= 0
+        portfolio_bankrupt = state.total_value <= 0
         return jnp.logical_or(max_steps_reached, portfolio_bankrupt)
 
     def step_env(
@@ -114,14 +115,13 @@ class PortfolioOptimizationV0(Environment):
 
         # normalize action
         weights = jax.nn.softmax(action)
-        weights = jnp.array([0.999, 0.001, 0])
 
         ############### UPDATE PORTFOLIO WITH FEES ###############
-        values = state.portfolio * prices
-        portfolio_value = jnp.sum(values)
+        values = state.holdings * prices
+        total_value = jnp.sum(values)
         asset_values = values[1:]
         asset_weights = weights[1:]
-        new_asset_values_no_fee = portfolio_value * asset_weights
+        new_asset_values_no_fee = total_value * asset_weights
         deltas_no_fee = new_asset_values_no_fee - asset_values
         num_trades = jnp.sum(jnp.abs(deltas_no_fee) > params.trade_threshold)
         gas_cost = params.gas_fee * num_trades
@@ -140,25 +140,26 @@ class PortfolioOptimizationV0(Environment):
         # calculate new portfolio value after fees
         fee_param = params.taker_fee / (1 - params.taker_fee)
         numerator = (
-            portfolio_value
+            total_value
             - gas_cost
             + fee_param * (jnp.sum(current_buy_values) - jnp.sum(current_sell_values))
         )
         denominator = 1 + fee_param * (jnp.sum(buy_weights) - jnp.sum(sell_weights))
-        new_portfolio_value = numerator / denominator
-        new_values = new_portfolio_value * weights
-        final_values = jnp.where(no_trade_indices, values, new_values)
-        delta_values = new_values - final_values
+        new_total_value = numerator / denominator
+        new_values = new_total_value * weights
+        adj_new_values = jnp.where(no_trade_indices, values, new_values)
+        delta_values = new_values - adj_new_values
         delta_cash = jnp.sum(delta_values)
-        final_values = final_values.at[0].add(delta_cash)
-        new_portfolio = final_values / prices
+        adj_new_values = adj_new_values.at[0].add(delta_cash)
+        new_holdings = adj_new_values / prices
 
         next_state = EnvState(
             step=state.step + 1,
             time=time,
             prices=prices,
-            portfolio=new_portfolio,
-            portfolio_value=new_portfolio_value,
+            holdings=new_holdings,
+            values=adj_new_values,
+            total_value=new_total_value,
         )
         obs = self.get_obs(next_state, params)
         reward = self.reward(state, next_state, params)
@@ -176,14 +177,16 @@ class PortfolioOptimizationV0(Environment):
         prices = jnp.concatenate(
             [jnp.array([1.0]), self.data[time, :, KLineFeatures.CLOSE.value]]
         )
-        portfolio = jnp.zeros(len(self.assets) + 1)
-        portfolio = portfolio.at[0].set(params.initial_cash)
+        holdings = jnp.zeros(len(self.assets) + 1)
+        holdings = holdings.at[0].set(params.initial_cash)
+        values = holdings * prices
         state = EnvState(
             step=0,
             time=time,
             prices=prices,
-            portfolio=portfolio,
-            portfolio_value=params.initial_cash,
+            holdings=holdings,
+            values=values,
+            total_value=jnp.sum(values),
         )
         obs = self.get_obs(state, params)
         return obs, state
