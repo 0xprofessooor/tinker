@@ -93,12 +93,13 @@ class PortfolioOptimizationV0(Environment):
         start_indices = (start_time_idx, 0, 0)
         slice_sizes = (self.step_size, self.data.shape[1], self.data.shape[2])
         step_data = jax.lax.dynamic_slice(self.data, start_indices, slice_sizes)
-        return step_data.flatten()
+        return step_data
 
     def reward(
         self, state: EnvState, next_state: EnvState, params: EnvParams
     ) -> chex.Array:
-        pass
+        log_return = jnp.log(next_state.total_value) - jnp.log(state.total_value)
+        return log_return
 
     def is_terminal(self, state: EnvState, params: EnvParams) -> chex.Array:
         max_steps_reached = state.step >= params.max_steps
