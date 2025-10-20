@@ -114,6 +114,7 @@ class PortfolioOptimizationV0(Environment):
 
         # normalize action
         weights = jax.nn.softmax(action)
+        weights = jnp.array([0.999, 0.001, 0])
 
         ############### UPDATE PORTFOLIO WITH FEES ###############
         values = state.portfolio * prices
@@ -146,16 +147,18 @@ class PortfolioOptimizationV0(Environment):
         denominator = 1 + fee_param * (jnp.sum(buy_weights) - jnp.sum(sell_weights))
         new_portfolio_value = numerator / denominator
         new_values = new_portfolio_value * weights
-        new_portfolio = new_values / prices
-        final_portfolio = jnp.where(no_trade_indices, state.portfolio, new_portfolio)
-        final_portfolio_value = jnp.sum(final_portfolio * prices)
+        final_values = jnp.where(no_trade_indices, values, new_values)
+        delta_values = new_values - final_values
+        delta_cash = jnp.sum(delta_values)
+        final_values = final_values.at[0].add(delta_cash)
+        new_portfolio = final_values / prices
 
         next_state = EnvState(
             step=state.step + 1,
             time=time,
             prices=prices,
-            portfolio=final_portfolio,
-            portfolio_value=final_portfolio_value,
+            portfolio=new_portfolio,
+            portfolio_value=new_portfolio_value,
         )
         obs = self.get_obs(next_state, params)
         reward = self.reward(state, next_state, params)
