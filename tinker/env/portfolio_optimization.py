@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Dict, Tuple
 from enum import Enum
 from gymnax.environments.environment import Environment, EnvParams, EnvState
@@ -43,22 +44,22 @@ class EnvState:
 
 @struct.dataclass
 class EnvParams:
-    step_size: int
     max_steps: int
     initial_cash: float
     taker_fee: float
     gas_fee: float
-    trade_threshold: float = 1e-6
+    trade_threshold: float
 
 
 class PortfolioOptimizationV0(Environment):
-    def __init__(self, data_paths: Dict[str, str]):
+    def __init__(self, data_paths: Dict[str, str], step_size: int = 3600):
         super().__init__()
         data_dict = {key: load_binance_klines(path) for key, path in data_paths.items()}
         self.assets = sorted(data_dict.keys())
         self.data = jnp.stack(
             [data_dict[asset] for asset in self.assets], axis=1
         )  # shape (num_rows, num_assets, num_features)
+        self.step_size = step_size
 
     @property
     def name(self) -> str:
@@ -67,11 +68,11 @@ class PortfolioOptimizationV0(Environment):
     @property
     def default_params(self) -> EnvParams:
         return EnvParams(
-            step_size=3600,
             max_steps=2160,
             initial_cash=1000.0,
             taker_fee=BinanceFeeTier.REGULAR.value,
             gas_fee=0.0,
+            trade_threshold=1,
         )
 
     def action_space(self, params: EnvParams) -> spaces.Box:
@@ -80,15 +81,18 @@ class PortfolioOptimizationV0(Environment):
         )
 
     def observation_space(self, params: EnvParams) -> spaces.Box:
+        obs_shape = (self.step_size * self.data.shape[1] * self.data.shape[2],)
         return spaces.Box(
-            low=-jnp.inf, high=jnp.inf, shape=(len(self.data),), dtype=jnp.float32
+            low=-jnp.inf, high=jnp.inf, shape=obs_shape, dtype=jnp.float32
         )
 
     def get_obs(self, state: EnvState, params: EnvParams) -> chex.Array:
-        step_data = self.data[
-            state.time - (params.step_size - 1) : state.time + 1, :, :
-        ]
-        return step_data
+        # Use step_size as the lookback window for observations
+        start_time_idx = jnp.maximum(0, state.time - self.step_size + 1)
+        start_indices = (start_time_idx, 0, 0)
+        slice_sizes = (self.step_size, self.data.shape[1], self.data.shape[2])
+        step_data = jax.lax.dynamic_slice(self.data, start_indices, slice_sizes)
+        return step_data.flatten()
 
     def reward(
         self, state: EnvState, next_state: EnvState, params: EnvParams
@@ -103,7 +107,7 @@ class PortfolioOptimizationV0(Environment):
     def step_env(
         self, key: chex.PRNGKey, state: EnvState, action: chex.Array, params: EnvParams
     ) -> tuple[chex.Array, EnvState, chex.Array, chex.Array, dict]:
-        time = state.time + params.step_size
+        time = state.time + self.step_size
         prices = jnp.concatenate(
             [jnp.array([1.0]), self.data[time, :, KLineFeatures.CLOSE.value]]
         )
@@ -143,14 +147,15 @@ class PortfolioOptimizationV0(Environment):
         new_portfolio_value = numerator / denominator
         new_values = new_portfolio_value * weights
         new_portfolio = new_values / prices
-        new_portfolio = jnp.where(no_trade_indices, state.portfolio, new_portfolio)
+        final_portfolio = jnp.where(no_trade_indices, state.portfolio, new_portfolio)
+        final_portfolio_value = jnp.sum(final_portfolio * prices)
 
         next_state = EnvState(
             step=state.step + 1,
             time=time,
             prices=prices,
-            portfolio=new_portfolio,
-            portfolio_value=new_portfolio_value,
+            portfolio=final_portfolio,
+            portfolio_value=final_portfolio_value,
         )
         obs = self.get_obs(next_state, params)
         reward = self.reward(state, next_state, params)
@@ -161,9 +166,9 @@ class PortfolioOptimizationV0(Environment):
     def reset_env(
         self, key: chex.PRNGKey, params: EnvParams
     ) -> Tuple[chex.Array, EnvState]:
-        episode_length = params.max_steps * params.step_size
+        episode_length = params.max_steps * self.step_size
         max_start = self.data.shape[0] - episode_length
-        min_start = params.step_size
+        min_start = self.step_size
         time = jax.random.randint(key, (), min_start, max_start)
         prices = jnp.concatenate(
             [jnp.array([1.0]), self.data[time, :, KLineFeatures.CLOSE.value]]
@@ -197,9 +202,16 @@ def load_binance_klines(filepath: str) -> chex.Array:
 
 
 if __name__ == "__main__":
-    env = PortfolioOptimizationV0(
-        data_paths={"BTC": "data/BTCUSDT_2024-10-15_2025-10-15_1s.csv"}
-    )
+    data_paths = {
+        "BTC": "data/BTCUSDT_2024-10-15_2025-10-15_1s.csv",
+        "ETH": "data/ETHUSDT_2024-10-15_2025-10-15_1s.csv",
+    }
+    env = PortfolioOptimizationV0(data_paths=data_paths)
     key = jax.random.PRNGKey(0)
-    print(env.data.shape)
-    env.reset(key, env.default_params)
+    obs, state = env.reset(key, env.default_params)
+    print(state)
+    action = jnp.array([1, 0.000003, 0.0000002])  # Example action
+    next_obs, next_state, reward, done, info = env.step_env(
+        key, state, action, env.default_params
+    )
+    print(next_state)
