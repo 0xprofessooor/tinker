@@ -1,7 +1,7 @@
 """Proximal Policy Optimization (PPO) with Categorical Policy."""
 
 import os
-from typing import NamedTuple, Sequence, Tuple
+from typing import NamedTuple, Tuple
 
 import chex
 import distrax
@@ -26,7 +26,7 @@ class ActorCritic(nn.Module):
     :param activation: Activation function for the network.
     """
 
-    action_dim: Sequence[int]
+    action_dim: int
     activation: str = "tanh"
 
     @nn.compact
@@ -381,7 +381,7 @@ def run(
 
 if __name__ == "__main__":
     config = {
-        "ENV_NAME": "CartPole-v1",
+        "ENV_NAME": "CartPole-v0",
         "LR": 3e-4,
         "NUM_ENVS": 1,
         "TRAIN_FREQ": 128,
@@ -397,7 +397,7 @@ if __name__ == "__main__":
         "ACTIVATION": "tanh",
         "ANNEAL_LR": False,
         "WANDB_MODE": "online",  # set to online to activate wandb
-        "NUM_SEEDS": 1,
+        "NUM_SEEDS": 10,
         "SEED": 0,
     }
 
@@ -407,7 +407,7 @@ if __name__ == "__main__":
     wandb.init(
         project="Tinker",
         tags=["PPO", config["ENV_NAME"].upper(), f"jax_{jax.__version__}"],
-        name=f"purejaxrl_ppo_{config['ENV_NAME']}",
+        name=f"ppo_{config['ENV_NAME']}",
         config=config,
         mode=config["WANDB_MODE"],
     )
