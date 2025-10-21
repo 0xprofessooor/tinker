@@ -90,7 +90,6 @@ def make_train(
     value_coef: float,
     max_grad_norm: float,
     clip_eps: float,
-    log_wandb: bool = False,
 ):
     """Generate a jitted JAX PPO train function.
 
@@ -110,7 +109,6 @@ def make_train(
     :param value_coef: Coefficient for the value loss.
     :param max_grad_norm: Maximum gradient norm for clipping.
     :param clip_eps: Epsilon for clipping the policy loss.
-    :param log_wandb: Whether to log to wandb.
     """
 
     num_updates = num_steps // train_freq // num_envs
@@ -290,22 +288,14 @@ def make_train(
             runner_state = (train_state, env_state, last_obs, rng)
             metrics = {
                 "updates": train_state.step,
-                "actor_losses": loss_info[1][1],
-                "critic_losses": loss_info[1][0],
-                "entropy": loss_info[1][2],
+                "actor_loss": loss_info[1][1].mean(),
+                "critic_loss": loss_info[1][0].mean(),
+                "entropy": loss_info[1][2].mean(),
                 "batch_returns": traj_batch.info["returned_episode_returns"].mean(),
                 "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
                 "dones": traj_batch.info["returned_episode"],
                 "returns": traj_batch.info["returned_episode_returns"],
             }
-
-            # report on wandb if required
-            if log_wandb:
-
-                def callback(metrics):
-                    wandb.log(metrics)
-
-                jax.debug.callback(callback, metrics)
 
             return runner_state, metrics
 
@@ -381,7 +371,7 @@ def run(
 
 if __name__ == "__main__":
     config = {
-        "ENV_NAME": "CartPole-v0",
+        "ENV_NAME": "CartPole-v1",
         "LR": 3e-4,
         "NUM_ENVS": 1,
         "TRAIN_FREQ": 128,
@@ -397,7 +387,7 @@ if __name__ == "__main__":
         "ACTIVATION": "tanh",
         "ANNEAL_LR": False,
         "WANDB_MODE": "online",  # set to online to activate wandb
-        "NUM_SEEDS": 10,
+        "NUM_SEEDS": 2,
         "SEED": 0,
     }
 
@@ -429,10 +419,59 @@ if __name__ == "__main__":
         value_coef=config["VF_COEF"],
         max_grad_norm=config["MAX_GRAD_NORM"],
         clip_eps=config["CLIP_EPS"],
-        log_wandb=True if config["WANDB_MODE"] == "online" else False,
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
+
+    # JIT and vmap the training function for parallel execution
     train_vjit = jax.jit(jax.vmap(train_fn))
-    outs = jax.block_until_ready(train_vjit(rngs))
+    runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
+
+    # Log metrics from each parallel run separately to WandB
+    if config["WANDB_MODE"] == "online":
+        print("Logging metrics to WandB...")
+        num_updates = len(
+            all_metrics["batch_returns"][0]
+        )  # Get number of training updates
+
+        # Log each update step for all runs
+        for update_idx in range(num_updates):
+            log_dict = {}
+
+            # Log metrics for each parallel run
+            for run_idx in range(config["NUM_SEEDS"]):
+                run_prefix = f"run_{run_idx}"
+
+                # Extract metrics for this update and run
+                log_dict.update(
+                    {
+                        f"{run_prefix}/updates": all_metrics["updates"][run_idx][
+                            update_idx
+                        ],
+                        f"{run_prefix}/dones": all_metrics["dones"][run_idx][
+                            update_idx
+                        ],
+                        f"{run_prefix}/returns": all_metrics["returns"][run_idx][
+                            update_idx
+                        ],
+                        f"{run_prefix}/batch_returns": float(
+                            all_metrics["batch_returns"][run_idx][update_idx]
+                        ),
+                        f"{run_prefix}/actor_loss": float(
+                            all_metrics["actor_loss"][run_idx][update_idx]
+                        ),
+                        f"{run_prefix}/critic_loss": float(
+                            all_metrics["critic_loss"][run_idx][update_idx]
+                        ),
+                        f"{run_prefix}/entropy": float(
+                            all_metrics["entropy"][run_idx][update_idx]
+                        ),
+                        f"{run_prefix}/episode_lengths": float(
+                            all_metrics["episode_lengths"][run_idx][update_idx]
+                        ),
+                    }
+                )
+
+            # Log to WandB
+            wandb.log(log_dict)
