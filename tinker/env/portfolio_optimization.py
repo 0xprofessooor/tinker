@@ -78,7 +78,10 @@ class PortfolioOptimizationV0(Environment):
 
     def action_space(self, params: EnvParams) -> spaces.Box:
         return spaces.Box(
-            low=-jnp.inf, high=jnp.inf, shape=(len(self.data) + 1,), dtype=jnp.float32
+            low=-jnp.inf,
+            high=jnp.inf,
+            shape=(self.data.shape[1] + 1,),
+            dtype=jnp.float32,
         )
 
     def observation_space(self, params: EnvParams) -> spaces.Box:
@@ -88,7 +91,6 @@ class PortfolioOptimizationV0(Environment):
         )
 
     def get_obs(self, state: EnvState, params: EnvParams) -> chex.Array:
-        # Use step_size as the lookback window for observations
         start_time_idx = jnp.maximum(0, state.time - self.step_size + 1)
         start_indices = (start_time_idx, 0, 0)
         slice_sizes = (self.step_size, self.data.shape[1], self.data.shape[2])
