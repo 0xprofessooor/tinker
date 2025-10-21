@@ -299,6 +299,7 @@ def make_train(
                 "dones": info["returned_episode"],
                 "PMF": pmfs[action],
             }
+            runner_state = (next_obs, env_state, buffer_state, train_state, key)
 
             return runner_state, metrics
 
@@ -381,6 +382,7 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 2
     WANDB = "online"
+    LOG_FREQ = 100
 
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
@@ -389,6 +391,9 @@ if __name__ == "__main__":
         name=f"c51_{env.name}",
         mode=WANDB,
     )
+
+    rng = jax.random.PRNGKey(SEED)
+    rngs = jax.random.split(rng, NUM_SEEDS)
 
     train_fn = make_train(
         env=env,
@@ -409,35 +414,29 @@ if __name__ == "__main__":
         gamma=0.99,
         tau=0.95,
     )
-    rng = jax.random.PRNGKey(SEED)
-    rngs = jax.random.split(rng, NUM_SEEDS)
     train_vjit = jax.jit(jax.vmap(train_fn))
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
 
     if WANDB == "online":
-        num_updates = len(all_metrics["updates"])
-
-        for update_idx in range(num_updates):
+        num_updates = len(all_metrics["updates"][0])
+        for update_idx in range(0, num_updates, LOG_FREQ):
             log_dict = {}
 
-            # Log metrics for each parallel run
             for run_idx in range(NUM_SEEDS):
                 run_prefix = f"run_{run_idx}"
-
-                # Extract metrics for this update and run
                 log_dict.update(
                     {
                         f"{run_prefix}/updates": all_metrics["updates"][run_idx][
                             update_idx
                         ],
-                        f"{run_prefix}/loss": all_metrics["loss"][run_idx][update_idx],
+                        f"{run_prefix}/dones": all_metrics["dones"][run_idx][
+                            update_idx
+                        ],
                         f"{run_prefix}/returns": all_metrics["returns"][run_idx][
                             update_idx
                         ],
                         f"{run_prefix}/PMF": all_metrics["PMF"][run_idx][update_idx],
-                        f"{run_prefix}/dones": all_metrics["dones"][run_idx][
-                            update_idx
-                        ],
+                        f"{run_prefix}/loss": all_metrics["loss"][run_idx][update_idx],
                         f"{run_prefix}/episode_lengths": all_metrics["episode_lengths"][
                             run_idx
                         ][update_idx],
