@@ -91,7 +91,7 @@ def make_train(
 
     :param env: Gymnax environment.
     :param env_params: Environment parameters.
-    :param num_steps: Total number of steps to train for.
+    :param num_steps: Number of steps to train per environment.
     :param num_envs: Number of parallel environments to run.
     :param train_freq: Number of steps to run between training updates.
     :param batch_size: Minibatch size to make a single gradient descent step on.
@@ -107,7 +107,7 @@ def make_train(
     :param ratio_clip: The clipping factor for the clipped loss
     """
 
-    num_updates = num_steps // train_freq // num_envs
+    num_updates = num_steps // train_freq
     num_minibatches = (num_envs * train_freq) // batch_size
     env = LogWrapper(env)
 
