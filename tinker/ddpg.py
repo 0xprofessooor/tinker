@@ -89,15 +89,15 @@ def make_train(
     num_envs: int,
     batch_size: int,
     buffer_size: int,
-    actor_epochs: int,
-    critic_epochs: int,
+    actor_epochs: int = 1,
+    critic_epochs: int = 1,
     actor_activation: callable = nn.relu,
     critic_activation: callable = nn.relu,
     train_freq: int = 1,
     start_steps: int = 1000,
     explorer_noise_scale: float = 0.1,
     td_gamma: float = 0.99,
-    lr_actor: float = 1e-4,
+    lr_actor: float = 1e-3,
     lr_critic: float = 1e-3,
     anneal_lr: bool = True,
     polyak_coeff: float = 0.005,
@@ -376,14 +376,13 @@ def make_train(
 
 
 if __name__ == "__main__":
-    from gymnax.environments import Pendulum
+    import gymnax
 
     SEED = 0
     NUM_SEEDS = 1
     WANDB = "online"
 
-    env = Pendulum()
-    env_params = env.default_params
+    env, env_params = gymnax.make("Pendulum-v1")
 
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
@@ -399,12 +398,14 @@ if __name__ == "__main__":
     train_fn = make_train(
         env,
         env_params,
-        num_steps=int(1e6),
+        num_steps=int(1e5),
         num_envs=1,
-        batch_size=32,
-        buffer_size=int(1e6),
+        batch_size=64,
+        buffer_size=int(1e5),
         actor_epochs=1,
         critic_epochs=1,
+        train_freq=1,
+        anneal_lr=False,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
