@@ -141,9 +141,9 @@ def make_train(
         obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
 
         # TRAIN LOOP
-        def _update_step(runner_state, unused):
+        def _update_step(runner_state, _):
             # COLLECT TRAJECTORIES
-            def _env_step(runner_state, unused):
+            def _env_step(runner_state, _):
                 train_state, env_state, last_obs, rng = runner_state
 
                 # SELECT ACTION
@@ -196,7 +196,7 @@ def make_train(
             advantages, targets = _calculate_gae(traj_batch, last_val)
 
             # UPDATE NETWORK
-            def _update_epoch(update_state, unused):
+            def _update_epoch(update_state, _):
                 def _update_minbatch(train_state, batch_info):
                     traj_batch, advantages, targets = batch_info
 
