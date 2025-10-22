@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from flax.linen.initializers import constant, orthogonal, uniform
+from flax.linen.initializers import orthogonal, uniform
 from flax.training.train_state import TrainState
 from gymnax.environments.environment import Environment, EnvParams, EnvState
 from gymnax.wrappers import LogWrapper
