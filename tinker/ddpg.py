@@ -222,7 +222,7 @@ def make_train(
             )
             return action, rng
 
-        def update_critic(carry: Tuple[DDPGTrainState, DDPGTrainState, Transition], _):
+        def update_critic(carry, _):
             actor_state, critic_state, trajectories = carry
 
             next_actions = actor.apply(
@@ -249,7 +249,7 @@ def make_train(
             carry = (actor_state, critic_state, trajectories)
             return carry, loss
 
-        def update_actor(carry: Tuple[DDPGTrainState, DDPGTrainState, Transition], _):
+        def update_actor(carry, _):
             actor_state, critic_state, trajectories = carry
 
             def loss_fn(params):
