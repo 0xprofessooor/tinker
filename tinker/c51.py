@@ -78,7 +78,7 @@ def make_train(
     value_max: float,
     buffer_size: int,
     batch_size: int,
-    learning_starts: int,
+    start_steps: int,
     train_freq: int,
     target_update_freq: int,
     epsilon_start: float,
@@ -98,7 +98,7 @@ def make_train(
     :param value_max: The maximum value of the distribution.
     :param buffer_size: The maximum size of the replay buffer.
     :param batch_size: The size of the batch sampled from the replay buffer.
-    :param learning_starts: The number of steps before training starts.
+    :param start_steps: The number of steps before training starts.
     :param train_freq: The number of steps between training updates.
     :param target_update_freq: The number of steps between target network updates.
     :param epsilon_start: The starting epsilon value for epsilon greedy exploration.
@@ -257,7 +257,7 @@ def make_train(
             train_state = train_state.replace(env_steps=train_state.env_steps + 1)
             is_learning_step = (
                 (buffer.can_sample(buffer_state))
-                & (train_state.env_steps >= learning_starts)
+                & (train_state.env_steps >= start_steps)
                 & (train_state.env_steps % train_freq == 0)
             )
             key, subkey = jax.random.split(key)
@@ -404,7 +404,7 @@ if __name__ == "__main__":
         value_max=500,
         buffer_size=10000,
         batch_size=32,
-        learning_starts=1000,
+        start_steps=1000,
         train_freq=10,
         target_update_freq=500,
         epsilon_start=1.0,

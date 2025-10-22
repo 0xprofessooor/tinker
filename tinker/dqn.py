@@ -181,7 +181,7 @@ def make_train(config):
             is_learn_time = (
                 (buffer.can_sample(buffer_state))
                 & (  # enough experience in buffer
-                    train_state.timesteps > config["LEARNING_STARTS"]
+                    train_state.timesteps > config["START_STEPS"]
                 )
                 & (  # pure exploration phase ended
                     train_state.timesteps % config["TRAINING_INTERVAL"] == 0
@@ -252,7 +252,7 @@ def main():
         "EPSILON_ANNEAL_TIME": 25e4,
         "TARGET_UPDATE_INTERVAL": 500,
         "LR": 2.5e-4,
-        "LEARNING_STARTS": 10000,
+        "START_STEPS": 10000,
         "TRAINING_INTERVAL": 10,
         "LR_LINEAR_DECAY": False,
         "GAMMA": 0.99,
