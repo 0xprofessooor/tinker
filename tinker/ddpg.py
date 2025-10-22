@@ -1,5 +1,6 @@
 """Deep Deterministic Policy Gradient (DDPG)."""
 
+import os
 from typing import NamedTuple, Tuple
 
 import chex
@@ -74,12 +75,9 @@ RunnerState = Tuple[
 
 
 def add_noise(
-    action: jnp.ndarray, noise_scale: float, rng: chex.PRNGKey = None
+    action: jnp.ndarray, noise_scale: float, rng: chex.PRNGKey
 ) -> jnp.ndarray:
     """Add Gaussian noise to actions for exploration."""
-    if rng is None:
-        rng = jax.random.PRNGKey(0)
-
     noise = jax.random.normal(rng, action.shape) * noise_scale
     return jnp.clip(action + noise, -1.0, 1.0)
 
@@ -122,6 +120,7 @@ def make_train(
         # SETUP DUMMY PARAMS
         rng, dummy_key = jax.random.split(rng)
         action_space = env.action_space(env_params)
+        action_scale = (action_space.high - action_space.low) / 2.0
         _, dummy_state = env.reset(dummy_key, env_params)
         dummy_action = action_space.sample(dummy_key)
         dummy_obs, _, dummy_reward, dummy_done, _ = env.step(
@@ -201,60 +200,69 @@ def make_train(
             actor_state: DDPGTrainState, obs: jnp.ndarray, rng: chex.PRNGKey, step: int
         ) -> Tuple[jnp.ndarray, chex.PRNGKey]:
             rng, noise_rng = jax.random.split(rng)
-            action = jax.lax.cond(
-                step < start_steps,
-                lambda: action_space.sample(noise_rng),
-                lambda: add_noise(
-                    actor.apply(actor_state.params, obs),
+
+            def random_action():
+                random_actions = jax.vmap(action_space.sample)(
+                    jax.random.split(noise_rng, num_envs)
+                )
+                return random_actions
+
+            def policy_action():
+                actor_actions = actor.apply(actor_state.params, obs)
+                return action_scale * add_noise(
+                    actor_actions,
                     noise_scale=explorer_noise_scale,
                     rng=noise_rng,
-                ),
+                )
+
+            action = jax.lax.cond(
+                step < start_steps,
+                random_action,
+                policy_action,
             )
             return action, rng
 
-        def update_critic(
-            carry: Tuple[DDPGTrainState, DDPGTrainState, BufferState, chex.PRNGKey], _
-        ):
-            actor_state, critic_state, buffer_state, rng = carry
-            rng, buffer_rng = jax.random.split(rng)
-            trajectories = buffer.sample(buffer_state, buffer_rng)
+        def update_critic(carry: Tuple[DDPGTrainState, DDPGTrainState, Transition], _):
+            actor_state, critic_state, trajectories = carry
 
-            next_actions = actor.apply(actor_state.target_params, trajectories.next_obs)
+            next_actions = actor.apply(
+                actor_state.target_params, trajectories.second.obs
+            )
             next_q_values = critic.apply(
-                critic_state.target_params, trajectories.next_obs, next_actions
+                critic_state.target_params, trajectories.second.obs, next_actions
             )
             target_q_values = (
-                trajectories.reward
-                + td_gamma * (1.0 - trajectories.done) * next_q_values
+                trajectories.first.reward
+                + td_gamma * (1.0 - trajectories.first.done) * next_q_values
             )
 
             def loss_fn(params):
-                q_values = critic.apply(params, trajectories.obs, trajectories.action)
+                q_values = critic.apply(
+                    params, trajectories.first.obs, trajectories.first.action
+                )
                 td_errors = q_values - target_q_values
                 loss = jnp.mean(td_errors**2)
                 return loss
 
             loss, grads = jax.value_and_grad(loss_fn)(critic_state.params)
             critic_state = critic_state.apply_gradients(grads=grads)
-            carry = (actor_state, critic_state, buffer_state, rng)
+            carry = (actor_state, critic_state, trajectories)
             return carry, loss
 
-        def update_actor(
-            carry: Tuple[DDPGTrainState, DDPGTrainState, BufferState, chex.PRNGKey], _
-        ):
-            actor_state, critic_state, buffer_state, rng = carry
-            rng, buffer_rng = jax.random.split(rng)
-            trajectories = buffer.sample(buffer_state, buffer_rng)
+        def update_actor(carry: Tuple[DDPGTrainState, DDPGTrainState, Transition], _):
+            actor_state, critic_state, trajectories = carry
 
             def loss_fn(params):
-                actions = actor.apply(params, trajectories.obs)
-                q_values = critic.apply(critic_state.params, trajectories.obs, actions)
+                actions = actor.apply(params, trajectories.first.obs)
+                q_values = critic.apply(
+                    critic_state.params, trajectories.first.obs, actions
+                )
                 loss = -jnp.mean(q_values)
                 return loss
 
             loss, grads = jax.value_and_grad(loss_fn)(actor_state.params)
             actor_state = actor_state.apply_gradients(grads=grads)
-            carry = (actor_state, critic_state, buffer_state, rng)
+            carry = (actor_state, critic_state, trajectories)
             return carry, loss
 
         def update(
@@ -263,16 +271,18 @@ def make_train(
             buffer_state: BufferState,
             rng: chex.PRNGKey,
         ) -> Tuple[DDPGTrainState, DDPGTrainState, jnp.ndarray]:
-            rng, actor_rng, critic_rng = jax.random.split(rng, 3)
-            (actor_state, critic_state, buffer_state, _), critic_losses = jax.lax.scan(
+            rng, buffer_rng = jax.random.split(rng)
+            sample = buffer.sample(buffer_state, buffer_rng)
+            trajectories = sample.experience
+            (actor_state, critic_state, trajectories), critic_losses = jax.lax.scan(
                 update_critic,
-                (actor_state, critic_state, buffer_state, critic_rng),
+                (actor_state, critic_state, trajectories),
                 None,
                 critic_epochs,
             )
-            (actor_state, critic_state, buffer_state, _), actor_losses = jax.lax.scan(
+            (actor_state, critic_state, trajectories), actor_losses = jax.lax.scan(
                 update_actor,
-                (actor_state, critic_state, buffer_state, actor_rng),
+                (actor_state, critic_state, trajectories),
                 None,
                 actor_epochs,
             )
@@ -325,34 +335,26 @@ def make_train(
             rng, update_rng = jax.random.split(rng)
             actor_state, critic_state, actor_losses, critic_losses = jax.lax.cond(
                 is_learning_step,
-                lambda: update(actor_state, critic_state, buffer_state, update_rng),
-                lambda: (actor_state, critic_state, jnp.array(0.0), jnp.array(0.0)),
-                actor_state,
-                critic_state,
-                buffer_state,
-                update_rng,
+                lambda args: update(*args),
+                lambda args: (
+                    args[0],
+                    args[1],
+                    jnp.zeros(actor_epochs),
+                    jnp.zeros(critic_epochs),
+                ),
+                (actor_state, critic_state, buffer_state, update_rng),
             )
 
-            has_episodes = info["returned_episode"].sum() > 0
-            should_log = is_learning_step | has_episodes
-            metrics = jax.lax.cond(
-                should_log,
-                lambda: {
-                    "step": env_step,
-                    "actor_loss": actor_losses.mean(),
-                    "critic_loss": critic_losses.mean(),
-                    "buffer_size": buffer_state.current_index,
-                    "returns": info["returned_episode_returns"].mean(),
-                    "episode_lengths": info["returned_episode_lengths"].mean(),
-                    "is_learning": is_learning_step,
-                    "should_log": True,
-                },
-                lambda: {
-                    "step": env_step,
-                    "should_log": False,
-                    "buffer_size": buffer_state.current_index,
-                },
-            )
+            metrics = {
+                "step": env_step,
+                "actor_loss": actor_losses.mean(),
+                "critic_loss": critic_losses.mean(),
+                "buffer_size": buffer_state.current_index,
+                "returns": info["returned_episode_returns"].mean(),
+                "episode_lengths": info["returned_episode_lengths"].mean(),
+                "is_learning": is_learning_step,
+            }
+
             carry = (
                 actor_state,
                 critic_state,
@@ -376,5 +378,66 @@ def make_train(
 if __name__ == "__main__":
     from gymnax.environments import Pendulum
 
+    SEED = 0
+    NUM_SEEDS = 1
+    WANDB = "online"
+
     env = Pendulum()
     env_params = env.default_params
+
+    wandb.login(os.environ.get("WANDB_KEY"))
+    wandb.init(
+        project="Tinker",
+        tags=["DDPG", f"{env.name.upper()}", f"jax_{jax.__version__}"],
+        name=f"ddpg_{env.name}",
+        mode=WANDB,
+    )
+
+    rng = jax.random.PRNGKey(SEED)
+    rngs = jax.random.split(rng, NUM_SEEDS)
+
+    train_fn = make_train(
+        env,
+        env_params,
+        num_steps=int(1e6),
+        num_envs=1,
+        batch_size=32,
+        buffer_size=int(1e6),
+        actor_epochs=1,
+        critic_epochs=1,
+    )
+    train_vjit = jax.jit(jax.vmap(train_fn))
+    runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
+
+    if WANDB == "online":
+        num_steps = len(all_metrics["step"][0])
+        for update_idx in range(num_steps):
+            log_dict = {}
+
+            for run_idx in range(NUM_SEEDS):
+                run_prefix = f"run_{run_idx}"
+                log_dict.update(
+                    {
+                        f"{run_prefix}/step": all_metrics["step"][run_idx][update_idx],
+                        f"{run_prefix}/returns": all_metrics["returns"][run_idx][
+                            update_idx
+                        ],
+                        f"{run_prefix}/actor_loss": all_metrics["actor_loss"][run_idx][
+                            update_idx
+                        ],
+                        f"{run_prefix}/critic_loss": all_metrics["critic_loss"][
+                            run_idx
+                        ][update_idx],
+                        f"{run_prefix}/buffer_size": all_metrics["buffer_size"][
+                            run_idx
+                        ][update_idx],
+                        f"{run_prefix}/is_learning": all_metrics["is_learning"][
+                            run_idx
+                        ][update_idx],
+                        f"{run_prefix}/episode_lengths": all_metrics["episode_lengths"][
+                            run_idx
+                        ][update_idx],
+                    }
+                )
+
+            wandb.log(log_dict)
