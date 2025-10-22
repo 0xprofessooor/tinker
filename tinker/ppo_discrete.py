@@ -75,17 +75,17 @@ def make_train(
     num_steps: int,
     num_envs: int,
     train_freq: int,
-    num_minibatches: int,
+    batch_size: int,
     num_epochs: int,
-    activation: str,
-    lr: float,
-    anneal_lr: bool,
-    gamma: float,
-    gae_lambda: float,
-    entropy_coef: float,
-    value_coef: float,
-    max_grad_norm: float,
-    clip_eps: float,
+    activation: callable = nn.tanh,
+    lr: float = 3e-4,
+    anneal_lr: bool = False,
+    gae_gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    entropy_coef: float = 0.01,
+    value_coef: float = 0.5,
+    max_grad_norm: float = 0.5,
+    ratio_clip: float = 0.2,
 ):
     """Generate a jitted JAX PPO train function.
 
@@ -94,21 +94,21 @@ def make_train(
     :param num_steps: Total number of steps to train for.
     :param num_envs: Number of parallel environments to run.
     :param train_freq: Number of steps to run between training updates.
-    :param num_minibatches: Number of minibatches to split the data into.
-    :param num_epochs: Number of epochs to train for.
-    :param activation: Activation function for the network.
+    :param batch_size: Minibatch size to make a single gradient descent step on.
+    :param num_epochs: Number of epochs to train per update step.
+    :param activation: Activation function for the network hidden layers.
     :param lr: Learning rate for the optimizer.
     :param anneal_lr: Whether to anneal the learning rate over time.
-    :param gamma: Discount factor for the returns.
+    :param gae_gamma: Discount factor for the returns.
     :param gae_lambda: Lambda for the Generalized Advantage Estimation.
     :param entropy_coef: Coefficient for the entropy loss.
     :param value_coef: Coefficient for the value loss.
     :param max_grad_norm: Maximum gradient norm for clipping.
-    :param clip_eps: Epsilon for clipping the policy loss.
+    :param ratio_clip: The clipping factor for the clipped loss
     """
 
     num_updates = num_steps // train_freq // num_envs
-    minibatch_size = num_envs * train_freq // num_minibatches
+    num_minibatches = (num_envs * train_freq) // batch_size
     env = LogWrapper(env)
 
     def linear_schedule(count):
@@ -182,8 +182,8 @@ def make_train(
                         transition.value,
                         transition.reward,
                     )
-                    delta = reward + gamma * next_value * (1 - done) - value
-                    gae = delta + gamma * gae_lambda * (1 - done) * gae
+                    delta = reward + gae_gamma * next_value * (1 - done) - value
+                    gae = delta + gae_gamma * gae_lambda * (1 - done) * gae
                     return (gae, value), gae
 
                 _, advantages = jax.lax.scan(
@@ -210,7 +210,7 @@ def make_train(
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
                             value - traj_batch.value
-                        ).clip(-clip_eps, clip_eps)
+                        ).clip(-ratio_clip, ratio_clip)
                         value_losses = jnp.square(value - targets)
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
                         value_loss = (
@@ -224,8 +224,8 @@ def make_train(
                         loss_actor2 = (
                             jnp.clip(
                                 ratio,
-                                1.0 - clip_eps,
-                                1.0 + clip_eps,
+                                1.0 - ratio_clip,
+                                1.0 + ratio_clip,
                             )
                             * gae
                         )
@@ -250,21 +250,23 @@ def make_train(
                 train_state, traj_batch, advantages, targets, rng = update_state
                 rng, _rng = jax.random.split(rng)
                 # Batching and Shuffling
-                batch_size = minibatch_size * num_minibatches
-                assert batch_size == train_freq * num_envs, (
-                    "batch size must be equal to number of steps * number of envs"
+                total_batch_size = batch_size * num_minibatches
+                assert total_batch_size == train_freq * num_envs, (
+                    "total batch size must be equal to number of steps * number of envs"
                 )
-                permutation = jax.random.permutation(_rng, batch_size)
+                permutation = jax.random.permutation(_rng, total_batch_size)
                 batch = (traj_batch, advantages, targets)
                 batch = jax.tree_util.tree_map(
-                    lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
+                    lambda x: x.reshape((total_batch_size,) + x.shape[2:]), batch
                 )
                 shuffled_batch = jax.tree_util.tree_map(
                     lambda x: jnp.take(x, permutation, axis=0), batch
                 )
                 # Mini-batch Updates
                 minibatches = jax.tree_util.tree_map(
-                    lambda x: jnp.reshape(x, [num_minibatches, -1] + list(x.shape[1:])),
+                    lambda x: jnp.reshape(
+                        x, [num_minibatches, batch_size] + list(x.shape[1:])
+                    ),
                     shuffled_batch,
                 )
                 train_state, total_loss = jax.lax.scan(
@@ -373,7 +375,7 @@ if __name__ == "__main__":
         "TRAIN_FREQ": 128,
         "TOTAL_TIMESTEPS": 5e5,
         "UPDATE_EPOCHS": 4,
-        "NUM_MINIBATCHES": 4,
+        "BATCH_SIZE": 32,
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
@@ -383,7 +385,7 @@ if __name__ == "__main__":
         "ACTIVATION": "tanh",
         "ANNEAL_LR": False,
         "WANDB_MODE": "online",  # set to online to activate wandb
-        "NUM_SEEDS": 2,
+        "NUM_SEEDS": 1,
         "SEED": 0,
     }
 
@@ -404,17 +406,17 @@ if __name__ == "__main__":
         num_steps=config["TOTAL_TIMESTEPS"],
         num_envs=config["NUM_ENVS"],
         train_freq=config["TRAIN_FREQ"],
-        num_minibatches=config["NUM_MINIBATCHES"],
+        batch_size=config["BATCH_SIZE"],
         num_epochs=config["UPDATE_EPOCHS"],
-        activation=config["ACTIVATION"],
+        activation=nn.tanh if config["ACTIVATION"] == "tanh" else nn.relu,
         lr=config["LR"],
         anneal_lr=config["ANNEAL_LR"],
-        gamma=config["GAMMA"],
+        gae_gamma=config["GAMMA"],
         gae_lambda=config["GAE_LAMBDA"],
         entropy_coef=config["ENT_COEF"],
         value_coef=config["VF_COEF"],
         max_grad_norm=config["MAX_GRAD_NORM"],
-        clip_eps=config["CLIP_EPS"],
+        ratio_clip=config["CLIP_EPS"],
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
