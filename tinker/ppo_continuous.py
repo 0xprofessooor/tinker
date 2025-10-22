@@ -78,8 +78,8 @@ def make_train(
     anneal_lr: bool = False,
     gae_gamma: float = 0.99,
     gae_lambda: float = 0.95,
-    entropy_coef: float = 0.01,
-    value_coef: float = 0.5,
+    entropy_coeff: float = 0.01,
+    value_coeff: float = 0.5,
     max_grad_norm: float = 0.5,
     ratio_clip: float = 0.2,
 ):
@@ -97,8 +97,8 @@ def make_train(
     :param anneal_lr: Whether to anneal the learning rate over time.
     :param gae_gamma: Discount factor for the returns.
     :param gae_lambda: Lambda for the Generalized Advantage Estimation.
-    :param entropy_coef: Coefficient for the entropy loss.
-    :param value_coef: Coefficient for the value loss.
+    :param entropy_coeff: Coefficient for the entropy loss.
+    :param value_coeff: Coefficient for the value loss.
     :param max_grad_norm: Maximum gradient norm for clipping.
     :param ratio_clip: The clipping factor for the clipped loss
     """
@@ -233,8 +233,8 @@ def make_train(
 
                         total_loss = (
                             loss_actor
-                            + value_coef * value_loss
-                            - entropy_coef * entropy
+                            + value_coeff * value_loss
+                            - entropy_coeff * entropy
                         )
                         return total_loss, (value_loss, loss_actor, entropy)
 
@@ -411,8 +411,8 @@ if __name__ == "__main__":
         anneal_lr=config["ANNEAL_LR"],
         gae_gamma=config["GAMMA"],
         gae_lambda=config["GAE_LAMBDA"],
-        entropy_coef=config["ENT_COEF"],
-        value_coef=config["VF_COEF"],
+        entropy_coeff=config["ENT_COEF"],
+        value_coeff=config["VF_COEF"],
         max_grad_norm=config["MAX_GRAD_NORM"],
         ratio_clip=config["CLIP_EPS"],
     )
