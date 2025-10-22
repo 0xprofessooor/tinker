@@ -333,14 +333,26 @@ def make_train(
                 update_rng,
             )
 
-            metrics = {
-                "step": env_step,
-                "actor_loss": actor_losses.mean(),
-                "critic_loss": critic_losses.mean(),
-                "buffer_size": buffer_state.current_index,
-                "returns": info["returned_episode_returns"].mean(),
-                "is_learning": is_learning_step,
-            }
+            has_episodes = info["returned_episode"].sum() > 0
+            should_log = is_learning_step | has_episodes
+            metrics = jax.lax.cond(
+                should_log,
+                lambda: {
+                    "step": env_step,
+                    "actor_loss": actor_losses.mean(),
+                    "critic_loss": critic_losses.mean(),
+                    "buffer_size": buffer_state.current_index,
+                    "returns": info["returned_episode_returns"].mean(),
+                    "episode_lengths": info["returned_episode_lengths"].mean(),
+                    "is_learning": is_learning_step,
+                    "should_log": True,
+                },
+                lambda: {
+                    "step": env_step,
+                    "should_log": False,
+                    "buffer_size": buffer_state.current_index,
+                },
+            )
             carry = (
                 actor_state,
                 critic_state,
