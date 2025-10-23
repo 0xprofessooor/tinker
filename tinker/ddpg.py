@@ -222,8 +222,9 @@ def make_train(
             )
             return action, rng
 
-        def update_critic(carry, _):
-            actor_state, critic_state, trajectories = carry
+        def update_critic(carry, xs):
+            actor_state, critic_state = carry
+            trajectories = xs
 
             next_actions = actor.apply(
                 actor_state.target_params, trajectories.second.obs
@@ -246,11 +247,12 @@ def make_train(
 
             loss, grads = jax.value_and_grad(loss_fn)(critic_state.params)
             critic_state = critic_state.apply_gradients(grads=grads)
-            carry = (actor_state, critic_state, trajectories)
+            carry = (actor_state, critic_state)
             return carry, loss
 
-        def update_actor(carry, _):
-            actor_state, critic_state, trajectories = carry
+        def update_actor(carry, xs):
+            actor_state, critic_state = carry
+            trajectories = xs
 
             def loss_fn(params):
                 actions = actor.apply(params, trajectories.first.obs)
@@ -262,7 +264,7 @@ def make_train(
 
             loss, grads = jax.value_and_grad(loss_fn)(actor_state.params)
             actor_state = actor_state.apply_gradients(grads=grads)
-            carry = (actor_state, critic_state, trajectories)
+            carry = (actor_state, critic_state)
             return carry, loss
 
         def update(
@@ -272,19 +274,20 @@ def make_train(
             rng: chex.PRNGKey,
         ) -> Tuple[DDPGTrainState, DDPGTrainState, jnp.ndarray]:
             rng, buffer_rng = jax.random.split(rng)
-            sample = buffer.sample(buffer_state, buffer_rng)
-            trajectories = sample.experience
-            (actor_state, critic_state, trajectories), critic_losses = jax.lax.scan(
-                update_critic,
-                (actor_state, critic_state, trajectories),
-                None,
-                critic_epochs,
+            sample_rngs = jax.random.split(buffer_rng, critic_epochs)
+            samples = jax.vmap(buffer.sample, in_axes=(None, 0))(
+                buffer_state, sample_rngs
             )
-            (actor_state, critic_state, trajectories), actor_losses = jax.lax.scan(
+            trajectories = samples.experience
+            (actor_state, critic_state), critic_losses = jax.lax.scan(
+                update_critic,
+                (actor_state, critic_state),
+                trajectories,
+            )
+            (actor_state, critic_state), actor_losses = jax.lax.scan(
                 update_actor,
-                (actor_state, critic_state, trajectories),
-                None,
-                actor_epochs,
+                (actor_state, critic_state),
+                trajectories,
             )
 
             # UPDATE TARGET NETWORKS
