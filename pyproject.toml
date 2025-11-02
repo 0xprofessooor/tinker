@@ -5,6 +5,7 @@ description = "Implementations of reinforcement learning algorithms"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "arch>=8.0.0",
     "chex>=0.1.91",
     "distrax>=0.1.7",
     "flashbax>=0.1.3",
