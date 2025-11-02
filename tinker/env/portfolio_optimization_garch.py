@@ -1,0 +1,502 @@
+from functools import partial
+from typing import Dict, Tuple, Optional
+from enum import Enum
+from gymnax.environments.environment import Environment, EnvParams, EnvState
+from gymnax.environments import spaces
+from flax import struct
+import chex
+import jax
+from jax import numpy as jnp
+
+
+class BinanceFeeTier(Enum):
+    REGULAR = 0.001
+    VIP_1 = 0.001
+    VIP_2 = 0.001
+    VIP_3 = 0.0006
+    VIP_4 = 0.00052
+    VIP_5 = 0.00031
+    VIP_6 = 0.00029
+    VIP_7 = 0.00028
+    VIP_8 = 0.00025
+    VIP_9 = 0.00023
+
+
+@struct.dataclass
+class GARCHParams:
+    """Parameters for GARCH(p,q) process."""
+
+    omega: float  # Constant term in variance equation
+    alpha: chex.Array  # ARCH coefficients (length q)
+    beta: chex.Array  # GARCH coefficients (length p)
+    mu: float  # Mean return
+    initial_price: float  # Starting price for the asset
+
+
+@struct.dataclass
+class VecGARCHParams:
+    """Parameters for GARCH(p,q) process."""
+
+    omega: chex.Array  # Constant term in variance equation
+    alpha: chex.Array  # ARCH coefficients (length q)
+    beta: chex.Array  # GARCH coefficients (length p)
+    mu: chex.Array  # Mean return
+    initial_price: chex.Array  # Starting price for the asset
+
+
+@struct.dataclass
+class EnvState:
+    step: int
+    prices: chex.Array  # Current prices for all assets
+    holdings: chex.Array  # Current holdings
+    values: chex.Array  # Current values
+    total_value: float
+    # Pre-generated GARCH paths (generated at reset)
+    returns_path: chex.Array  # Pre-simulated returns (max_steps + lookback, num_assets)
+    volatilities_path: (
+        chex.Array
+    )  # Pre-simulated volatilities (max_steps + lookback, num_assets)
+
+
+@struct.dataclass
+class EnvParams:
+    max_steps: int
+    initial_cash: float
+    taker_fee: float
+    gas_fee: float
+    trade_threshold: float
+    lookback_window: int  # Number of past observations in state
+    garch_params: Tuple[GARCHParams, ...]  # GARCH params for each asset
+
+
+@jax.jit
+def _sample_garch(carry, x):
+    """
+    JIT-compiled step function for jax.lax.scan.
+
+    This function is vectorized to process all assets in parallel for a single time step.
+
+    Args:
+        carry: A tuple containing (params, garch_state)
+            - params: A GARCHParams pytree where each field is a (num_assets, ...) array.
+            - garch_state: A tuple (last_vols, last_returns, last_price)
+                - last_vols: (num_assets, p) array of past volatilities
+                - last_returns: (num_assets, q) array of past returns
+                - last_price: (num_assets,) array of prices from t-1
+        x: (num_assets,) array of standard normal random shocks for time t.
+
+    Returns:
+        new_carry: The updated carry for time t+1
+        y_t: A tuple (new_return, new_vol, new_price) of outputs to stack
+            - new_return: (num_assets,) array of returns for time t
+            - new_vol: (num_assets,) array of volatilities for time t
+            - new_price: (num_assets,) array of prices for time t
+    """
+    # Unpack carry
+    params, (last_vols, last_returns, last_price) = carry
+    noise = x  # (num_assets,)
+
+    # GARCH(p,q) equations (all vectorized)
+    # sigma_t^2 = omega + sum(alpha * residuals^2) + sum(beta * vols^2)
+    residuals = last_returns - params.mu  # (num_assets, q)
+    arch_term = (params.alpha * residuals**2).sum(axis=-1)
+    garch_term = (params.beta * last_vols**2).sum(axis=-1)
+    variance = params.omega + arch_term + garch_term
+    new_vol = jnp.sqrt(jnp.maximum(variance, 1e-8))  # Ensure positive variance
+
+    # r_t = mu + sigma_t * epsilon_t
+    new_return = params.mu + new_vol * noise
+    new_price = last_price * jnp.exp(new_return)
+
+    # Update GARCH state
+    y = (new_return, new_vol, new_price)
+    new_last_vols = jnp.roll(last_vols, shift=1, axis=-1)
+    new_last_vols = new_last_vols.at[:, 0].set(new_vol)
+    new_last_returns = jnp.roll(last_returns, shift=1, axis=-1)
+    new_last_returns = new_last_returns.at[:, 0].set(new_return)
+    new_carry = (params, (new_last_vols, new_last_returns, new_price))
+    return new_carry, y
+
+
+class PortfolioOptimizationGARCH(Environment):
+    """Portfolio optimization environment with GARCH-simulated asset returns."""
+
+    def __init__(
+        self,
+        rng: chex.PRNGKey,
+        garch_params: Dict[str, GARCHParams],
+        step_size: int = 1,
+        total_samples: int = 10_000_000,
+    ):
+        """
+        Initialize GARCH portfolio environment.
+
+        Args:
+            rng: Random key for generating GARCH paths
+            garch_params: Dict mapping asset names to GARCHParams
+            step_size: Step size for sampling (if subsampling the data)
+            total_samples: Total number of time steps to generate
+        """
+        super().__init__()
+        self.asset_names = sorted(garch_params.keys())
+        self.num_assets = len(self.asset_names)
+        self.step_size = step_size
+        self.total_samples = total_samples
+
+        # Store individual GARCH params for default_params property
+        self._garch_configs = {name: garch_params[name] for name in self.asset_names}
+
+        # Stack GARCHParams into vectorized arrays for parallel processing
+        # Each field becomes (num_assets, ...) shaped
+        max_p = max(len(gp.beta) for gp in garch_params.values())
+        max_q = max(len(gp.alpha) for gp in garch_params.values())
+
+        # Pad alpha and beta to same length for vectorization
+        omega_vec = jnp.array([garch_params[name].omega for name in self.asset_names])
+        mu_vec = jnp.array([garch_params[name].mu for name in self.asset_names])
+        initial_price_vec = jnp.array(
+            [garch_params[name].initial_price for name in self.asset_names]
+        )
+
+        alpha_list = []
+        beta_list = []
+        for name in self.asset_names:
+            gp = garch_params[name]
+            # Pad with zeros to max length
+            alpha_padded = jnp.pad(gp.alpha, (0, max_q - len(gp.alpha)))
+            beta_padded = jnp.pad(gp.beta, (0, max_p - len(gp.beta)))
+            alpha_list.append(alpha_padded)
+            beta_list.append(beta_padded)
+
+        alpha_vec = jnp.stack(alpha_list, axis=0)  # (num_assets, max_q)
+        beta_vec = jnp.stack(beta_list, axis=0)  # (num_assets, max_p)
+
+        stacked_params = VecGARCHParams(
+            omega=omega_vec,
+            alpha=alpha_vec,
+            beta=beta_vec,
+            mu=mu_vec,
+            initial_price=initial_price_vec,
+        )
+
+        # Initialize GARCH state with unconditional variance
+        alpha_sum = alpha_vec.sum(axis=-1)  # (num_assets,)
+        beta_sum = beta_vec.sum(axis=-1)  # (num_assets,)
+        uncond_var = omega_vec / (1 - alpha_sum - beta_sum)
+        uncond_vol = jnp.sqrt(jnp.maximum(uncond_var, 1e-8))
+
+        # Initialize state with burn-in using unconditional moments
+        initial_vols = jnp.tile(uncond_vol[:, None], (1, max_p))  # (num_assets, p)
+        initial_returns = jnp.tile(mu_vec[:, None], (1, max_q))  # (num_assets, q)
+        initial_prices = initial_price_vec  # (num_assets,)
+
+        initial_state = (initial_vols, initial_returns, initial_prices)
+
+        # Generate noise for all time steps: (total_samples, num_assets)
+        rng, noise_rng = jax.random.split(rng)
+        noise = jax.random.normal(noise_rng, (total_samples, self.num_assets))
+
+        # Run GARCH simulation
+        _, outputs = jax.lax.scan(_sample_garch, (stacked_params, initial_state), noise)
+
+        # Unpack outputs: each is (total_samples, num_assets)
+        self.returns, self.volatilities, self.prices = outputs
+
+    @property
+    def name(self) -> str:
+        return "PortfolioOptimizationGARCH"
+
+    @property
+    def default_params(self) -> EnvParams:
+        # Convert stored GARCH configs to GARCHParams tuple
+        garch_params = tuple(self._garch_configs[name] for name in self.asset_names)
+
+        return EnvParams(
+            max_steps=2160,
+            initial_cash=1000.0,
+            taker_fee=BinanceFeeTier.REGULAR.value,
+            gas_fee=0.0,
+            trade_threshold=1.0,
+            lookback_window=60,  # Use last 60 observations
+            garch_params=garch_params,
+        )
+
+    def action_space(self, params: EnvParams) -> spaces.Box:
+        """Action space: portfolio weights (including cash)."""
+        return spaces.Box(
+            low=-jnp.inf,
+            high=jnp.inf,
+            shape=(self.num_assets + 1,),  # +1 for cash
+            dtype=jnp.float32,
+        )
+
+    def observation_space(self, params: EnvParams) -> spaces.Box:
+        """Observation: recent returns and volatilities for all assets."""
+        # Features: returns and volatilities for each asset over lookback window
+        obs_shape = (params.lookback_window * self.num_assets * 2,)
+        return spaces.Box(
+            low=-jnp.inf, high=jnp.inf, shape=obs_shape, dtype=jnp.float32
+        )
+
+    def _generate_garch_path(
+        self,
+        key: chex.PRNGKey,
+        garch_params: GARCHParams,
+        num_steps: int,
+    ) -> Tuple[chex.Array, chex.Array]:
+        """
+        Pre-generate entire GARCH(p,q) path.
+
+        Args:
+            key: Random key
+            garch_params: GARCH parameters
+            num_steps: Total number of steps to simulate
+
+        Returns:
+            (returns, volatilities) both of shape (num_steps,)
+        """
+        p = len(garch_params.beta)
+        q = len(garch_params.alpha)
+        max_lag = max(p, q)
+
+        # Initialize arrays
+        returns = jnp.zeros(num_steps)
+        volatilities = jnp.zeros(num_steps)
+
+        # Compute unconditional variance for burn-in
+        alpha_sum = jnp.sum(garch_params.alpha)
+        beta_sum = jnp.sum(garch_params.beta)
+        uncond_var = garch_params.omega / (1 - alpha_sum - beta_sum)
+        uncond_vol = jnp.sqrt(jnp.maximum(uncond_var, 1e-8))
+
+        # Generate random shocks for all steps
+        shocks = jax.random.normal(key, (num_steps,))
+
+        # Burn-in period with unconditional variance
+        for t in range(max_lag):
+            returns = returns.at[t].set(garch_params.mu + uncond_vol * shocks[t])
+            volatilities = volatilities.at[t].set(uncond_vol)
+
+        # Simulate GARCH process
+        def step_fn(carry, t):
+            returns_arr, vols_arr = carry
+
+            # Compute conditional variance
+            variance = garch_params.omega
+
+            # ARCH component - use squared residuals (demeaned returns)
+            for i in range(q):
+                residual = returns_arr[t - i - 1] - garch_params.mu
+                variance += garch_params.alpha[i] * (residual**2)
+
+            # GARCH component
+            for j in range(p):
+                variance += garch_params.beta[j] * (vols_arr[t - j - 1] ** 2)
+
+            variance = jnp.maximum(variance, 1e-8)
+            vol = jnp.sqrt(variance)
+            ret = garch_params.mu + vol * shocks[t]
+
+            returns_arr = returns_arr.at[t].set(ret)
+            vols_arr = vols_arr.at[t].set(vol)
+
+            return (returns_arr, vols_arr), None
+
+        # Use scan for efficient loop
+        (returns, volatilities), _ = jax.lax.scan(
+            step_fn, (returns, volatilities), jnp.arange(max_lag, num_steps)
+        )
+
+        return returns, volatilities
+
+    def get_obs(self, state: EnvState, params: EnvParams) -> chex.Array:
+        """Get observation from current state."""
+        # Extract recent returns and volatilities from pre-generated path
+        start_idx = jnp.maximum(0, state.step - params.lookback_window)
+        returns_window = jax.lax.dynamic_slice(
+            state.returns_path,
+            (start_idx, 0),
+            (params.lookback_window, self.num_assets),
+        )
+        vols_window = jax.lax.dynamic_slice(
+            state.volatilities_path,
+            (start_idx, 0),
+            (params.lookback_window, self.num_assets),
+        )
+
+        # Flatten: [returns_asset0, ..., vols_asset0, ...]
+        obs = jnp.concatenate([returns_window.flatten(), vols_window.flatten()])
+        return obs
+
+    def reward(
+        self, state: EnvState, next_state: EnvState, params: EnvParams
+    ) -> chex.Array:
+        """Log return of portfolio value."""
+        log_return = jnp.log(next_state.total_value) - jnp.log(state.total_value)
+        return log_return
+
+    def is_terminal(self, state: EnvState, params: EnvParams) -> chex.Array:
+        """Check if episode is done."""
+        # Account for lookback_window offset in step count
+        max_steps_reached = state.step >= (params.max_steps + params.lookback_window)
+        portfolio_bankrupt = state.total_value <= 0
+        return jnp.logical_or(max_steps_reached, portfolio_bankrupt)
+
+    def step_env(
+        self, key: chex.PRNGKey, state: EnvState, action: chex.Array, params: EnvParams
+    ) -> tuple[chex.Array, EnvState, chex.Array, chex.Array, dict]:
+        """Execute one environment step with pre-generated GARCH prices."""
+
+        # Get pre-generated returns for current step
+        new_returns = state.returns_path[state.step, :]
+        new_volatilities = state.volatilities_path[state.step, :]
+
+        # Update prices based on returns: P_t = P_{t-1} * exp(r_t)
+        asset_prices = state.prices[1:] * jnp.exp(new_returns)
+        prices = jnp.concatenate([jnp.array([1.0]), asset_prices])
+
+        # Normalize action to portfolio weights
+        weights = jax.nn.softmax(action)
+
+        ############### UPDATE PORTFOLIO WITH FEES ###############
+        values = state.holdings * prices
+        total_value = jnp.sum(values)
+        asset_values = values[1:]
+        asset_weights = weights[1:]
+        new_asset_values_no_fee = total_value * asset_weights
+        deltas_no_fee = new_asset_values_no_fee - asset_values
+        num_trades = jnp.sum(jnp.abs(deltas_no_fee) > params.trade_threshold)
+        gas_cost = params.gas_fee * num_trades
+
+        # Split buy and sell orders
+        buy_indices = deltas_no_fee > params.trade_threshold
+        sell_indices = deltas_no_fee < -params.trade_threshold
+        no_trade_indices = jnp.concatenate(
+            [jnp.array([False]), jnp.abs(deltas_no_fee) <= params.trade_threshold]
+        )
+        buy_weights = jnp.where(buy_indices, asset_weights, 0.0)
+        sell_weights = jnp.where(sell_indices, asset_weights, 0.0)
+        current_buy_values = jnp.where(buy_indices, asset_values, 0.0)
+        current_sell_values = jnp.where(sell_indices, asset_values, 0.0)
+
+        # Calculate new portfolio value after fees
+        fee_param = params.taker_fee / (1 - params.taker_fee)
+        numerator = (
+            total_value
+            - gas_cost
+            + fee_param * (jnp.sum(current_buy_values) - jnp.sum(current_sell_values))
+        )
+        denominator = 1 + fee_param * (jnp.sum(buy_weights) - jnp.sum(sell_weights))
+        new_total_value = numerator / denominator
+        new_values = new_total_value * weights
+        adj_new_values = jnp.where(no_trade_indices, values, new_values)
+        delta_values = new_values - adj_new_values
+        delta_cash = jnp.sum(delta_values)
+        adj_new_values = adj_new_values.at[0].add(delta_cash)
+        new_holdings = adj_new_values / prices
+
+        next_state = EnvState(
+            step=state.step + 1,
+            prices=prices,
+            holdings=new_holdings,
+            values=adj_new_values,
+            total_value=new_total_value,
+            returns_path=state.returns_path,  # Keep same pre-generated path
+            volatilities_path=state.volatilities_path,
+        )
+
+        obs = self.get_obs(next_state, params)
+        reward = self.reward(state, next_state, params)
+        done = self.is_terminal(next_state, params)
+        info = {
+            "returns": new_returns,
+            "volatilities": new_volatilities,
+        }
+        return obs, next_state, reward, done, info
+
+    def reset_env(
+        self, key: chex.PRNGKey, params: EnvParams
+    ) -> Tuple[chex.Array, EnvState]:
+        """Reset environment and pre-generate GARCH paths."""
+
+        # Pre-generate GARCH paths for entire episode
+        total_steps = params.max_steps + params.lookback_window
+
+        # Split keys for each asset
+        keys = jax.random.split(key, self.num_assets)
+
+        # Generate paths for all assets
+        all_returns = []
+        all_volatilities = []
+
+        for i, garch_params in enumerate(params.garch_params):
+            returns, volatilities = self._generate_garch_path(
+                keys[i],
+                garch_params,
+                total_steps,
+            )
+            all_returns.append(returns)
+            all_volatilities.append(volatilities)
+
+        # Stack into (total_steps, num_assets) arrays
+        returns_path = jnp.stack(all_returns, axis=1)
+        volatilities_path = jnp.stack(all_volatilities, axis=1)
+
+        # Initialize prices at initial_price for each asset
+        initial_asset_prices = jnp.array(
+            [gp.initial_price for gp in params.garch_params]
+        )
+        prices = jnp.concatenate([jnp.array([1.0]), initial_asset_prices])
+
+        # Initialize holdings (all cash)
+        holdings = jnp.zeros(self.num_assets + 1)
+        holdings = holdings.at[0].set(params.initial_cash)
+        values = holdings * prices
+        total_value = jnp.sum(values)
+
+        # Start after lookback window so we have history
+        state = EnvState(
+            step=params.lookback_window,
+            prices=prices,
+            holdings=holdings,
+            values=values,
+            total_value=total_value,
+            returns_path=returns_path,
+            volatilities_path=volatilities_path,
+        )
+
+        obs = self.get_obs(state, params)
+        return obs, state
+
+
+if __name__ == "__main__":
+    from matplotlib import pyplot as plt
+
+    rng = jax.random.PRNGKey(0)
+    garch_params = {
+        "AssetA": GARCHParams(
+            omega=1e-6,
+            alpha=jnp.array([0.1]),
+            beta=jnp.array([0.6]),
+            mu=1e-6,
+            initial_price=100.0,
+        ),
+        "AssetB": GARCHParams(
+            omega=0,
+            alpha=jnp.array([0.0001]),
+            beta=jnp.array([0.00001]),
+            mu=0,
+            initial_price=50.0,
+        ),
+    }
+    env = PortfolioOptimizationGARCH(rng, garch_params)
+    print(env.returns.shape)  # Should be (1000, 2)
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(env.prices[:, 0], label="AssetA Prices")
+    plt.plot(env.prices[:, 1], label="AssetB Prices")
+    plt.title("GARCH Simulated Prices")
+    plt.xlabel("Time Steps")
+    plt.ylabel("Prices")
+    plt.legend()
+    plt.show()
