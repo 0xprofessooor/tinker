@@ -182,7 +182,8 @@ class PortfolioOptimizationGARCH(Environment):
         # Initialize GARCH state with unconditional variance
         alpha_sum = alpha_vec.sum(axis=-1)  # (num_assets,)
         beta_sum = beta_vec.sum(axis=-1)  # (num_assets,)
-        uncond_var = omega_vec / (1 - alpha_sum - beta_sum)
+        denominator = 1 - alpha_sum - beta_sum
+        uncond_var = jnp.where(denominator < 1e-6, omega_vec, omega_vec / denominator)
         uncond_vol = jnp.sqrt(jnp.maximum(uncond_var, 1e-8))
 
         # Initialize state with burn-in using unconditional moments
@@ -474,27 +475,18 @@ if __name__ == "__main__":
 
     rng = jax.random.PRNGKey(0)
     garch_params = {
-        "AssetA": GARCHParams(
-            omega=1e-6,
-            alpha=jnp.array([0.1]),
-            beta=jnp.array([0.6]),
-            mu=1e-6,
-            initial_price=100.0,
-        ),
-        "AssetB": GARCHParams(
-            omega=0,
-            alpha=jnp.array([0.0001]),
-            beta=jnp.array([0.00001]),
+        "RealAsset": GARCHParams(
+            omega=0.0000001110,
+            alpha=jnp.array([0.16515]),
+            beta=jnp.array([0.83485]),
             mu=0,
-            initial_price=50.0,
+            initial_price=100.0,
         ),
     }
     env = PortfolioOptimizationGARCH(rng, garch_params)
-    print(env.returns.shape)  # Should be (1000, 2)
 
     plt.figure(figsize=(12, 6))
-    plt.plot(env.prices[:, 0], label="AssetA Prices")
-    plt.plot(env.prices[:, 1], label="AssetB Prices")
+    plt.plot(env.prices[:, 0], label="RealAsset Prices")
     plt.title("GARCH Simulated Prices")
     plt.xlabel("Time Steps")
     plt.ylabel("Prices")
