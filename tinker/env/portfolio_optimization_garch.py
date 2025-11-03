@@ -258,8 +258,7 @@ class PortfolioOptimizationGARCH(Environment):
 
     def is_terminal(self, state: EnvState, params: EnvParams) -> chex.Array:
         """Check if episode is done."""
-        # Account for lookback_window offset in step count
-        max_steps_reached = state.step >= (params.max_steps + params.lookback_window)
+        max_steps_reached = state.step >= params.max_steps
         portfolio_bankrupt = state.total_value <= 0
         return jnp.logical_or(max_steps_reached, portfolio_bankrupt)
 
@@ -358,9 +357,7 @@ class PortfolioOptimizationGARCH(Environment):
 
 
 if __name__ == "__main__":
-    from matplotlib import pyplot as plt
-
-    rng = jax.random.PRNGKey(1000)
+    rng = jax.random.PRNGKey(0)
     garch_params = {
         "BTC": GARCHParams(
             mu=0,
@@ -378,12 +375,10 @@ if __name__ == "__main__":
         ),
     }
     env = PortfolioOptimizationGARCH(rng, garch_params)
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(env.prices[:, 0], label="BTC")
-    plt.plot(env.prices[:, 1], label="ETH")
-    plt.title("GARCH Simulated Prices")
-    plt.xlabel("Time Steps")
-    plt.ylabel("Prices")
-    plt.legend()
-    plt.show()
+    obs, state = env.reset(rng, env.default_params)
+    print(state)
+    action = jnp.array([0.999995, 0.000003, 0.0000002])  # Example action
+    next_obs, next_state, reward, done, info = env.step_env(
+        rng, state, action, env.default_params
+    )
+    print(next_state)
