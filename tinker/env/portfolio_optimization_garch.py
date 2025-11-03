@@ -360,20 +360,28 @@ class PortfolioOptimizationGARCH(Environment):
 if __name__ == "__main__":
     from matplotlib import pyplot as plt
 
-    rng = jax.random.PRNGKey(0)
+    rng = jax.random.PRNGKey(1000)
     garch_params = {
-        "RealAsset": GARCHParams(
-            omega=0.0000001110,
-            alpha=jnp.array([0.16515]),
-            beta=jnp.array([0.83485]),
+        "BTC": GARCHParams(
             mu=0,
-            initial_price=100.0,
+            omega=0.0000001110,
+            alpha=jnp.array([0.165]),
+            beta=jnp.array([0.8]),
+            initial_price=66084.0,
+        ),
+        "ETH": GARCHParams(
+            mu=0,
+            omega=0.0000004817,
+            alpha=jnp.array([0.15]),
+            beta=jnp.array([0.8]),
+            initial_price=2629.79,
         ),
     }
     env = PortfolioOptimizationGARCH(rng, garch_params)
 
     plt.figure(figsize=(12, 6))
-    plt.plot(env.prices[:, 0], label="RealAsset Prices")
+    plt.plot(env.prices[:, 0], label="BTC")
+    plt.plot(env.prices[:, 1], label="ETH")
     plt.title("GARCH Simulated Prices")
     plt.xlabel("Time Steps")
     plt.ylabel("Prices")
