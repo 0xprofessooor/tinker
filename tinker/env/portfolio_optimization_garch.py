@@ -6,6 +6,7 @@ from flax import struct
 import chex
 import jax
 from jax import numpy as jnp
+from matplotlib import pyplot as plt
 
 
 class BinanceFeeTier(Enum):
@@ -360,6 +361,41 @@ class PortfolioOptimizationGARCH(Environment):
         obs = self.get_obs(state, params)
         return obs, state
 
+    def plot_garch(self):
+        """Plot the generated GARCH price paths, returns, and volatilities for all assets."""
+        fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+
+        # Plot prices
+        for i, name in enumerate(self.asset_names):
+            axes[0].plot(self.prices[:, i], label=f"{name}")
+        axes[0].set_title("GARCH-Simulated Asset Prices")
+        axes[0].set_xlabel("Time")
+        axes[0].set_ylabel("Price")
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        # Plot returns
+        for i, name in enumerate(self.asset_names):
+            axes[1].plot(self.returns[:, i], label=f"{name}", alpha=0.7)
+        axes[1].set_title("GARCH Returns")
+        axes[1].set_xlabel("Time")
+        axes[1].set_ylabel("Return")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+        axes[1].axhline(y=0, color="k", linestyle="--", linewidth=0.5)
+
+        # Plot volatilities
+        for i, name in enumerate(self.asset_names):
+            axes[2].plot(self.volatilities[:, i], label=f"{name}")
+        axes[2].set_title("GARCH Conditional Volatilities")
+        axes[2].set_xlabel("Time")
+        axes[2].set_ylabel("Volatility")
+        axes[2].legend()
+        axes[2].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
 
 if __name__ == "__main__":
     rng = jax.random.PRNGKey(1)
@@ -381,13 +417,7 @@ if __name__ == "__main__":
     }
     env = PortfolioOptimizationGARCH(rng, garch_params)
 
-    from matplotlib import pyplot as plt
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(env.volatilities[:, 0], label="BTC Volatility")
-    plt.plot(env.volatilities[:, 1], label="ETH Volatility")
-    plt.legend()
-    plt.show()
+    env.plot_garch()
 
     obs, state = env.reset(rng, env.default_params)
     action = jnp.array([0.999995, 0.000003, 0.0000002])  # Example action
