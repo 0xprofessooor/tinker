@@ -92,7 +92,7 @@ def _sample_garch(carry, x):
 
     # GARCH(p,q) equations (all vectorized)
     # sigma_t^2 = omega + sum(alpha * residuals^2) + sum(beta * vols^2)
-    residuals = last_returns - params.mu  # (num_assets, q)
+    residuals = last_returns - params.mu[:, None]  # (num_assets, q)
     arch_term = (params.alpha * residuals**2).sum(axis=-1)
     garch_term = (params.beta * last_vols**2).sum(axis=-1)
     variance = params.omega + arch_term + garch_term
@@ -146,10 +146,15 @@ class PortfolioOptimizationGARCH(Environment):
         max_q = max(len(gp.alpha) for gp in garch_params.values())
 
         # Pad alpha and beta to same length for vectorization
-        omega_vec = jnp.array([garch_params[name].omega for name in self.asset_names])
-        mu_vec = jnp.array([garch_params[name].mu for name in self.asset_names])
+        omega_vec = jnp.array(
+            [garch_params[name].omega for name in self.asset_names], dtype=jnp.float32
+        )
+        mu_vec = jnp.array(
+            [garch_params[name].mu for name in self.asset_names], dtype=jnp.float32
+        )
         initial_price_vec = jnp.array(
-            [garch_params[name].initial_price for name in self.asset_names]
+            [garch_params[name].initial_price for name in self.asset_names],
+            dtype=jnp.float32,
         )
 
         alpha_list = []
@@ -357,7 +362,7 @@ class PortfolioOptimizationGARCH(Environment):
 
 
 if __name__ == "__main__":
-    rng = jax.random.PRNGKey(0)
+    rng = jax.random.PRNGKey(1)
     garch_params = {
         "BTC": GARCHParams(
             mu=0,
@@ -375,10 +380,17 @@ if __name__ == "__main__":
         ),
     }
     env = PortfolioOptimizationGARCH(rng, garch_params)
+
+    from matplotlib import pyplot as plt
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(env.volatilities[:, 0], label="BTC Volatility")
+    plt.plot(env.volatilities[:, 1], label="ETH Volatility")
+    plt.legend()
+    plt.show()
+
     obs, state = env.reset(rng, env.default_params)
-    print(state)
     action = jnp.array([0.999995, 0.000003, 0.0000002])  # Example action
     next_obs, next_state, reward, done, info = env.step_env(
         rng, state, action, env.default_params
     )
-    print(next_state)
