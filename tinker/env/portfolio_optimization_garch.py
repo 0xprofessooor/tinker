@@ -171,7 +171,7 @@ class PortfolioOptimizationGARCH(Environment):
         alpha_vec = jnp.stack(alpha_list, axis=0)  # (num_assets, max_q)
         beta_vec = jnp.stack(beta_list, axis=0)  # (num_assets, max_p)
 
-        stacked_params = VecGARCHParams(
+        self.vec_params = VecGARCHParams(
             omega=omega_vec,
             alpha=alpha_vec,
             beta=beta_vec,
@@ -198,7 +198,9 @@ class PortfolioOptimizationGARCH(Environment):
         noise = jax.random.normal(noise_rng, (total_samples, self.num_assets))
 
         # Run GARCH simulation
-        _, outputs = jax.lax.scan(_sample_garch, (stacked_params, initial_state), noise)
+        _, outputs = jax.lax.scan(
+            _sample_garch, (self.vec_params, initial_state), noise
+        )
 
         # Unpack outputs: each is (total_samples, num_assets)
         self.returns, self.volatilities, self.prices = outputs
@@ -229,8 +231,12 @@ class PortfolioOptimizationGARCH(Environment):
 
     def observation_space(self, params: EnvParams) -> spaces.Box:
         """Observation: recent returns and volatilities for all assets."""
-        # Features: returns and volatilities for each asset over lookback window
-        obs_shape = (self.step_size * self.prices.shape[1] * 2,)
+        num_garch_params = (
+            self.num_assets * 2
+            + self.num_assets * self.vec_params.alpha.shape[1]
+            + self.num_assets * self.vec_params.beta.shape[1]
+        )
+        obs_shape = (self.step_size * self.prices.shape[1] * 2 + num_garch_params,)
         return spaces.Box(
             low=-jnp.inf, high=jnp.inf, shape=obs_shape, dtype=jnp.float32
         )
@@ -251,8 +257,22 @@ class PortfolioOptimizationGARCH(Environment):
             start_indices,
             slice_sizes,
         )
+        mu = self.vec_params.mu
+        omega = self.vec_params.omega
+        alpha = self.vec_params.alpha
+        beta = self.vec_params.beta
 
-        obs = jnp.concatenate([returns_window.flatten(), vols_window.flatten()])
+        obs = jnp.concatenate(
+            [
+                state.values,
+                returns_window.flatten(),
+                vols_window.flatten(),
+                mu.flatten(),
+                omega.flatten(),
+                alpha.flatten(),
+                beta.flatten(),
+            ]
+        )
         return obs
 
     def reward(
