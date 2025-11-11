@@ -388,9 +388,6 @@ def make_train(
             # Normalize reward advantages
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            # Center cost advantages (don't normalize)
-            cost_advantages = cost_advantages - cost_advantages.mean()
-
             # Compute constraint violation
             avg_ep_cost = cost_targets.mean()
             c = avg_ep_cost - cost_limit
