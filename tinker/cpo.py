@@ -72,7 +72,7 @@ class Transition(NamedTuple):
     value: jnp.ndarray
     cost_value: jnp.ndarray
     reward: jnp.ndarray
-    cost: jnp.ndarray  # Cost signal from environment
+    cost: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
     info: jnp.ndarray
@@ -231,7 +231,7 @@ def make_train(
     num_steps: int,
     num_envs: int,
     train_freq: int,
-    vf_iters: int = 80,
+    critic_epochs: int = 80,
     activation: Callable = jax.nn.tanh,
     lr: float = 3e-4,
     anneal_lr: bool = False,
@@ -254,7 +254,7 @@ def make_train(
     :param num_steps: Number of steps to train per environment.
     :param num_envs: Number of parallel environments to run.
     :param train_freq: Number of steps to run between training updates.
-    :param vf_iters: Number of value function update iterations per rollout.
+    :param critic_epochs: Number of critic update iterations per rollout.
     :param activation: Activation function for the network hidden layers.
     :param lr: Learning rate for the critic optimizer.
     :param anneal_lr: Whether to anneal the learning rate over time.
@@ -274,10 +274,6 @@ def make_train(
     num_updates = num_steps // train_freq
     env = LogWrapper(env)
 
-    def linear_schedule(count):
-        frac = 1.0 - (count // vf_iters) / num_updates
-        return lr * frac
-
     def train(rng: chex.PRNGKey) -> Tuple[CPOState, dict]:
         # INIT NETWORK
         rng, model_rng = jax.random.split(rng)
@@ -292,7 +288,7 @@ def make_train(
             schedule = optax.linear_schedule(
                 init_value=lr,
                 end_value=0.0,
-                transition_steps=num_updates * vf_iters,
+                transition_steps=num_updates * critic_epochs,
             )
             tx = optax.chain(
                 optax.clip_by_global_norm(max_grad_norm),
@@ -316,18 +312,18 @@ def make_train(
         def _update_step(runner_state, _):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, _):
-                cpo_state, env_state, last_obs, rng = runner_state
+                cpo_state, env_state, obs, rng = runner_state
 
                 # SELECT ACTION (use optimizer.model to access the current model)
-                rng, _rng = jax.random.split(rng)
-                pi, value, cost_value = cpo_state.optimizer.model(last_obs)
-                action = pi.sample(seed=_rng)
+                rng, action_rng = jax.random.split(rng)
+                pi, value, cost_value = cpo_state.optimizer.model(obs)
+                action = pi.sample(seed=action_rng)
                 log_prob = pi.log_prob(action)
 
                 # STEP ENV
-                rng, _rng = jax.random.split(rng)
-                rng_step = jax.random.split(_rng, num_envs)
-                obsv, env_state, reward, done, info = jax.vmap(
+                rng, step_rng = jax.random.split(rng)
+                rng_step = jax.random.split(step_rng, num_envs)
+                next_obs, next_env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0, None)
                 )(rng_step, env_state, action, env_params)
 
@@ -343,10 +339,10 @@ def make_train(
                     reward,
                     cost,
                     log_prob,
-                    last_obs,
+                    obs,
                     info,
                 )
-                runner_state = (cpo_state, env_state, obsv, rng)
+                runner_state = (cpo_state, next_env_state, next_obs, rng)
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
@@ -358,9 +354,9 @@ def make_train(
             _, last_val, last_cost_val = cpo_state.optimizer.model(last_obs)
 
             def _calculate_gae(traj_batch, last_val, gamma, lambda_):
-                def _get_advantages(gae_and_next_value, transition_value_reward):
-                    gae, next_value = gae_and_next_value
-                    done, value, reward = transition_value_reward
+                def _get_advantages(carry, x):
+                    gae, next_value = carry
+                    done, value, reward = x
                     delta = reward + gamma * next_value * (1 - done) - value
                     gae = delta + gamma * lambda_ * (1 - done) * gae
                     return (gae, value), gae
@@ -375,7 +371,7 @@ def make_train(
                 return advantages, advantages + traj_batch.value
 
             # Reward advantages
-            advantages, targets = _calculate_gae(
+            advantages, return_targets = _calculate_gae(
                 traj_batch, last_val, gae_gamma, gae_lambda
             )
 
@@ -396,65 +392,42 @@ def make_train(
             cost_advantages = cost_advantages - cost_advantages.mean()
 
             # Compute constraint violation
-            ep_cost = traj_batch.cost.sum()
-            c = ep_cost - cost_limit
+            avg_ep_cost = cost_targets.mean()
+            c = avg_ep_cost - cost_limit
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c)
             c = c + new_margin
-            c = c / (train_freq * num_envs + 1e-8)
 
-            # ====================================================================
-            # ACTOR-CRITIC UPDATE (CORRECT ORDER)
-            # ====================================================================
-            # 1. Update value critics FIRST (multiple iterations with Adam)
-            #    This gives us V_k+1 that better estimates the returns
-            # 2. Update policy SECOND (one CPO step)
-            #    The policy becomes greedy w.r.t. the updated value function
-            #    while respecting trust region and cost constraints
-            #
-            # This order ensures:
-            # - Critics are trained on collected data
-            # - Policy update uses the BEST available value estimates
-            # - CPO step is not overwritten by subsequent critic updates
-            # - Optimizer state (Adam momentum) is preserved across updates
-            # ====================================================================
-
-            # UPDATE VALUE CRITICS FIRST (using Adam optimizer properly)
+            # UPDATE VALUE CRITICS FIRST
             def critic_loss_fn(model: ActorCritic):
                 """Compute critic loss (for both value and cost-value heads)."""
                 _, value, cost_value = model(traj_batch.obs)
-                value_loss = ((value - targets) ** 2).mean()
+                value_loss = ((value - return_targets) ** 2).mean()
                 cost_value_loss = ((cost_value - cost_targets) ** 2).mean()
                 return value_loss + cost_value_loss
 
-            # Update critics for vf_iters iterations using the optimizer
+            # Update critics for critic_epochs iterations using the optimizer
             def _update_critic(optimizer: nnx.Optimizer, _):
                 """Update critic using Adam optimizer (preserves momentum)."""
                 loss, grads = nnx.value_and_grad(critic_loss_fn)(optimizer.model)
-                optimizer.update(grads)  # ✅ Uses Adam correctly, updates in-place
+                optimizer.update(grads)
                 return optimizer, loss
 
-            # Start from current optimizer (preserves Adam state)
-            optimizer_after_critic_update, critic_losses = jax.lax.scan(
-                _update_critic, cpo_state.optimizer, None, vf_iters
+            # Start from current optimizer
+            optimizer, critic_losses = jax.lax.scan(
+                _update_critic, cpo_state.optimizer, None, critic_epochs
             )
 
             # UPDATE POLICY (CPO STEP) - using the critic-updated model
             # Split ORIGINAL model (before critic update) for KL computation
-            graphdef_orig, state_orig = nnx.split(cpo_state.optimizer.model)
+            graphdef_orig, params_orig = nnx.split(cpo_state.optimizer.model, nnx.Param)
 
             # Split CRITIC-UPDATED model for policy gradients
-            graphdef, state_after_critic_update = nnx.split(
-                optimizer_after_critic_update.model
-            )
+            graphdef, params = nnx.split(optimizer.model, nnx.Param)
 
-            def model_apply(state, obs):
-                """Apply model with given state."""
-                model = nnx.merge(graphdef, state)
-                return model(obs)
-
-            def compute_policy_loss(state):
+            def compute_policy_loss(params_arg):
                 """Compute surrogate policy loss and cost loss."""
-                pi, _, _ = model_apply(state, traj_batch.obs)
+                model = nnx.merge(graphdef, params_arg)
+                pi, _, _ = model(traj_batch.obs)
                 log_prob = pi.log_prob(traj_batch.action)
                 ratio = jnp.exp(log_prob - traj_batch.log_prob)
 
@@ -463,47 +436,53 @@ def make_train(
 
                 return policy_loss, cost_loss
 
-            def compute_kl(new_state):
+            def compute_kl(params_new):
                 """Compute KL divergence between old and new policy."""
-                pi_new, _, _ = model_apply(new_state, traj_batch.obs)
-                # Compare against the ORIGINAL policy (before critic update)
-                model_orig = nnx.merge(graphdef_orig, state_orig)
+                model_new = nnx.merge(graphdef, params_new)
+                pi_new, _, _ = model_new(traj_batch.obs)
+
+                model_orig = nnx.merge(graphdef_orig, params_orig)
                 pi_old, _, _ = model_orig(traj_batch.obs)
                 return distrax.kl_divergence(pi_old, pi_new).mean()
 
-            # Compute policy gradient and cost gradient using CRITIC-UPDATED state
-            (old_policy_loss, old_cost_loss), (g_tree, b_tree) = jax.value_and_grad(
+            # Get gradient of REWARD loss (g)
+            (old_policy_loss, old_cost_loss), g_tree = jax.value_and_grad(
                 compute_policy_loss, has_aux=True
-            )(state_after_critic_update)
+            )(params)
+
+            # Get gradient of COST loss (b)
+            def cost_loss_fn(p):
+                return compute_policy_loss(p)[1]
+
+            b_tree = jax.grad(cost_loss_fn)(params)
 
             # Flatten gradients
             g, unravel_fn = jax.flatten_util.ravel_pytree(g_tree)
             b, _ = jax.flatten_util.ravel_pytree(b_tree)
 
             # Define Hessian-vector product for KL divergence
-            # HVP is computed at the critic-updated state
-            def kl_fn(state_flat):
-                state_unflat = unravel_fn(state_flat)
-                return compute_kl(state_unflat)
+            def kl_fn(params_flat):
+                params_unflat = unravel_fn(params_flat)
+                return compute_kl(params_unflat)
 
-            flat_state, _ = jax.flatten_util.ravel_pytree(state_after_critic_update)
-            hvp_fn = lambda v: hvp(kl_fn, (flat_state,), (v,))
+            flat_params, _ = jax.flatten_util.ravel_pytree(params)
+            hvp_fn = lambda v: hvp(kl_fn, (flat_params,), (v,))
 
             # Compute CPO step direction
             direction, optim_case = compute_cpo_step(
                 g, b, float(c), hvp_fn, target_kl, use_constraint, damping_coeff
             )
 
-            # Backtracking line search starting from critic-updated state
+            # Backtracking line search
             def line_search_body(search_state):
-                i, current_state, accepted = search_state
+                i, current_params, accepted = search_state
 
                 step_size = backtrack_coeff**i
-                new_flat_state = flat_state - step_size * direction
-                new_state = unravel_fn(new_flat_state)
+                new_flat_params = flat_params - step_size * direction
+                new_params = unravel_fn(new_flat_params)
 
-                new_policy_loss, new_cost_loss = compute_policy_loss(new_state)
-                kl = compute_kl(new_state)
+                new_policy_loss, new_cost_loss = compute_policy_loss(new_params)
+                kl = compute_kl(new_params)
 
                 # Check acceptance criteria
                 loss_improve = (optim_case > 1) or (new_policy_loss <= old_policy_loss)
@@ -516,38 +495,34 @@ def make_train(
 
                 accept = loss_improve & cost_improve & kl_ok
 
-                updated_state = jax.tree.map(
+                updated_params = jax.tree.map(
                     lambda new, old: jnp.where(accept, new, old),
-                    new_state,
-                    current_state,
+                    new_params,
+                    current_params,
                 )
 
-                return i + 1, updated_state, accept
+                return i + 1, updated_params, accept
 
             def line_search_cond(search_state):
                 i, _, accepted = search_state
                 return (i < backtrack_iters) & (~accepted)
 
-            # Line search starts from critic-updated state
-            _, final_state, accepted = jax.lax.while_loop(
+            # Line search (start with critic-updated params)
+            _, final_params, accepted = jax.lax.while_loop(
                 line_search_cond,
                 line_search_body,
-                (0, state_after_critic_update, False),
+                (0, params, False),
             )
 
-            # Merge final state (both actor and critic updates applied)
-            final_model = nnx.merge(graphdef, final_state)
-
-            # ✅ PRESERVE OPTIMIZER STATE - Don't create new optimizer!
-            # Replace the model in the critic-updated optimizer with CPO-updated model
-            # This keeps Adam's momentum/statistics intact
-            final_optimizer = optimizer_after_critic_update.replace(model=final_model)
+            # Merge final params back into model
+            final_model = nnx.merge(graphdef, final_params)
+            optimizer = optimizer.replace(model=final_model)
 
             # Update CPO state with preserved optimizer
-            cpo_state = CPOState(optimizer=final_optimizer, margin=new_margin)
+            cpo_state = CPOState(optimizer=optimizer, margin=new_margin)
 
             # Compute final KL for logging
-            final_kl = compute_kl(final_state)
+            final_kl = compute_kl(final_params)
 
             metrics = {
                 "policy_loss": old_policy_loss,
@@ -556,7 +531,7 @@ def make_train(
                 "kl": final_kl,
                 "constraint_violation": c,
                 "margin": new_margin,
-                "episode_cost": ep_cost,
+                "avg_ep_cost": avg_ep_cost,
                 "optim_case": optim_case,
                 "total_reward": traj_batch.reward.sum(),
                 "accepted": accepted,
