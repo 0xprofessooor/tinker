@@ -373,7 +373,7 @@ if __name__ == "__main__":
         "LR": 3e-4,
         "NUM_ENVS": 1,
         "TRAIN_FREQ": 128,
-        "TOTAL_TIMESTEPS": 5e5,
+        "TOTAL_TIMESTEPS": 2e5,
         "UPDATE_EPOCHS": 4,
         "BATCH_SIZE": 32,
         "GAMMA": 0.99,

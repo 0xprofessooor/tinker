@@ -370,10 +370,10 @@ if __name__ == "__main__":
         "ENV_NAME": "Pendulum-v1",
         "LR": 3e-4,
         "NUM_ENVS": 1,
-        "TRAIN_FREQ": 128,
-        "TOTAL_TIMESTEPS": 5e5,
-        "UPDATE_EPOCHS": 4,
-        "BATCH_SIZE": 32,
+        "TRAIN_FREQ": 2048,
+        "TOTAL_TIMESTEPS": 1e6,
+        "UPDATE_EPOCHS": 10,
+        "BATCH_SIZE": 64,
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
@@ -383,7 +383,7 @@ if __name__ == "__main__":
         "ACTIVATION": "tanh",
         "ANNEAL_LR": False,
         "WANDB_MODE": "online",
-        "NUM_SEEDS": 1,
+        "NUM_SEEDS": 5,
         "SEED": 0,
     }
 
