@@ -1,4 +1,4 @@
-"""Constrained Policy Optimization (CPO) - JAX Implementation.
+"""Constrained Policy Optimization (CPO)
 
 Based on the paper: https://arxiv.org/abs/1705.10528
 Implements CPO for safe reinforcement learning with cost constraints.
@@ -97,25 +97,28 @@ def cg_solve(
     residual_tol: float = 1e-10,
 ) -> jnp.ndarray:
     """Conjugate gradient solver for Hx = b."""
-    x = jnp.zeros_like(b)
-    r = b.copy()
-    p = r.copy()
-    rdotr = jnp.dot(r, r)
 
-    for _ in range(max_iter):
+    def cg_body(state):
+        i, x, r, p, rdotr = state
         Ap = hvp_fn(p)
         alpha = rdotr / (jnp.dot(p, Ap) + 1e-8)
         x = x + alpha * p
         r = r - alpha * Ap
         new_rdotr = jnp.dot(r, r)
-
-        if new_rdotr < residual_tol:
-            break
-
         beta = new_rdotr / (rdotr + 1e-8)
         p = r + beta * p
-        rdotr = new_rdotr
+        return i + 1, x, r, p, new_rdotr
 
+    def cg_cond(state):
+        i, x, r, p, rdotr = state
+        return (i < max_iter) & (rdotr >= residual_tol)
+
+    x = jnp.zeros_like(b)
+    r = b.copy()
+    p = r.copy()
+    rdotr = jnp.dot(r, r)
+
+    _, x, _, _, _ = jax.lax.while_loop(cg_cond, cg_body, (0, x, r, p, rdotr))
     return x
 
 
@@ -144,64 +147,82 @@ def compute_cpo_step(
     q = jnp.dot(v, approx_g)
 
     # Check if we should use TRPO (unconstrained) case
-    use_trpo = (jnp.dot(b, b) <= 1e-8) and (c < 0.0)
+    use_trpo = (jnp.dot(b, b) <= 1e-8) & (c < 0.0)
 
-    if not use_constraint or use_trpo:
-        # TRPO case: no constraint
+    def trpo_case():
+        """TRPO case: no constraint."""
         optim_case = 4
         lam = jnp.sqrt(q / (2.0 * target_kl))
         direction = v / (lam + 1e-8)
         return direction, optim_case
 
-    # CPO case: solve with constraint
-    w = cg_solve(damped_hvp, b, max_iter=10)
-    r = jnp.dot(w, approx_g)
-    s = jnp.dot(w, damped_hvp(w))
+    def cpo_case():
+        """CPO case: solve with constraint."""
+        # Solve for constraint direction
+        w = cg_solve(damped_hvp, b, max_iter=10)
+        r = jnp.dot(w, approx_g)
+        s = jnp.dot(w, damped_hvp(w))
 
-    A = q - r**2 / (s + 1e-8)
-    B = 2.0 * target_kl - c**2 / (s + 1e-8)
+        A = q - r**2 / (s + 1e-8)
+        B = 2.0 * target_kl - c**2 / (s + 1e-8)
 
-    # Determine optimization case
-    if c < 0.0 and B < 0.0:
-        optim_case = 3
-    elif c < 0.0 and B >= 0.0:
-        optim_case = 2
-    elif c >= 0.0 and B >= 0.0:
-        optim_case = 1
-    else:
-        optim_case = 0
+        # Determine optimization case using jnp.where for branch-free logic
+        # Case 0: c >= 0 and B < 0 (recovery)
+        # Case 1: c >= 0 and B >= 0 (feasible)
+        # Case 2: c < 0 and B >= 0 (feasible)
+        # Case 3: c < 0 and B < 0 (feasible, ignore constraint)
+        optim_case = jnp.where(
+            c < 0.0, jnp.where(B < 0.0, 3, 2), jnp.where(B >= 0.0, 1, 0)
+        )
 
-    # Compute step based on optimization case
-    if optim_case == 0:
-        # Recovery case
-        nu = jnp.sqrt(2.0 * target_kl / (s + 1e-8))
-        direction = nu * w
-    else:
-        # Feasible cases
-        if optim_case > 2:
-            # Ignore constraint
-            lam = jnp.sqrt(q / (2.0 * target_kl))
-            nu = 0.0
-        else:
-            # Solve for optimal lam, nu
-            if c < 0.0:
-                LA, LB = [0.0, r / c], [r / c, jnp.inf]
-            else:
-                LA, LB = [r / c, jnp.inf], [0.0, r / c]
+        # Recovery case (optim_case == 0)
+        nu_recovery = jnp.sqrt(2.0 * target_kl / (s + 1e-8))
+        direction_recovery = nu_recovery * w
 
-            proj = lambda x, L: jnp.maximum(L[0], jnp.minimum(L[1], x))
-            lam_a = proj(jnp.sqrt(A / (B + 1e-8)), LA)
-            lam_b = proj(jnp.sqrt(q / (2 * target_kl)), LB)
+        # Feasible cases (optim_case > 0)
+        # Case 3 or 4: ignore constraint
+        lam_unconstrained = jnp.sqrt(q / (2.0 * target_kl))
+        nu_unconstrained = 0.0
 
-            f_a = -0.5 * (A / (lam_a + 1e-8) + B * lam_a) - r * c / (s + 1e-8)
-            f_b = -0.5 * (q / (lam_b + 1e-8) + 2.0 * target_kl * lam_b)
+        # Case 1 or 2: solve for optimal lam, nu
+        # Compute projection bounds
+        LA_0, LA_1 = (
+            jnp.where(c < 0.0, 0.0, r / (c + 1e-8)),
+            jnp.where(c < 0.0, r / (c - 1e-8), jnp.inf),
+        )
+        LB_0, LB_1 = (
+            jnp.where(c < 0.0, r / (c - 1e-8), 0.0),
+            jnp.where(c < 0.0, jnp.inf, r / (c + 1e-8)),
+        )
 
-            lam = jnp.where(f_a >= f_b, lam_a, lam_b)
-            nu = jnp.maximum(0.0, lam * c - r) / (s + 1e-8)
+        proj = lambda x, L0, L1: jnp.maximum(L0, jnp.minimum(L1, x))
+        lam_a = proj(jnp.sqrt(A / (B + 1e-8)), LA_0, LA_1)
+        lam_b = proj(jnp.sqrt(q / (2.0 * target_kl)), LB_0, LB_1)
 
-        direction = (v + nu * w) / (lam + 1e-8)
+        f_a = -0.5 * (A / (lam_a + 1e-8) + B * lam_a) - r * c / (s + 1e-8)
+        f_b = -0.5 * (q / (lam_b + 1e-8) + 2.0 * target_kl * lam_b)
 
-    return direction, optim_case
+        lam_constrained = jnp.where(f_a >= f_b, lam_a, lam_b)
+        nu_constrained = jnp.maximum(0.0, lam_constrained * c - r) / (s + 1e-8)
+
+        # Select between constrained and unconstrained based on optim_case
+        lam = jnp.where(optim_case > 2, lam_unconstrained, lam_constrained)
+        nu = jnp.where(optim_case > 2, nu_unconstrained, nu_constrained)
+
+        direction_feasible = (v + nu * w) / (lam + 1e-8)
+
+        # Select between recovery and feasible
+        direction = jnp.where(optim_case == 0, direction_recovery, direction_feasible)
+
+        return direction, optim_case
+
+    # Use jax.lax.cond for top-level branching
+    return jax.lax.cond(
+        (not use_constraint) | use_trpo,
+        lambda _: trpo_case(),
+        lambda _: cpo_case(),
+        None,
+    )
 
 
 def make_train(
