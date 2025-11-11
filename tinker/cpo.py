@@ -390,9 +390,8 @@ def make_train(
 
             # Compute constraint violation
             avg_ep_cost = cost_targets.mean()
-            c = avg_ep_cost - cost_limit
+            c = avg_ep_cost - cost_limit + cpo_state.margin
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c)
-            c = c + new_margin
 
             # UPDATE VALUE CRITICS FIRST
             def critic_loss_fn(model: ActorCritic):
