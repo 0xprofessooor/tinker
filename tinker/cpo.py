@@ -125,7 +125,7 @@ def cg_solve(
 def compute_cpo_step(
     g: jnp.ndarray,
     b: jnp.ndarray,
-    c: float,
+    c: jnp.ndarray,  # scalar array
     hvp_fn: Callable,
     target_kl: float,
     use_constraint: bool,
@@ -389,40 +389,38 @@ def make_train(
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             # Compute constraint violation
-            avg_ep_cost = cost_targets.mean()
-            c = avg_ep_cost - cost_limit + cpo_state.margin
+            ep_cost = cost_targets.mean()
+            c = ep_cost - cost_limit + cpo_state.margin
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c)
 
-            # UPDATE VALUE CRITICS FIRST
-            def critic_loss_fn(model: ActorCritic):
-                """Compute critic loss (for both value and cost-value heads)."""
-                _, value, cost_value = model(traj_batch.obs)
-                value_loss = ((value - return_targets) ** 2).mean()
-                cost_value_loss = ((cost_value - cost_targets) ** 2).mean()
-                return value_loss + cost_value_loss
+            # UPDATE POLICY (CPO STEP)
+            # Clone current model for reference in KL and line search
+            model_old: ActorCritic = nnx.clone(cpo_state.optimizer.model)
+            pi_old, _, _ = model_old(traj_batch.obs)
+            graphdef, params = nnx.split(model_old, nnx.Param)
+            flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
 
-            # Update critics for critic_epochs iterations using the optimizer
-            def _update_critic(optimizer: nnx.Optimizer, _):
-                """Update critic using Adam optimizer (preserves momentum)."""
-                loss, grads = nnx.value_and_grad(critic_loss_fn)(optimizer.model)
-                optimizer.update(grads)
-                return optimizer, loss
+            def policy_loss_fn(model: ActorCritic):
+                """Compute surrogate policy loss."""
+                pi, _, _ = model(traj_batch.obs)
+                log_prob = pi.log_prob(traj_batch.action)
+                ratio = jnp.exp(log_prob - traj_batch.log_prob)
 
-            # Start from current optimizer
-            optimizer, critic_losses = jax.lax.scan(
-                _update_critic, cpo_state.optimizer, None, critic_epochs
-            )
+                policy_loss = -(ratio * advantages).mean()
 
-            # UPDATE POLICY (CPO STEP) - using the critic-updated model
-            # Split ORIGINAL model (before critic update) for KL computation
-            graphdef_orig, params_orig = nnx.split(cpo_state.optimizer.model, nnx.Param)
+                return policy_loss
 
-            # Split CRITIC-UPDATED model for policy gradients
-            graphdef, params = nnx.split(optimizer.model, nnx.Param)
+            def cost_loss_fn(model: ActorCritic):
+                """Compute surrogate cost loss."""
+                pi, _, _ = model(traj_batch.obs)
+                log_prob = pi.log_prob(traj_batch.action)
+                ratio = jnp.exp(log_prob - traj_batch.log_prob)
 
-            def compute_policy_loss(params_arg):
-                """Compute surrogate policy loss and cost loss."""
-                model = nnx.merge(graphdef, params_arg)
+                cost_loss = (ratio * cost_advantages).mean()
+
+                return cost_loss
+
+            def joint_loss_fn(model: ActorCritic):
                 pi, _, _ = model(traj_batch.obs)
                 log_prob = pi.log_prob(traj_batch.action)
                 ratio = jnp.exp(log_prob - traj_batch.log_prob)
@@ -432,41 +430,26 @@ def make_train(
 
                 return policy_loss, cost_loss
 
-            def compute_kl(params_new):
-                """Compute KL divergence between old and new policy."""
-                model_new = nnx.merge(graphdef, params_new)
-                pi_new, _, _ = model_new(traj_batch.obs)
-
-                model_orig = nnx.merge(graphdef_orig, params_orig)
-                pi_old, _, _ = model_orig(traj_batch.obs)
-                return distrax.kl_divergence(pi_old, pi_new).mean()
-
-            # Get gradient of REWARD loss (g)
-            (old_policy_loss, old_cost_loss), g_tree = jax.value_and_grad(
-                compute_policy_loss, has_aux=True
-            )(params)
-
-            # Get gradient of COST loss (b)
-            def cost_loss_fn(p):
-                return compute_policy_loss(p)[1]
-
-            b_tree = jax.grad(cost_loss_fn)(params)
+            # Get gradients of policy and cost losses
+            old_policy_loss, g_tree = nnx.value_and_grad(policy_loss_fn)(model_old)
+            old_cost_loss, b_tree = nnx.value_and_grad(cost_loss_fn)(model_old)
 
             # Flatten gradients
-            g, unravel_fn = jax.flatten_util.ravel_pytree(g_tree)
+            g, _ = jax.flatten_util.ravel_pytree(g_tree)
             b, _ = jax.flatten_util.ravel_pytree(b_tree)
 
-            # Define Hessian-vector product for KL divergence
-            def kl_fn(params_flat):
-                params_unflat = unravel_fn(params_flat)
-                return compute_kl(params_unflat)
+            def kl_fn(new_params_flat):
+                """Compute KL divergence between old and new policy."""
+                params_unflat = unravel_fn(new_params_flat)
+                model_new: ActorCritic = nnx.merge(graphdef, params_unflat)
+                pi_new, _, _ = model_new(traj_batch.obs)
+                return pi_new.kl_divergence(pi_old).mean()
 
-            flat_params, _ = jax.flatten_util.ravel_pytree(params)
             hvp_fn = lambda v: hvp(kl_fn, (flat_params,), (v,))
 
             # Compute CPO step direction
             direction, optim_case = compute_cpo_step(
-                g, b, float(c), hvp_fn, target_kl, use_constraint, damping_coeff
+                g, b, c, hvp_fn, target_kl, use_constraint, damping_coeff
             )
 
             # Backtracking line search
@@ -476,9 +459,10 @@ def make_train(
                 step_size = backtrack_coeff**i
                 new_flat_params = flat_params - step_size * direction
                 new_params = unravel_fn(new_flat_params)
+                new_model: ActorCritic = nnx.merge(graphdef, new_params)
 
-                new_policy_loss, new_cost_loss = compute_policy_loss(new_params)
-                kl = compute_kl(new_params)
+                new_policy_loss, new_cost_loss = joint_loss_fn(new_model)
+                kl = kl_fn(new_flat_params)
 
                 # Check acceptance criteria
                 loss_improve = (optim_case > 1) or (new_policy_loss <= old_policy_loss)
@@ -509,25 +493,48 @@ def make_train(
                 line_search_body,
                 (0, params, False),
             )
+            final_params_flat, _ = jax.flatten_util.ravel_pytree(final_params)
 
             # Merge final params back into model
             final_model = nnx.merge(graphdef, final_params)
-            optimizer = optimizer.replace(model=final_model)
+            optimizer = cpo_state.optimizer.replace(model=final_model)
 
-            # Update CPO state with preserved optimizer
+            # Update CPO state with new policy and margin
             cpo_state = CPOState(optimizer=optimizer, margin=new_margin)
 
             # Compute final KL for logging
-            final_kl = compute_kl(final_params)
+            final_kl = kl_fn(final_params_flat)
+
+            # UPDATE VALUE CRITICS
+            def critic_loss_fn(model: ActorCritic):
+                """Compute critic loss (for both value and cost-value heads)."""
+                _, value, cost_value = model(traj_batch.obs)
+                value_loss = ((value - return_targets) ** 2).mean()
+                cost_value_loss = ((cost_value - cost_targets) ** 2).mean()
+                total_loss = value_loss + cost_value_loss
+                return total_loss, (value_loss, cost_value_loss)
+
+            def _update_critic(optimizer: nnx.Optimizer, _):
+                """Update value and cost critic parameters."""
+                (_, (value_loss, cost_value_loss)), grads = nnx.value_and_grad(
+                    critic_loss_fn, has_aux=True
+                )(optimizer.model)
+                optimizer.update(grads)
+                return optimizer, (value_loss, cost_value_loss)
+
+            optimizer, (value_losses, cost_value_losses) = jax.lax.scan(
+                _update_critic, cpo_state.optimizer, None, critic_epochs
+            )
 
             metrics = {
                 "policy_loss": old_policy_loss,
                 "cost_loss": old_cost_loss,
-                "critic_loss": critic_losses.mean(),
+                "value_loss": value_losses.mean(),
+                "cost_value_loss": cost_value_losses.mean(),
                 "kl": final_kl,
                 "constraint_violation": c,
                 "margin": new_margin,
-                "avg_ep_cost": avg_ep_cost,
+                "ep_cost": ep_cost,
                 "optim_case": optim_case,
                 "total_reward": traj_batch.reward.sum(),
                 "accepted": accepted,
