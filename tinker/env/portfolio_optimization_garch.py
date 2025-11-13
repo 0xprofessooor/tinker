@@ -50,16 +50,19 @@ class EnvState:
     holdings: chex.Array  # Current holdings
     values: chex.Array  # Current values
     total_value: float
+    episode_return: float  # Augmented state with running return target
 
 
 @struct.dataclass
 class EnvParams:
-    max_steps: int
     initial_cash: float
     taker_fee: float
     gas_fee: float
     trade_threshold: float
     garch_params: Dict[str, GARCHParams]  # GARCH params for each asset
+    var_threshold: float  # return threshold for VaR constraint
+    var_probability: float  # probability level for VaR constraint
+    gamma_discount: float  # Discount factor for returns
 
 
 @jax.jit
@@ -121,6 +124,7 @@ class PortfolioOptimizationGARCH(Environment):
         rng: chex.PRNGKey,
         garch_params: Dict[str, GARCHParams],
         step_size: int = 1,
+        max_steps: int = 10000,
         total_samples: int = 10_000_000,
     ):
         """
@@ -136,6 +140,7 @@ class PortfolioOptimizationGARCH(Environment):
         self.asset_names = sorted(garch_params.keys())
         self.num_assets = len(self.asset_names)
         self.step_size = step_size
+        self.max_steps = max_steps
         self.total_samples = total_samples
 
         # Store individual GARCH params for default_params property
@@ -212,12 +217,14 @@ class PortfolioOptimizationGARCH(Environment):
     @property
     def default_params(self) -> EnvParams:
         return EnvParams(
-            max_steps=10000,
             initial_cash=1000.0,
             taker_fee=BinanceFeeTier.REGULAR.value,
             gas_fee=0.0,
             trade_threshold=1.0,
             garch_params=self._garch_params,
+            var_threshold=-0.5,
+            var_probability=0.05,
+            gamma_discount=0.99,
         )
 
     def action_space(self, params: EnvParams) -> spaces.Box:
@@ -275,16 +282,9 @@ class PortfolioOptimizationGARCH(Environment):
         )
         return obs
 
-    def reward(
-        self, state: EnvState, next_state: EnvState, params: EnvParams
-    ) -> chex.Array:
-        """Log return of portfolio value."""
-        log_return = jnp.log(next_state.total_value) - jnp.log(state.total_value)
-        return log_return
-
     def is_terminal(self, state: EnvState, params: EnvParams) -> chex.Array:
         """Check if episode is done."""
-        max_steps_reached = state.step >= params.max_steps
+        max_steps_reached = state.step >= self.max_steps
         portfolio_bankrupt = state.total_value <= 0
         return jnp.logical_or(max_steps_reached, portfolio_bankrupt)
 
@@ -337,6 +337,20 @@ class PortfolioOptimizationGARCH(Environment):
         adj_new_values = adj_new_values.at[0].add(delta_cash)
         new_holdings = adj_new_values / prices
 
+        reward = jnp.log(new_total_value) - jnp.log(state.total_value)
+        alpha = (1 / params.var_probability) - 1
+        discount_term = params.gamma_discount**state.step
+        normalizer = jnp.sum(
+            jnp.array([params.gamma_discount**i for i in range(self.max_steps)])
+        )
+        local_cost = (
+            2.0 * alpha * state.episode_return * reward
+            + alpha * discount_term * (reward**2)
+            + 2.0 * params.var_threshold * reward
+            - ((params.var_threshold**2) / normalizer)
+        )
+        episode_return = state.episode_return + discount_term * reward
+
         next_state = EnvState(
             step=state.step + 1,
             time=time,
@@ -346,19 +360,19 @@ class PortfolioOptimizationGARCH(Environment):
             holdings=new_holdings,
             values=adj_new_values,
             total_value=new_total_value,
+            episode_return=episode_return,
         )
 
         obs = self.get_obs(next_state, params)
-        reward = self.reward(state, next_state, params)
         done = self.is_terminal(next_state, params)
-        info = {}
+        info = {"cost": local_cost}
         return obs, next_state, reward, done, info
 
     def reset_env(
         self, key: chex.PRNGKey, params: EnvParams
     ) -> Tuple[chex.Array, EnvState]:
         """Reset environment and pre-generate GARCH paths."""
-        episode_length = params.max_steps * self.step_size
+        episode_length = self.max_steps * self.step_size
         max_start = self.prices.shape[0] - episode_length
         min_start = self.step_size
         time = jax.random.randint(key, (), min_start, max_start)
@@ -377,6 +391,7 @@ class PortfolioOptimizationGARCH(Environment):
             holdings=holdings,
             values=values,
             total_value=jnp.sum(values),
+            episode_return=0.0,
         )
         obs = self.get_obs(state, params)
         return obs, state
@@ -435,7 +450,7 @@ if __name__ == "__main__":
             initial_price=2629.79,
         ),
     }
-    env = PortfolioOptimizationGARCH(rng, garch_params)
+    env = PortfolioOptimizationGARCH(rng, garch_params, total_samples=1000)
 
     env.plot_garch()
 
