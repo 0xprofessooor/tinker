@@ -4,8 +4,8 @@ Based on the paper: https://arxiv.org/abs/1705.10528
 Implements CPO for safe reinforcement learning with cost constraints.
 """
 
+import os
 from typing import NamedTuple, Tuple, Callable
-
 import chex
 import distrax
 from flax import nnx
@@ -14,8 +14,12 @@ import jax.numpy as jnp
 import optax
 from gymnax.environments.environment import Environment, EnvParams
 from gymnax.wrappers import LogWrapper
-
 import wandb
+
+from tinker.env.portfolio_optimization_garch import (
+    PortfolioOptimizationGARCH,
+    GARCHParams,
+)
 
 
 class ActorCritic(nnx.Module):
@@ -375,6 +379,22 @@ def make_train(
                 traj_batch, last_val, gae_gamma, gae_lambda
             )
 
+            # Custom VAR cost augmentation
+            def _augment_costs(traj_batch: Transition):
+                normalizer = (1 - env_params.gamma_discount**env_params.max_steps) / (
+                    1 - env_params.gamma_discount + 1e-8
+                )
+                expected_return = return_targets.mean()
+                costs = (
+                    traj_batch.cost
+                    - (1 / env_params.var_probability)
+                    * (expected_return**2)
+                    / normalizer
+                )
+                return traj_batch._replace(cost=costs)
+
+            traj_batch = _augment_costs(traj_batch)
+
             # Cost advantages
             cost_advantages, cost_targets = _calculate_gae(
                 traj_batch._replace(
@@ -558,53 +578,89 @@ def make_train(
 
 
 if __name__ == "__main__":
-    import time
+    SEED = 0
+    NUM_SEEDS = 1
+    WANDB = "online"
 
-    # Example usage with a simple environment
-    rng = jax.random.PRNGKey(0)
+    rng = jax.random.PRNGKey(SEED)
+    rngs = jax.random.split(rng, NUM_SEEDS + 1)
+    garch_rng = rngs[0]
+    train_rngs = rngs[1:]
 
-    # Example: Create a simple safe environment wrapper
-    # You would need to modify your environment to provide cost signals in the info dict
+    garch_params = {
+        "BTC": GARCHParams(
+            mu=0,
+            omega=0.0000001110,
+            alpha=jnp.array([0.165]),
+            beta=jnp.array([0.8]),
+            initial_price=66084.0,
+        ),
+        "ETH": GARCHParams(
+            mu=0,
+            omega=0.0000004817,
+            alpha=jnp.array([0.15]),
+            beta=jnp.array([0.8]),
+            initial_price=2629.79,
+        ),
+    }
+    env = PortfolioOptimizationGARCH(garch_rng, garch_params)
+    env_params = env.default_params()
 
-    """
-    Example integration:
-    
-    from tinker.cpo_refactored import make_train
-    from your_safe_env import SafeEnvironment
-    
-    env = SafeEnvironment()
-    env_params = env.default_params
-    
-    # Create train function
+    wandb.login(os.environ.get("WANDB_KEY"))
+    wandb.init(
+        project="Tinker",
+        tags=["CPO", f"{env.name.upper()}", f"jax_{jax.__version__}"],
+        name=f"cpo_{env.name}",
+        mode=WANDB,
+    )
+
+    rng = jax.random.PRNGKey(SEED)
+    rngs = jax.random.split(rng, NUM_SEEDS)
+
     train_fn = make_train(
-        env=env,
-        env_params=env_params,
-        num_steps=100000,
-        num_envs=4,
-        train_freq=1000,
-        vf_iters=80,
-        lr=3e-4,
-        target_kl=0.01,
-        cost_limit=25.0,  # Constraint on expected cumulative cost
-        use_constraint=True,
+        env,
+        env_params,
+        num_steps=int(1e5),
+        num_envs=1,
+        batch_size=64,
+        buffer_size=int(1e6),
+        actor_epochs=1,
+        critic_epochs=1,
+        train_freq=1,
+        anneal_lr=False,
     )
-    
-    # Train the agent
-    rng = jax.random.PRNGKey(42)
-    final_state, metrics = jax.jit(train_fn)(rng)
-    
-    # Access trained model
-    trained_model = final_state.model
-    
-    # Use the trained policy
-    def get_action(obs, rng):
-        pi, value, cost_value = trained_model(obs)
-        action = pi.sample(seed=rng)
-        return action
-    """
+    train_vjit = jax.jit(jax.vmap(train_fn))
+    runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
 
-    print("CPO implementation ready (NNX version).")
-    print("This implementation uses Flax NNX for a more Pythonic API.")
-    print(
-        "Your environment must provide 'cost' values in the info dict for constraint tracking."
-    )
+    if WANDB == "online":
+        num_steps = len(all_metrics["step"][0])
+        for update_idx in range(num_steps):
+            log_dict = {}
+
+            for run_idx in range(NUM_SEEDS):
+                run_prefix = f"run_{run_idx}"
+                log_dict.update(
+                    {
+                        f"{run_prefix}/step": all_metrics["step"][run_idx][update_idx],
+                        f"{run_prefix}/returns": all_metrics["returns"][run_idx][
+                            update_idx
+                        ],
+                        f"{run_prefix}/actor_loss": all_metrics["actor_loss"][run_idx][
+                            update_idx
+                        ],
+                        f"{run_prefix}/critic_loss": all_metrics["critic_loss"][
+                            run_idx
+                        ][update_idx],
+                        f"{run_prefix}/buffer_size": all_metrics["buffer_size"][
+                            run_idx
+                        ][update_idx],
+                        f"{run_prefix}/is_learning": all_metrics["is_learning"][
+                            run_idx
+                        ][update_idx],
+                        f"{run_prefix}/episode_lengths": all_metrics["episode_lengths"][
+                            run_idx
+                        ][update_idx],
+                    }
+                )
+
+            wandb.log(log_dict)
