@@ -8,11 +8,11 @@ import os
 from typing import NamedTuple, Tuple, Callable
 import chex
 import distrax
-from flax import nnx
+from flax import nnx, struct
 import jax
 import jax.numpy as jnp
 import optax
-from gymnax.environments.environment import Environment, EnvParams
+from gymnax.environments.environment import Environment, EnvParams, EnvState
 from gymnax.wrappers import LogWrapper
 import wandb
 
@@ -86,11 +86,14 @@ class Transition(NamedTuple):
     info: dict
 
 
-class CPOState(NamedTuple):
+@struct.dataclass
+class CPOState:
     """Extended state for CPO including constraint tracking."""
 
-    optimizer: nnx.ModelAndOptimizer  # Holds model AND optimizer state (momentum, etc.)
-    margin: float  # Constraint margin for safety
+    model_state: nnx.State
+    opt_state: optax.OptState
+    margin: float
+    num_updates: int
 
 
 def hvp(f: Callable, primals: Tuple, tangents: Tuple) -> jnp.ndarray:
@@ -238,6 +241,7 @@ def make_train(
     env_params: EnvParams,
     num_steps: int,
     num_envs: int,
+    cost_limit: float,
     train_freq: int,
     critic_epochs: int = 80,
     activation: Callable = jax.nn.tanh,
@@ -248,7 +252,6 @@ def make_train(
     gae_lambda: float = 0.95,
     max_grad_norm: float = 0.5,
     target_kl: float = 0.01,
-    cost_limit: float = 25.0,
     backtrack_coeff: float = 0.8,
     backtrack_iters: int = 10,
     damping_coeff: float = 0.1,
@@ -291,6 +294,7 @@ def make_train(
             activation=activation,
             rngs=nnx.Rngs(model_rng),
         )
+        graphdef, params = nnx.split(model)
 
         # INIT OPTIMIZER
         if anneal_lr:
@@ -308,9 +312,11 @@ def make_train(
                 optax.clip_by_global_norm(max_grad_norm),
                 optax.adam(lr, eps=1e-5),
             )
+        opt_state = tx.init(params)
 
-        optimizer = nnx.ModelAndOptimizer(model, tx, wrt=nnx.Param)
-        cpo_state = CPOState(optimizer=optimizer, margin=0.0)
+        cpo_state = CPOState(
+            model_state=params, opt_state=opt_state, margin=0.0, num_updates=0
+        )
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
@@ -318,14 +324,21 @@ def make_train(
         obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
 
         # TRAIN LOOP
-        def _update_step(runner_state, _):
+        def _update_step(
+            runner_state: Tuple[CPOState, EnvState, jnp.ndarray, chex.PRNGKey], _
+        ):
+            params = runner_state[0].model_state
+            model: ActorCritic = nnx.merge(graphdef, params)
+
             # COLLECT TRAJECTORIES
-            def _env_step(runner_state, _):
+            def _env_step(
+                runner_state: Tuple[CPOState, EnvState, jnp.ndarray, chex.PRNGKey], _
+            ):
                 cpo_state, env_state, obs, rng = runner_state
 
                 # SELECT ACTION (use optimizer.model to access the current model)
                 rng, action_rng = jax.random.split(rng)
-                pi, value, cost_value = cpo_state.optimizer.model(obs)
+                pi, value, cost_value = model(obs)
                 action = pi.sample(seed=action_rng)
                 log_prob = pi.log_prob(action)
 
@@ -360,9 +373,14 @@ def make_train(
 
             # CALCULATE ADVANTAGE AND COST ADVANTAGE
             cpo_state, env_state, last_obs, rng = runner_state
-            _, last_val, last_cost_val = cpo_state.optimizer.model(last_obs)
+            _, last_val, last_cost_val = model(last_obs)
 
-            def _calculate_gae(traj_batch, last_val, gamma, lambda_):
+            def _calculate_gae(
+                traj_batch: Transition,
+                last_val: jnp.ndarray,
+                gamma: float,
+                lambda_: float,
+            ) -> Tuple[jnp.ndarray, jnp.ndarray]:
                 def _get_advantages(carry, x):
                     gae, next_value = carry
                     done, value, reward = x
@@ -420,9 +438,7 @@ def make_train(
 
             # UPDATE POLICY (CPO STEP)
             # Clone current model for reference in KL and line search
-            model_old: ActorCritic = nnx.clone(cpo_state.optimizer.model)
-            pi_old, _, _ = model_old(traj_batch.obs)
-            graphdef, params = nnx.split(model_old, nnx.Param)
+            pi_old, _, _ = model(traj_batch.obs)
             flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
 
             def policy_loss_fn(model: ActorCritic):
@@ -456,8 +472,8 @@ def make_train(
                 return policy_loss, cost_loss
 
             # Get gradients of policy and cost losses
-            old_policy_loss, g_tree = nnx.value_and_grad(policy_loss_fn)(model_old)
-            old_cost_loss, b_tree = nnx.value_and_grad(cost_loss_fn)(model_old)
+            old_policy_loss, g_tree = nnx.value_and_grad(policy_loss_fn)(model)
+            old_cost_loss, b_tree = nnx.value_and_grad(cost_loss_fn)(model)
 
             # Flatten gradients
             g, _ = jax.flatten_util.ravel_pytree(g_tree)
@@ -519,36 +535,45 @@ def make_train(
                 (0, params, False),
             )
             final_params_flat, _ = jax.flatten_util.ravel_pytree(final_params)
-
-            # Update model parameters in place with final params from line search
-            _, current_params = nnx.split(cpo_state.optimizer.model, nnx.Param)
-            nnx.update(current_params, final_params)
-
-            # Compute final KL for logging
             final_kl = kl_fn(final_params_flat)
 
+            # Update model parameters in place with final params from line search
+            nnx.update(model, final_params)
+            cpo_state = cpo_state.replace(
+                model_state=final_params,
+                margin=new_margin,
+                num_updates=cpo_state.num_updates + 1,
+            )
+
             # UPDATE VALUE CRITICS
-            def critic_loss_fn(model: ActorCritic):
+            def critic_loss_fn(params):
                 """Compute critic loss (for both value and cost-value heads)."""
+                model = nnx.merge(graphdef, params)
                 _, value, cost_value = model(traj_batch.obs)
                 value_loss = ((value - return_targets) ** 2).mean()
                 cost_value_loss = ((cost_value - cost_targets) ** 2).mean()
                 total_loss = value_loss + cost_value_loss
                 return total_loss, (value_loss, cost_value_loss)
 
-            def _update_critic(optimizer: nnx.ModelAndOptimizer, _):
+            def _update_critic(cpo_state: CPOState, _):
                 """Update value and cost critic parameters."""
-                (_, (value_loss, cost_value_loss)), grads = nnx.value_and_grad(
+                params = cpo_state.model_state
+
+                (_, (value_loss, cost_value_loss)), grads = jax.value_and_grad(
                     critic_loss_fn, has_aux=True
-                )(optimizer.model)
-                optimizer.update(grads)
-                return optimizer, (value_loss, cost_value_loss)
+                )(params)
 
-            optimizer, (value_losses, cost_value_losses) = jax.lax.scan(
-                _update_critic, cpo_state.optimizer, None, critic_epochs
+                updates, new_opt_state = tx.update(grads, cpo_state.opt_state, params)
+                new_params = optax.apply_updates(params, updates)
+
+                cpo_state = cpo_state.replace(
+                    model_state=new_params, opt_state=new_opt_state
+                )
+                return cpo_state, (value_loss, cost_value_loss)
+
+            cpo_state, (value_losses, cost_value_losses) = jax.lax.scan(
+                _update_critic, cpo_state, None, critic_epochs
             )
-
-            cpo_state = CPOState(optimizer=optimizer, margin=new_margin)
 
             metrics = {
                 "policy_loss": old_policy_loss,
@@ -585,7 +610,7 @@ def make_train(
 if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 1
-    WANDB = "offline"
+    WANDB = "online"
 
     rng = jax.random.PRNGKey(SEED)
     rngs = jax.random.split(rng, NUM_SEEDS + 1)
@@ -629,6 +654,7 @@ if __name__ == "__main__":
         num_envs=1,
         critic_epochs=10,
         train_freq=env_params.max_steps,
+        cost_limit=env_params.var_threshold,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
