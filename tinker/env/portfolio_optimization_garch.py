@@ -243,7 +243,12 @@ class PortfolioOptimizationGARCH(Environment):
             + self.num_assets * self.vec_params.alpha.shape[1]
             + self.num_assets * self.vec_params.beta.shape[1]
         )
-        obs_shape = (self.step_size * self.prices.shape[1] * 2 + num_garch_params,)
+        obs_shape = (
+            self.num_assets
+            + 1
+            + self.step_size * self.num_assets * 2
+            + num_garch_params,
+        )
         return spaces.Box(
             low=-jnp.inf, high=jnp.inf, shape=obs_shape, dtype=jnp.float32
         )
