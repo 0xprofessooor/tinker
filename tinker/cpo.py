@@ -441,8 +441,9 @@ def make_train(
             pi_old, _, _ = model(traj_batch.obs)
             flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
 
-            def policy_loss_fn(model: ActorCritic):
+            def policy_loss_fn(params):
                 """Compute surrogate policy loss."""
+                model: ActorCritic = nnx.merge(graphdef, params)
                 pi, _, _ = model(traj_batch.obs)
                 log_prob = pi.log_prob(traj_batch.action)
                 ratio = jnp.exp(log_prob - traj_batch.log_prob)
@@ -451,8 +452,9 @@ def make_train(
 
                 return policy_loss
 
-            def cost_loss_fn(model: ActorCritic):
+            def cost_loss_fn(params):
                 """Compute surrogate cost loss."""
+                model: ActorCritic = nnx.merge(graphdef, params)
                 pi, _, _ = model(traj_batch.obs)
                 log_prob = pi.log_prob(traj_batch.action)
                 ratio = jnp.exp(log_prob - traj_batch.log_prob)
@@ -461,7 +463,8 @@ def make_train(
 
                 return cost_loss
 
-            def joint_loss_fn(model: ActorCritic):
+            def joint_loss_fn(params):
+                model: ActorCritic = nnx.merge(graphdef, params)
                 pi, _, _ = model(traj_batch.obs)
                 log_prob = pi.log_prob(traj_batch.action)
                 ratio = jnp.exp(log_prob - traj_batch.log_prob)
@@ -472,8 +475,8 @@ def make_train(
                 return policy_loss, cost_loss
 
             # Get gradients of policy and cost losses
-            old_policy_loss, g_tree = nnx.value_and_grad(policy_loss_fn)(model)
-            old_cost_loss, b_tree = nnx.value_and_grad(cost_loss_fn)(model)
+            old_policy_loss, g_tree = jax.value_and_grad(policy_loss_fn)(params)
+            old_cost_loss, b_tree = jax.value_and_grad(cost_loss_fn)(params)
 
             # Flatten gradients
             g, _ = jax.flatten_util.ravel_pytree(g_tree)
@@ -500,9 +503,8 @@ def make_train(
                 step_size = backtrack_coeff**i
                 new_flat_params = flat_params - step_size * direction
                 new_params = unravel_fn(new_flat_params)
-                new_model: ActorCritic = nnx.merge(graphdef, new_params)
 
-                new_policy_loss, new_cost_loss = joint_loss_fn(new_model)
+                new_policy_loss, new_cost_loss = joint_loss_fn(new_params)
                 kl = kl_fn(new_flat_params)
 
                 # Check acceptance criteria
