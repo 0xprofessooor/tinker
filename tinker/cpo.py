@@ -26,27 +26,31 @@ class ActorCritic(nnx.Module):
     """Combined actor-critic network with separate value and cost-value heads."""
 
     def __init__(
-        self, action_dim: int, activation: Callable = jax.nn.tanh, rngs: nnx.Rngs = None
+        self,
+        obs_dim: int,
+        action_dim: int,
+        activation: Callable = jax.nn.tanh,
+        rngs: nnx.Rngs = None,
     ):
         super().__init__()
         self.action_dim = action_dim
         self.activation = activation
 
         # Actor network
-        self.actor_fc1 = nnx.Linear(256, rngs=rngs)
-        self.actor_fc2 = nnx.Linear(256, rngs=rngs)
-        self.actor_mean = nnx.Linear(action_dim, rngs=rngs)
+        self.actor_fc1 = nnx.Linear(obs_dim, 256, rngs=rngs)
+        self.actor_fc2 = nnx.Linear(256, 256, rngs=rngs)
+        self.actor_mean = nnx.Linear(256, action_dim, rngs=rngs)
         self.log_std = nnx.Param(jnp.zeros(action_dim))
 
         # Value critic (for rewards)
-        self.value_fc1 = nnx.Linear(256, rngs=rngs)
-        self.value_fc2 = nnx.Linear(256, rngs=rngs)
-        self.value_out = nnx.Linear(1, rngs=rngs)
+        self.value_fc1 = nnx.Linear(obs_dim, 256, rngs=rngs)
+        self.value_fc2 = nnx.Linear(256, 256, rngs=rngs)
+        self.value_out = nnx.Linear(256, 1, rngs=rngs)
 
         # Cost-value critic (for costs)
-        self.cost_value_fc1 = nnx.Linear(256, rngs=rngs)
-        self.cost_value_fc2 = nnx.Linear(256, rngs=rngs)
-        self.cost_value_out = nnx.Linear(1, rngs=rngs)
+        self.cost_value_fc1 = nnx.Linear(obs_dim, 256, rngs=rngs)
+        self.cost_value_fc2 = nnx.Linear(256, 256, rngs=rngs)
+        self.cost_value_out = nnx.Linear(256, 1, rngs=rngs)
 
     def __call__(self, x):
         # Actor network
@@ -79,7 +83,7 @@ class Transition(NamedTuple):
     cost: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
-    info: jnp.ndarray
+    info: dict
 
 
 class CPOState(NamedTuple):
@@ -282,6 +286,7 @@ def make_train(
         # INIT NETWORK
         rng, model_rng = jax.random.split(rng)
         model = ActorCritic(
+            obs_dim=env.observation_space(env_params).shape[0],
             action_dim=env.action_space(env_params).shape[0],
             activation=activation,
             rngs=nnx.Rngs(model_rng),
@@ -304,7 +309,7 @@ def make_train(
                 optax.adam(lr, eps=1e-5),
             )
 
-        optimizer = nnx.Optimizer(model, tx)
+        optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         cpo_state = CPOState(optimizer=optimizer, margin=0.0)
 
         # INIT ENV
@@ -546,6 +551,8 @@ def make_train(
                 _update_critic, cpo_state.optimizer, None, critic_epochs
             )
 
+            cpo_state = CPOState(optimizer=optimizer, margin=new_margin)
+
             metrics = {
                 "policy_loss": old_policy_loss,
                 "cost_loss": old_cost_loss,
@@ -556,7 +563,8 @@ def make_train(
                 "margin": new_margin,
                 "ep_cost": ep_cost,
                 "optim_case": optim_case,
-                "total_reward": traj_batch.reward.sum(),
+                "returns": traj_batch.info["returned_episode_returns"].mean(),
+                "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
                 "accepted": accepted,
             }
 
@@ -580,7 +588,7 @@ def make_train(
 if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 1
-    WANDB = "online"
+    WANDB = "offline"
 
     rng = jax.random.PRNGKey(SEED)
     rngs = jax.random.split(rng, NUM_SEEDS + 1)
@@ -604,7 +612,7 @@ if __name__ == "__main__":
         ),
     }
     env = PortfolioOptimizationGARCH(garch_rng, garch_params)
-    env_params = env.default_params()
+    env_params = env.default_params
 
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
@@ -620,14 +628,10 @@ if __name__ == "__main__":
     train_fn = make_train(
         env,
         env_params,
-        num_steps=int(1e5),
+        num_steps=int(1e6),
         num_envs=1,
-        batch_size=64,
-        buffer_size=int(1e6),
-        actor_epochs=1,
-        critic_epochs=1,
-        train_freq=1,
-        anneal_lr=False,
+        critic_epochs=10,
+        train_freq=env_params.max_steps,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
@@ -641,25 +645,34 @@ if __name__ == "__main__":
                 run_prefix = f"run_{run_idx}"
                 log_dict.update(
                     {
-                        f"{run_prefix}/step": all_metrics["step"][run_idx][update_idx],
                         f"{run_prefix}/returns": all_metrics["returns"][run_idx][
                             update_idx
                         ],
-                        f"{run_prefix}/actor_loss": all_metrics["actor_loss"][run_idx][
+                        f"{run_prefix}/policy_loss": all_metrics["policy_loss"][
+                            run_idx
+                        ][update_idx],
+                        f"{run_prefix}/cost_loss": all_metrics["cost_loss"][run_idx][
                             update_idx
                         ],
-                        f"{run_prefix}/critic_loss": all_metrics["critic_loss"][
-                            run_idx
-                        ][update_idx],
-                        f"{run_prefix}/buffer_size": all_metrics["buffer_size"][
-                            run_idx
-                        ][update_idx],
-                        f"{run_prefix}/is_learning": all_metrics["is_learning"][
+                        f"{run_prefix}/value_loss": all_metrics["value_loss"][run_idx][
+                            update_idx
+                        ],
+                        f"{run_prefix}/cost_value_loss": all_metrics["cost_value_loss"][
                             run_idx
                         ][update_idx],
                         f"{run_prefix}/episode_lengths": all_metrics["episode_lengths"][
                             run_idx
                         ][update_idx],
+                        f"{run_prefix}/kl": all_metrics["kl"][run_idx][update_idx],
+                        f"{run_prefix}/constraint_violation": all_metrics[
+                            "constraint_violation"
+                        ][run_idx][update_idx],
+                        f"{run_prefix}/ep_cost": all_metrics["ep_cost"][run_idx][
+                            update_idx
+                        ],
+                        f"{run_prefix}/margin": all_metrics["margin"][run_idx][
+                            update_idx
+                        ],
                     }
                 )
 
