@@ -89,7 +89,7 @@ class Transition(NamedTuple):
 class CPOState(NamedTuple):
     """Extended state for CPO including constraint tracking."""
 
-    optimizer: nnx.Optimizer  # Holds model AND optimizer state (momentum, etc.)
+    optimizer: nnx.ModelAndOptimizer  # Holds model AND optimizer state (momentum, etc.)
     margin: float  # Constraint margin for safety
 
 
@@ -309,7 +309,7 @@ def make_train(
                 optax.adam(lr, eps=1e-5),
             )
 
-        optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+        optimizer = nnx.ModelAndOptimizer(model, tx, wrt=nnx.Param)
         cpo_state = CPOState(optimizer=optimizer, margin=0.0)
 
         # INIT ENV
@@ -490,7 +490,7 @@ def make_train(
                 kl = kl_fn(new_flat_params)
 
                 # Check acceptance criteria
-                loss_improve = (optim_case > 1) or (new_policy_loss <= old_policy_loss)
+                loss_improve = (optim_case > 1) | (new_policy_loss <= old_policy_loss)
                 cost_improve = (
                     (new_cost_loss - old_cost_loss <= jnp.maximum(-c, 0))
                     if use_constraint
@@ -520,12 +520,9 @@ def make_train(
             )
             final_params_flat, _ = jax.flatten_util.ravel_pytree(final_params)
 
-            # Merge final params back into model
-            final_model = nnx.merge(graphdef, final_params)
-            optimizer = cpo_state.optimizer.replace(model=final_model)
-
-            # Update CPO state with new policy and margin
-            cpo_state = CPOState(optimizer=optimizer, margin=new_margin)
+            # Update model parameters in place with final params from line search
+            _, current_params = nnx.split(cpo_state.optimizer.model, nnx.Param)
+            nnx.update(current_params, final_params)
 
             # Compute final KL for logging
             final_kl = kl_fn(final_params_flat)
@@ -539,7 +536,7 @@ def make_train(
                 total_loss = value_loss + cost_value_loss
                 return total_loss, (value_loss, cost_value_loss)
 
-            def _update_critic(optimizer: nnx.Optimizer, _):
+            def _update_critic(optimizer: nnx.ModelAndOptimizer, _):
                 """Update value and cost critic parameters."""
                 (_, (value_loss, cost_value_loss)), grads = nnx.value_and_grad(
                     critic_loss_fn, has_aux=True
