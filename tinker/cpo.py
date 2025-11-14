@@ -578,6 +578,7 @@ def make_train(
             )
 
             metrics = {
+                "num_updates": cpo_state.num_updates,
                 "policy_loss": old_policy_loss,
                 "cost_loss": old_cost_loss,
                 "value_loss": value_losses.mean(),
@@ -662,7 +663,7 @@ if __name__ == "__main__":
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
 
     if WANDB == "online":
-        num_steps = len(all_metrics["step"][0])
+        num_steps = len(all_metrics["num_updates"][0])
         for update_idx in range(num_steps):
             log_dict = {}
 
@@ -670,6 +671,9 @@ if __name__ == "__main__":
                 run_prefix = f"run_{run_idx}"
                 log_dict.update(
                     {
+                        f"{run_prefix}/num_updates": all_metrics["num_updates"][
+                            run_idx
+                        ][update_idx],
                         f"{run_prefix}/returns": all_metrics["returns"][run_idx][
                             update_idx
                         ],
