@@ -10,6 +10,7 @@ from matplotlib import pyplot as plt
 
 
 class BinanceFeeTier(Enum):
+    OFF = 0.0
     REGULAR = 0.001
     VIP_1 = 0.001
     VIP_2 = 0.001
@@ -218,9 +219,9 @@ class PortfolioOptimizationGARCH(Environment):
         return EnvParams(
             max_steps=10000,
             initial_cash=1000.0,
-            taker_fee=BinanceFeeTier.REGULAR.value,
+            taker_fee=BinanceFeeTier.OFF.value,
             gas_fee=0.0,
-            trade_threshold=1.0,
+            trade_threshold=0.0,
             garch_params=self._garch_params,
             var_threshold=-0.5,
             var_probability=0.05,
@@ -238,20 +239,28 @@ class PortfolioOptimizationGARCH(Environment):
 
     def observation_space(self, params: EnvParams) -> spaces.Box:
         """Observation: recent returns and volatilities for all assets."""
-        num_garch_params = (
-            self.num_assets * 2
-            + self.num_assets * self.vec_params.alpha.shape[1]
-            + self.num_assets * self.vec_params.beta.shape[1]
-        )
-        obs_shape = (
-            self.num_assets
-            + 1
-            + self.step_size * self.num_assets * 2
-            + num_garch_params,
-        )
+        # num_garch_params = (
+        #    self.num_assets * 2
+        #    + self.num_assets * self.vec_params.alpha.shape[1]
+        #    + self.num_assets * self.vec_params.beta.shape[1]
+        # )
+        # obs_shape = (
+        #    self.num_assets
+        #    + 1
+        #    + self.step_size * self.num_assets * 2
+        #    + num_garch_params,
+        # )
+        obs_shape = (self.num_assets * 2,)
         return spaces.Box(
             low=-jnp.inf, high=jnp.inf, shape=obs_shape, dtype=jnp.float32
         )
+
+    def get_obs_easy(self, state: EnvState, params: EnvParams) -> chex.Array:
+        next_time = state.time + self.step_size
+        next_vol = self.volatilities[next_time, :]  # (num_assets,)
+        mu = self.vec_params.mu  # (num_assets,)
+        obs = jnp.concatenate([next_vol.flatten(), mu.flatten()])
+        return obs
 
     def get_obs(self, state: EnvState, params: EnvParams) -> chex.Array:
         """Get observation from current state."""
@@ -368,7 +377,7 @@ class PortfolioOptimizationGARCH(Environment):
             episode_return=episode_return,
         )
 
-        obs = self.get_obs(next_state, params)
+        obs = self.get_obs_easy(next_state, params)
         done = self.is_terminal(next_state, params)
         info = {"cost": local_cost}
         return obs, next_state, reward, done, info
@@ -398,7 +407,7 @@ class PortfolioOptimizationGARCH(Environment):
             total_value=jnp.sum(values),
             episode_return=0.0,
         )
-        obs = self.get_obs(state, params)
+        obs = self.get_obs_easy(state, params)
         return obs, state
 
     def plot_garch(self):
@@ -464,3 +473,4 @@ if __name__ == "__main__":
     next_obs, next_state, reward, done, info = env.step_env(
         rng, state, action, env.default_params
     )
+    print(obs)
