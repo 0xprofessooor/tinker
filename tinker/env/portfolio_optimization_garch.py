@@ -259,7 +259,14 @@ class PortfolioOptimizationGARCH(Environment):
         next_time = state.time + self.step_size
         next_vol = self.volatilities[next_time, :]  # (num_assets,)
         mu = self.vec_params.mu  # (num_assets,)
-        obs = jnp.concatenate([next_vol.flatten(), mu.flatten()])
+
+        mu_scaler = 1_000_000
+        vol_scaler = 1000
+
+        normalized_vol = next_vol * vol_scaler  # Scale to ~[0.1, 1.0]
+        normalized_mu = mu * mu_scaler  # Scale to ~[0.01, 1.0]
+
+        obs = jnp.concatenate([normalized_vol.flatten(), normalized_mu.flatten()])
         return obs
 
     def get_obs(self, state: EnvState, params: EnvParams) -> chex.Array:
@@ -450,21 +457,21 @@ if __name__ == "__main__":
     rng = jax.random.PRNGKey(1)
     garch_params = {
         "BTC": GARCHParams(
-            mu=0,
+            mu=5e-7,
             omega=0.0000001110,
             alpha=jnp.array([0.165]),
             beta=jnp.array([0.8]),
-            initial_price=66084.0,
+            initial_price=1.0,
         ),
-        "ETH": GARCHParams(
-            mu=0,
+        "APPL": GARCHParams(
+            mu=3e-8,
             omega=0.0000004817,
             alpha=jnp.array([0.15]),
             beta=jnp.array([0.8]),
-            initial_price=2629.79,
+            initial_price=1.0,
         ),
     }
-    env = PortfolioOptimizationGARCH(rng, garch_params, total_samples=1000)
+    env = PortfolioOptimizationGARCH(rng, garch_params)
 
     env.plot_garch()
 
