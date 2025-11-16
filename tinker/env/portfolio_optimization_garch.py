@@ -427,7 +427,7 @@ class PortfolioOptimizationGARCH(Environment):
         axes[0].set_title("GARCH-Simulated Asset Prices")
         axes[0].set_xlabel("Time")
         axes[0].set_ylabel("Price")
-        axes[0].legend()
+        axes[0].legend(loc="upper right")
         axes[0].grid(True, alpha=0.3)
 
         # Plot returns
@@ -436,7 +436,7 @@ class PortfolioOptimizationGARCH(Environment):
         axes[1].set_title("GARCH Returns")
         axes[1].set_xlabel("Time")
         axes[1].set_ylabel("Return")
-        axes[1].legend()
+        axes[1].legend(loc="upper right")
         axes[1].grid(True, alpha=0.3)
         axes[1].axhline(y=0, color="k", linestyle="--", linewidth=0.5)
 
@@ -446,7 +446,7 @@ class PortfolioOptimizationGARCH(Environment):
         axes[2].set_title("GARCH Conditional Volatilities")
         axes[2].set_xlabel("Time")
         axes[2].set_ylabel("Volatility")
-        axes[2].legend()
+        axes[2].legend(loc="upper right")
         axes[2].grid(True, alpha=0.3)
 
         plt.tight_layout()
