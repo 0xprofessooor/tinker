@@ -402,22 +402,6 @@ def make_train(
                 traj_batch, last_val, gae_gamma, gae_lambda
             )
 
-            # Custom VAR cost augmentation
-            def _augment_costs(traj_batch: Transition):
-                normalizer = (1 - env_params.gamma_discount**env_params.max_steps) / (
-                    1 - env_params.gamma_discount + 1e-8
-                )
-                expected_return = return_targets.mean()
-                costs = (
-                    traj_batch.cost
-                    - (1 / env_params.var_probability)
-                    * (expected_return**2)
-                    / normalizer
-                )
-                return traj_batch._replace(cost=costs)
-
-            traj_batch = _augment_costs(traj_batch)
-
             # Cost advantages
             cost_advantages, cost_targets = _calculate_gae(
                 traj_batch._replace(

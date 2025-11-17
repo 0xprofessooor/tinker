@@ -361,14 +361,11 @@ class PortfolioOptimizationGARCH(Environment):
         reward = jnp.log(new_total_value) - jnp.log(state.total_value)
         alpha = (1 / params.var_probability) - 1
         discount_term = params.gamma_discount**state.step
-        normalizer = (1 - params.gamma_discount**params.max_steps) / (
-            1 - params.gamma_discount + 1e-8
-        )
+
         local_cost = (
             2.0 * alpha * state.episode_return * reward
             + alpha * discount_term * (reward**2)
             + 2.0 * params.var_threshold * reward
-            - ((params.var_threshold**2) / normalizer)
         )
         episode_return = state.episode_return + discount_term * reward
 
