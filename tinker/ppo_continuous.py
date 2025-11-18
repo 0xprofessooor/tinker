@@ -15,7 +15,7 @@ from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from gymnax.environments.environment import Environment, EnvParams
 from gymnax.wrappers import LogWrapper
-from tinker.env.portfolio_optimization_garch import (
+from tinker.env.po_garch import (
     PortfolioOptimizationGARCH,
     GARCHParams,
 )
