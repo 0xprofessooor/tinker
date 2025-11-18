@@ -7,6 +7,7 @@ import chex
 import jax
 from jax import numpy as jnp
 from matplotlib import pyplot as plt
+from argparse import ArgumentParser
 
 
 class BinanceFeeTier(Enum):
@@ -278,7 +279,7 @@ class PortfolioOptimizationGARCH(Environment):
         next_vol = traj_vols.squeeze()  # (num_assets,)
         mu = self.vec_params.mu  # (num_assets,)
 
-        mu_scaler = 1_000_000
+        mu_scaler = 100_000
         vol_scaler = 1000
 
         normalized_vol = next_vol * vol_scaler  # Scale to ~[0.1, 1.0]
@@ -518,50 +519,167 @@ class PortfolioOptimizationGARCH(Environment):
 
 
 if __name__ == "__main__":
-    rng = jax.random.PRNGKey(1)
+    parser = ArgumentParser(
+        description="Test portfolio optimization environment with different policies"
+    )
+    parser.add_argument(
+        "--policy",
+        type=str,
+        default="random",
+        choices=["random", "hold_btc", "hold_appl", "hold_cash"],
+        help="Policy to use: random, hold_btc, hold_appl, or hold_cash",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    args = parser.parse_args()
+
+    rng = jax.random.PRNGKey(args.seed)
     garch_params = {
         "BTC": GARCHParams(
-            mu=5e-7,
-            omega=0.0000001110,
+            mu=5e-4,
+            omega=0.0000004817,
             alpha=jnp.array([0.165]),
             beta=jnp.array([0.8]),
             initial_price=1.0,
         ),
         "APPL": GARCHParams(
-            mu=3e-8,
-            omega=0.0000004817,
+            mu=1e-4,
+            omega=0.0000001110,
             alpha=jnp.array([0.15]),
             beta=jnp.array([0.8]),
             initial_price=1.0,
         ),
     }
 
-    # Create environment with 3 independent trajectories
     env = PortfolioOptimizationGARCH(
         rng,
         garch_params,
-        num_trajectories=1,  # Generate 3 independent paths
+        num_trajectories=1,
+        num_samples=10_000,
     )
 
     # Plot first trajectory
     env.plot_garch(trajectory_id=0)
 
-    # Test with different trajectories
-    rng, reset_rng1, reset_rng2 = jax.random.split(rng, 3)
+    # Run a full episode with random actions using JAX scan (fast!)
+    rng, reset_rng = jax.random.split(rng)
+    obs, state = env.reset(reset_rng, env.default_params)
 
-    # Reset will randomly sample trajectories
-    obs1, state = env.reset(reset_rng2, env.default_params)
-    print(state)
+    max_steps = env.default_params.max_steps
+    appl_idx = env.asset_names.index("APPL") + 1
+    btc_idx = env.asset_names.index("BTC") + 1
 
-    # Test step
-    action = jnp.array([0.999995, 0.000003, 0.0000002])
-    next_obs, next_state, reward, done, info = env.step_env(
-        rng, state, action, env.default_params
+    # Generate actions based on policy
+    rng, action_rng = jax.random.split(rng)
+
+    if args.policy == "random":
+        # Random actions (unnormalized)
+        action_keys = jax.random.split(action_rng, max_steps)
+        all_actions = jax.random.normal(action_keys[0], (max_steps, env.num_assets + 1))
+    elif args.policy == "hold_cash":
+        # Hold 100% cash: [large, small, small]
+        all_actions = jnp.tile(jnp.array([10.0, -10.0, -10.0]), (max_steps, 1))
+    elif args.policy == "hold_btc":
+        # Hold 100% BTC: [small, large, small]
+        all_actions = jnp.tile(jnp.array([-10.0, -10.0, -10.0]), (max_steps, 1))
+        all_actions = all_actions.at[:, btc_idx].set(10.0)
+    elif args.policy == "hold_appl":
+        # Hold 100% APPL: [small, small, large]
+        all_actions = jnp.tile(jnp.array([-10.0, -10.0, -10.0]), (max_steps, 1))
+        all_actions = all_actions.at[:, appl_idx].set(10.0)
+
+    print(f"\nRunning {args.policy} policy for {max_steps} steps...")
+
+    # Define step function for scan
+    def scan_step(carry, action):
+        state, rng = carry
+        rng, step_rng = jax.random.split(rng)
+        obs, next_state, reward, done, info = env.step_env(
+            step_rng, state, action, env.default_params
+        )
+        weights = jax.nn.softmax(action)
+
+        # Return updated carry and outputs to collect
+        outputs = {
+            "reward": reward,
+            "portfolio_value": next_state.total_value,
+            "weights": weights,
+            "done": done,
+        }
+        return (next_state, rng), outputs
+
+    # Run entire episode with scan (JIT-compiled, runs on GPU/TPU)
+    (final_state, _), trajectory = jax.lax.scan(scan_step, (state, rng), all_actions)
+
+    # Extract results
+    rewards = trajectory["reward"]
+    portfolio_values = jnp.concatenate(
+        [jnp.array([state.total_value]), trajectory["portfolio_value"]]
     )
-    print(next_state)
+    cash_weights = trajectory["weights"][:, 0]
+    btc_weights = trajectory["weights"][:, btc_idx]
+    appl_weights = trajectory["weights"][:, appl_idx]
 
-    action = jnp.array([0.2, 0.5, 0.3])
-    next_obs, next_state, reward, done, info = env.step_env(
-        rng, next_state, action, env.default_params
+    # Calculate cumulative return
+    cumulative_returns = jnp.cumsum(rewards)
+    total_return = float(cumulative_returns[-1])
+    final_value = float(portfolio_values[-1])
+    initial_value = float(portfolio_values[0])
+
+    print(f"\n{'=' * 60}")
+    print(f"Episode Summary ({args.policy} policy):")
+    print(f"{'=' * 60}")
+    print(f"Steps completed: {max_steps}")
+    print(f"Initial portfolio value: ${initial_value:.2f}")
+    print(f"Final portfolio value: ${final_value:.2f}")
+    print(f"Total return (log): {total_return:.6f}")
+    print(f"Total return (percentage): {(final_value / initial_value - 1) * 100:.2f}%")
+    print(f"Average reward per step: {float(jnp.mean(rewards)):.6f}")
+    print(f"Reward std dev: {float(jnp.std(rewards)):.6f}")
+    print(
+        f"Sharpe ratio (approx): {float(jnp.mean(rewards) / (jnp.std(rewards) + 1e-8)):.4f}"
     )
-    print(next_state)
+    print(f"{'=' * 60}\n")
+
+    # Create visualization
+    fig, axes = plt.subplots(4, 1, figsize=(14, 12))
+
+    # Plot 1: Rewards over time
+    axes[0].plot(rewards, alpha=0.7, linewidth=1)
+    axes[0].set_title(f"Rewards per Step (Log Returns) - {args.policy} policy")
+    axes[0].set_xlabel("Step")
+    axes[0].set_ylabel("Reward")
+    axes[0].axhline(y=0, color="k", linestyle="--", linewidth=0.5)
+    axes[0].grid(True, alpha=0.3)
+
+    # Plot 2: Cumulative returns
+    axes[1].plot(cumulative_returns, color="green", linewidth=2)
+    axes[1].set_title("Cumulative Returns")
+    axes[1].set_xlabel("Step")
+    axes[1].set_ylabel("Cumulative Log Return")
+    axes[1].axhline(y=0, color="k", linestyle="--", linewidth=0.5)
+    axes[1].grid(True, alpha=0.3)
+
+    # Plot 3: Portfolio value over time
+    axes[2].plot(portfolio_values, color="blue", linewidth=2)
+    axes[2].set_title("Portfolio Value Over Time")
+    axes[2].set_xlabel("Step")
+    axes[2].set_ylabel("Portfolio Value ($)")
+    axes[2].axhline(
+        y=initial_value, color="k", linestyle="--", linewidth=0.5, label="Initial Value"
+    )
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+
+    # Plot 4: Portfolio allocation over time
+    axes[3].plot(cash_weights, label="Cash", alpha=0.7)
+    axes[3].plot(btc_weights, label="BTC", alpha=0.7)
+    axes[3].plot(appl_weights, label="APPL", alpha=0.7)
+    axes[3].set_title("Portfolio Weights Over Time")
+    axes[3].set_xlabel("Step")
+    axes[3].set_ylabel("Weight")
+    axes[3].set_ylim([0, 1])
+    axes[3].legend(loc="upper right")
+    axes[3].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()

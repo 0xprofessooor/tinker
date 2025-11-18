@@ -15,7 +15,10 @@ from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from gymnax.environments.environment import Environment, EnvParams
 from gymnax.wrappers import LogWrapper
-from tinker.env.portfolio_optimization import PortfolioOptimizationV0
+from tinker.env.portfolio_optimization_garch import (
+    PortfolioOptimizationGARCH,
+    GARCHParams,
+)
 
 import wandb
 
@@ -366,7 +369,7 @@ def run(
 
 
 if __name__ == "__main__":
-    config = {
+    pendulum_config = {
         "ENV_NAME": "Pendulum-v1",
         "LR": 3e-4,
         "NUM_ENVS": 1,
@@ -386,8 +389,56 @@ if __name__ == "__main__":
         "NUM_SEEDS": 5,
         "SEED": 0,
     }
+    config = {
+        "ENV_NAME": "PO-GARCH",
+        "LR": 3e-4,
+        "NUM_ENVS": 5,
+        "TRAIN_FREQ": 2048,
+        "TOTAL_TIMESTEPS": 1e6,
+        "UPDATE_EPOCHS": 10,
+        "BATCH_SIZE": 64,
+        "GAMMA": 0.99,
+        "GAE_LAMBDA": 0.95,
+        "CLIP_EPS": 0.2,
+        "ENT_COEF": 0.01,
+        "VF_COEF": 0.5,
+        "MAX_GRAD_NORM": 0.5,
+        "ACTIVATION": "tanh",
+        "ANNEAL_LR": False,
+        "WANDB_MODE": "online",
+        "NUM_SEEDS": 1,
+        "SEED": 0,
+    }
 
-    env, env_params = gymnax.make(config["ENV_NAME"])
+    rng = jax.random.PRNGKey(config["SEED"])
+    rngs = jax.random.split(rng, config["NUM_SEEDS"] + 1)
+    garch_rng = rngs[0]
+    train_rngs = rngs[1:]
+
+    garch_params = {
+        "BTC": GARCHParams(
+            mu=5e-4,
+            omega=0.0000004817,
+            alpha=jnp.array([0.165]),
+            beta=jnp.array([0.8]),
+            initial_price=1.0,
+        ),
+        "APPL": GARCHParams(
+            mu=1e-4,
+            omega=0.0000001110,
+            alpha=jnp.array([0.15]),
+            beta=jnp.array([0.8]),
+            initial_price=1.0,
+        ),
+    }
+    env = PortfolioOptimizationGARCH(
+        garch_rng,
+        garch_params,
+        num_samples=10_000,
+        num_trajectories=config["NUM_ENVS"] * 20,
+    )
+    env_params = env.default_params
+    env.plot_garch(trajectory_id=0)
 
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
@@ -417,10 +468,8 @@ if __name__ == "__main__":
         ratio_clip=config["CLIP_EPS"],
     )
 
-    rng = jax.random.PRNGKey(config["SEED"])
-    rngs = jax.random.split(rng, config["NUM_SEEDS"])
     train_vjit = jax.jit(jax.vmap(train_fn))
-    runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
+    runner_states, all_metrics = jax.block_until_ready(train_vjit(train_rngs))
 
     # Log metrics from each parallel run separately to WandB
     if config["WANDB_MODE"] == "online":
