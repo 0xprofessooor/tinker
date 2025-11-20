@@ -66,7 +66,7 @@ class EnvParams:
     garch_params: Dict[str, GARCHParams]  # GARCH params for each asset
     var_threshold: float  # return threshold for VaR constraint
     var_probability: float  # probability level for VaR constraint
-    gamma_discount: float  # Discount factor for returns
+    discount_gamma: float  # Discount factor for returns
 
 
 @jax.jit
@@ -237,7 +237,7 @@ class PortfolioOptimizationGARCH(Environment):
             garch_params=self._garch_params,
             var_threshold=-0.5,
             var_probability=0.05,
-            gamma_discount=0.99,
+            discount_gamma=1.0,
         )
 
     def action_space(self, params: EnvParams) -> spaces.Box:
@@ -395,7 +395,7 @@ class PortfolioOptimizationGARCH(Environment):
 
         reward = jnp.log(new_total_value) - jnp.log(state.total_value)
         alpha = (1 / params.var_probability) - 1
-        discount_term = params.gamma_discount**state.step
+        discount_term = params.discount_gamma**state.step
 
         local_cost = (
             2.0 * alpha * state.episode_return * reward
