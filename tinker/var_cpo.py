@@ -252,6 +252,7 @@ def make_train(
     gae_lambda: float = 0.95,
     max_grad_norm: float = 0.5,
     target_kl: float = 0.01,
+    entropy_coeff: float = 0.0,
     backtrack_coeff: float = 0.8,
     backtrack_iters: int = 10,
     damping_coeff: float = 0.1,
@@ -439,7 +440,9 @@ def make_train(
                 log_prob = pi.log_prob(traj_batch.action)
                 ratio = jnp.exp(log_prob - traj_batch.log_prob)
 
-                policy_loss = -(ratio * advantages).mean()
+                policy_loss = -(ratio * advantages).mean() - (
+                    entropy_coeff * pi.entropy().mean()
+                )
 
                 return policy_loss
 
