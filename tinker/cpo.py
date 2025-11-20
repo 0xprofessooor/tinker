@@ -414,6 +414,8 @@ def make_train(
 
             # Normalize reward advantages
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            # Center but do not rescale cost advantages
+            cost_advantages = cost_advantages - cost_advantages.mean()
 
             # Compute constraint violation
             traj_cost = traj_batch.cost.sum(

@@ -413,6 +413,8 @@ def make_train(
 
             # Normalize reward advantages
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            # Center but do not rescale cost advantages
+            cost_advantages = cost_advantages - cost_advantages.mean()
 
             # Compute constraint limit
             discounts = jnp.power(discount_gamma, jnp.arange(train_freq))
