@@ -416,9 +416,15 @@ def make_train(
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             # Compute constraint violation
-            ep_cost = cost_targets.mean()
-            c = ep_cost - cost_limit + cpo_state.margin
-            new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c)
+            traj_cost = traj_batch.cost.sum(
+                axis=0
+            ).mean()  # Sum over time, mean over envs
+            # Update margin first
+            c_raw = traj_cost - cost_limit
+            new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
+            # Add margin and normalize by episode length
+            c = c_raw + new_margin
+            c = c / (train_freq + 1e-8)
 
             # UPDATE POLICY (CPO STEP)
             # Clone current model for reference in KL and line search
@@ -570,7 +576,7 @@ def make_train(
                 "kl": final_kl,
                 "constraint_violation": c,
                 "margin": new_margin,
-                "ep_cost": ep_cost,
+                "traj_cost": traj_cost,
                 "optim_case": optim_case,
                 "returns": traj_batch.info["returned_episode_returns"].mean(),
                 "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
@@ -680,7 +686,7 @@ if __name__ == "__main__":
                         f"{run_prefix}/constraint_violation": all_metrics[
                             "constraint_violation"
                         ][run_idx][update_idx],
-                        f"{run_prefix}/ep_cost": all_metrics["ep_cost"][run_idx][
+                        f"{run_prefix}/traj_cost": all_metrics["traj_cost"][run_idx][
                             update_idx
                         ],
                         f"{run_prefix}/margin": all_metrics["margin"][run_idx][
