@@ -6,6 +6,7 @@ wandb/
 notebooks/
 data/
 .DS_Store
+checkpoints/
 
 # C extensions
 *.so

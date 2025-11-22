@@ -1,7 +1,7 @@
 """Proximal Policy Optimization (PPO) with Continuous Action Space."""
 
+import json
 import os
-import pickle
 from typing import NamedTuple, Tuple
 
 import chex
@@ -69,6 +69,9 @@ def save_policy(train_state: TrainState, save_path: str, config: dict = None):
         save_path: Path to save the policy (without extension)
         config: Optional configuration dict to save alongside the policy
     """
+    # Convert to absolute path
+    save_path = os.path.abspath(save_path)
+
     os.makedirs(
         os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True
     )
@@ -84,9 +87,9 @@ def save_policy(train_state: TrainState, save_path: str, config: dict = None):
 
     # Save config separately if provided
     if config is not None:
-        config_path = save_path + "_config.pkl"
-        with open(config_path, "wb") as f:
-            pickle.dump(config, f)
+        config_path = save_path + "_config.json"
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
         print(f"Config saved to {config_path}")
 
     print(f"Policy saved to {save_path}")
@@ -111,6 +114,9 @@ def load_policy(
         train_state: The restored TrainState with trained parameters
         config: The configuration dict (if it was saved)
     """
+    # Convert to absolute path
+    load_path = os.path.abspath(load_path)
+
     # Initialize network with same architecture
     network = ActorCritic(action_dim, activation=activation)
     init_x = jnp.zeros(obs_shape)
@@ -135,10 +141,10 @@ def load_policy(
 
     # Load config if it exists
     config = None
-    config_path = load_path + "_config.pkl"
+    config_path = load_path + "_config.json"
     if os.path.exists(config_path):
-        with open(config_path, "rb") as f:
-            config = pickle.load(f)
+        with open(config_path, "r") as f:
+            config = json.load(f)
         print(f"Config loaded from {config_path}")
 
     print(f"Policy loaded from {load_path}")
@@ -480,10 +486,10 @@ if __name__ == "__main__":
         "ENV_NAME": "PO-GARCH",
         "LR": 3e-4,
         "NUM_ENVS": 10,
-        "TRAIN_FREQ": 2048,
+        "TRAIN_FREQ": 1000,
         "TOTAL_TIMESTEPS": 1e6,
         "UPDATE_EPOCHS": 10,
-        "BATCH_SIZE": 64,
+        "BATCH_SIZE": 100,
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
@@ -524,9 +530,9 @@ if __name__ == "__main__":
         num_samples=1000,
         num_trajectories=config["NUM_ENVS"] * 1000,
     )
-    env_params = env.default_params
-    env_params.max_steps = 1000
-    env.plot_garch(trajectory_id=0)
+    env_params = env.default_params.replace(
+        max_steps=1000,
+    )
 
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
@@ -608,6 +614,8 @@ if __name__ == "__main__":
             wandb.log(log_dict)
 
     # Save the best policy (from the first seed)
-    best_train_state = runner_states[0][0]  # (train_state, env_state, last_obs, rng)
+    # runner_states is a tuple: (train_state, env_state, last_obs, rng)
+    # Each element is vmapped, so runner_states[0] gives all train_states
+    best_train_state = jax.tree_util.tree_map(lambda x: x[0], runner_states[0])
     save_path = f"checkpoints/ppo_{config['ENV_NAME']}_seed{config['SEED']}"
     save_policy(best_train_state, save_path, config)
