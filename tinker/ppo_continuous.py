@@ -1,6 +1,7 @@
 """Proximal Policy Optimization (PPO) with Continuous Action Space."""
 
 import os
+import pickle
 from typing import NamedTuple, Tuple
 
 import chex
@@ -13,6 +14,7 @@ import numpy as np
 import optax
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
+from flax.training import checkpoints
 from gymnax.environments.environment import Environment, EnvParams
 from gymnax.wrappers import LogWrapper
 from tinker.env.po_garch import (
@@ -56,6 +58,91 @@ class ActorCritic(nn.Module):
         )
 
         return pi, jnp.squeeze(critic, axis=-1)
+
+
+def save_policy(train_state: TrainState, save_path: str, config: dict = None):
+    """
+    Save the trained policy parameters and configuration.
+
+    Args:
+        train_state: The Flax TrainState containing the network parameters
+        save_path: Path to save the policy (without extension)
+        config: Optional configuration dict to save alongside the policy
+    """
+    os.makedirs(
+        os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True
+    )
+
+    # Save using Flax checkpoints
+    checkpoints.save_checkpoint(
+        ckpt_dir=os.path.dirname(save_path) or ".",
+        target=train_state,
+        step=0,
+        prefix=os.path.basename(save_path) + "_",
+        overwrite=True,
+    )
+
+    # Save config separately if provided
+    if config is not None:
+        config_path = save_path + "_config.pkl"
+        with open(config_path, "wb") as f:
+            pickle.dump(config, f)
+        print(f"Config saved to {config_path}")
+
+    print(f"Policy saved to {save_path}")
+
+
+def load_policy(
+    load_path: str,
+    action_dim: int,
+    obs_shape: tuple,
+    activation: callable = nn.tanh,
+) -> Tuple[TrainState, dict]:
+    """
+    Load a trained policy from disk.
+
+    Args:
+        load_path: Path to the saved policy (without extension)
+        action_dim: Dimension of the action space
+        obs_shape: Shape of the observation space
+        activation: Activation function used in the network
+
+    Returns:
+        train_state: The restored TrainState with trained parameters
+        config: The configuration dict (if it was saved)
+    """
+    # Initialize network with same architecture
+    network = ActorCritic(action_dim, activation=activation)
+    init_x = jnp.zeros(obs_shape)
+    rng = jax.random.PRNGKey(0)
+    network_params = network.init(rng, init_x)
+
+    # Create a dummy train_state to restore into
+    tx = optax.adam(1e-4)  # Dummy optimizer
+    train_state = TrainState.create(
+        apply_fn=network.apply,
+        params=network_params,
+        tx=tx,
+    )
+
+    # Restore from checkpoint
+    restored_state = checkpoints.restore_checkpoint(
+        ckpt_dir=os.path.dirname(load_path) or ".",
+        target=train_state,
+        step=None,
+        prefix=os.path.basename(load_path) + "_",
+    )
+
+    # Load config if it exists
+    config = None
+    config_path = load_path + "_config.pkl"
+    if os.path.exists(config_path):
+        with open(config_path, "rb") as f:
+            config = pickle.load(f)
+        print(f"Config loaded from {config_path}")
+
+    print(f"Policy loaded from {load_path}")
+    return restored_state, config
 
 
 class Transition(NamedTuple):
@@ -392,7 +479,7 @@ if __name__ == "__main__":
     config = {
         "ENV_NAME": "PO-GARCH",
         "LR": 3e-4,
-        "NUM_ENVS": 5,
+        "NUM_ENVS": 10,
         "TRAIN_FREQ": 2048,
         "TOTAL_TIMESTEPS": 1e6,
         "UPDATE_EPOCHS": 10,
@@ -418,14 +505,14 @@ if __name__ == "__main__":
     garch_params = {
         "BTC": GARCHParams(
             mu=5e-4,
-            omega=0.0000004817,
+            omega=5e-5,
             alpha=jnp.array([0.165]),
             beta=jnp.array([0.8]),
             initial_price=1.0,
         ),
         "APPL": GARCHParams(
             mu=1e-4,
-            omega=0.0000001110,
+            omega=1e-5,
             alpha=jnp.array([0.15]),
             beta=jnp.array([0.8]),
             initial_price=1.0,
@@ -434,10 +521,11 @@ if __name__ == "__main__":
     env = PortfolioOptimizationGARCH(
         garch_rng,
         garch_params,
-        num_samples=10_000,
-        num_trajectories=config["NUM_ENVS"] * 20,
+        num_samples=1000,
+        num_trajectories=config["NUM_ENVS"] * 1000,
     )
     env_params = env.default_params
+    env_params.max_steps = 1000
     env.plot_garch(trajectory_id=0)
 
     wandb.login(os.environ.get("WANDB_KEY"))
@@ -518,3 +606,8 @@ if __name__ == "__main__":
 
             # Log to WandB
             wandb.log(log_dict)
+
+    # Save the best policy (from the first seed)
+    best_train_state = runner_states[0][0]  # (train_state, env_state, last_obs, rng)
+    save_path = f"checkpoints/ppo_{config['ENV_NAME']}_seed{config['SEED']}"
+    save_policy(best_train_state, save_path, config)
