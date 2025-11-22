@@ -618,28 +618,33 @@ if __name__ == "__main__":
 
     garch_params = {
         "BTC": GARCHParams(
-            mu=0,
-            omega=0.0000001110,
+            mu=5e-4,
+            omega=5e-5,
             alpha=jnp.array([0.165]),
             beta=jnp.array([0.8]),
-            initial_price=66084.0,
+            initial_price=1.0,
         ),
-        "ETH": GARCHParams(
-            mu=0,
-            omega=0.0000004817,
+        "APPL": GARCHParams(
+            mu=1e-4,
+            omega=1e-5,
             alpha=jnp.array([0.15]),
             beta=jnp.array([0.8]),
-            initial_price=2629.79,
+            initial_price=1.0,
         ),
     }
-    env = PortfolioOptimizationGARCH(garch_rng, garch_params)
+    env = PortfolioOptimizationGARCH(
+        garch_rng, garch_params, num_samples=1000, num_trajectories=10000
+    )
     env_params = env.default_params
+    env_params.max_steps = 1000
+    env_params.var_probability = 0.05
+    env_params.var_threshold = -1.0
 
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
         project="Tinker",
-        tags=["CPO", f"{env.name.upper()}", f"jax_{jax.__version__}"],
-        name=f"cpo_{env.name}",
+        tags=["VAR-CPO", f"{env.name.upper()}", f"jax_{jax.__version__}"],
+        name=f"varcpo_{env.name}",
         mode=WANDB,
     )
 
@@ -650,10 +655,11 @@ if __name__ == "__main__":
         env,
         env_params,
         num_steps=int(1e6),
-        num_envs=1,
-        critic_epochs=10,
+        num_envs=10,
         train_freq=env_params.max_steps,
-        cost_limit=env_params.var_threshold,
+        var_probability=env_params.var_probability,
+        var_threshold=env_params.var_threshold,
+        margin_lr=0.0,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
