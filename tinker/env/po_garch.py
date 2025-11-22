@@ -48,7 +48,7 @@ class EnvState:
     time: int
     trajectory_id: int  # Which trajectory this environment is using
     prices: chex.Array  # Current prices for all assets
-    returns: chex.Array  # Current returns for all assets
+    log_returns: chex.Array  # Current returns for all assets
     volatilities: chex.Array  # Current volatilities for all assets
     holdings: chex.Array  # Current holdings
     values: chex.Array  # Current values
@@ -107,15 +107,15 @@ def _sample_garch(carry, x):
     new_vol = jnp.sqrt(jnp.maximum(variance, 1e-8))  # Ensure positive variance
 
     # r_t = mu + sigma_t * epsilon_t
-    new_return = params.mu + new_vol * noise
-    new_price = last_price * jnp.exp(new_return)
+    new_log_return = params.mu + new_vol * noise
+    new_price = last_price * jnp.exp(new_log_return)
 
     # Update GARCH state
-    y = (new_return, new_vol, new_price)
+    y = (new_log_return, new_vol, new_price)
     new_last_vols = jnp.roll(last_vols, shift=1, axis=-1)
     new_last_vols = new_last_vols.at[:, 0].set(new_vol)
     new_last_returns = jnp.roll(last_returns, shift=1, axis=-1)
-    new_last_returns = new_last_returns.at[:, 0].set(new_return)
+    new_last_returns = new_last_returns.at[:, 0].set(new_log_return)
     new_carry = (params, (new_last_vols, new_last_returns, new_price))
     return new_carry, y
 
@@ -220,7 +220,7 @@ class PortfolioOptimizationGARCH(Environment):
 
         # Run all trajectories in parallel: (num_trajectories, num_samples, num_assets)
         outputs = jax.vmap(simulate_one_trajectory)(all_noise)
-        self.returns, self.volatilities, self.prices = outputs
+        self.log_returns, self.volatilities, self.prices = outputs
 
     @property
     def name(self) -> str:
@@ -229,7 +229,7 @@ class PortfolioOptimizationGARCH(Environment):
     @property
     def default_params(self) -> EnvParams:
         return EnvParams(
-            max_steps=10000,
+            max_steps=1000,
             initial_cash=1000.0,
             taker_fee=BinanceFeeTier.OFF.value,
             gas_fee=0.0,
@@ -279,13 +279,7 @@ class PortfolioOptimizationGARCH(Environment):
         next_vol = traj_vols.squeeze()  # (num_assets,)
         mu = self.vec_params.mu  # (num_assets,)
 
-        mu_scaler = 100_000
-        vol_scaler = 1000
-
-        normalized_vol = next_vol * vol_scaler  # Scale to ~[0.1, 1.0]
-        normalized_mu = mu * mu_scaler  # Scale to ~[0.01, 1.0]
-
-        obs = jnp.concatenate([normalized_vol.flatten(), normalized_mu.flatten()])
+        obs = jnp.concatenate([next_vol.flatten(), mu.flatten()])
         return obs
 
     def get_obs(self, state: EnvState, params: EnvParams) -> chex.Array:
@@ -294,8 +288,8 @@ class PortfolioOptimizationGARCH(Environment):
         start_time_idx = jnp.maximum(0, state.time - self.step_size + 1)
 
         # Index into correct trajectory using dynamic_slice
-        returns_window = jax.lax.dynamic_slice(
-            self.returns,
+        log_returns_window = jax.lax.dynamic_slice(
+            self.log_returns,
             (state.trajectory_id, start_time_idx, 0),
             (1, self.step_size, self.num_assets),
         ).squeeze(0)  # Remove trajectory dimension
@@ -314,7 +308,7 @@ class PortfolioOptimizationGARCH(Environment):
         obs = jnp.concatenate(
             [
                 state.values,
-                returns_window.flatten(),
+                log_returns_window.flatten(),
                 vols_window.flatten(),
                 mu.flatten(),
                 omega.flatten(),
@@ -341,8 +335,8 @@ class PortfolioOptimizationGARCH(Environment):
             self.prices, (state.trajectory_id, time, 0), (1, 1, self.num_assets)
         ).squeeze()  # (num_assets,)
 
-        traj_returns = jax.lax.dynamic_slice(
-            self.returns, (state.trajectory_id, time, 0), (1, 1, self.num_assets)
+        traj_log_returns = jax.lax.dynamic_slice(
+            self.log_returns, (state.trajectory_id, time, 0), (1, 1, self.num_assets)
         ).squeeze()
 
         traj_volatilities = jax.lax.dynamic_slice(
@@ -350,7 +344,7 @@ class PortfolioOptimizationGARCH(Environment):
         ).squeeze()
 
         prices = jnp.concatenate([jnp.array([1.0]), traj_prices])
-        returns = jnp.concatenate([jnp.array([0.0]), traj_returns])
+        log_returns = jnp.concatenate([jnp.array([0.0]), traj_log_returns])
         volatilities = jnp.concatenate([jnp.array([0.0]), traj_volatilities])
 
         # Normalize action to portfolio weights
@@ -409,7 +403,7 @@ class PortfolioOptimizationGARCH(Environment):
             time=time,
             trajectory_id=state.trajectory_id,
             prices=prices,
-            returns=returns,
+            log_returns=log_returns,
             volatilities=volatilities,
             holdings=new_holdings,
             values=adj_new_values,
@@ -446,8 +440,8 @@ class PortfolioOptimizationGARCH(Environment):
             self.prices, (traj_id, time, 0), (1, 1, self.num_assets)
         ).squeeze()
 
-        traj_returns = jax.lax.dynamic_slice(
-            self.returns, (traj_id, time, 0), (1, 1, self.num_assets)
+        traj_log_returns = jax.lax.dynamic_slice(
+            self.log_returns, (traj_id, time, 0), (1, 1, self.num_assets)
         ).squeeze()
 
         traj_volatilities = jax.lax.dynamic_slice(
@@ -455,7 +449,7 @@ class PortfolioOptimizationGARCH(Environment):
         ).squeeze()
 
         prices = jnp.concatenate([jnp.array([1.0]), traj_prices])
-        returns = jnp.concatenate([jnp.array([0.0]), traj_returns])
+        log_returns = jnp.concatenate([jnp.array([0.0]), traj_log_returns])
         volatilities = jnp.concatenate([jnp.array([0.0]), traj_volatilities])
 
         holdings = jnp.zeros(self.num_assets + 1)
@@ -466,7 +460,7 @@ class PortfolioOptimizationGARCH(Environment):
             time=time,
             trajectory_id=traj_id,
             prices=prices,
-            returns=returns,
+            log_returns=log_returns,
             volatilities=volatilities,
             holdings=holdings,
             values=values,
@@ -497,10 +491,10 @@ class PortfolioOptimizationGARCH(Environment):
 
         # Plot returns
         for i, name in enumerate(self.asset_names):
-            axes[1].plot(self.returns[traj_id, :, i], label=f"{name}", alpha=0.7)
-        axes[1].set_title("GARCH Returns")
+            axes[1].plot(self.log_returns[traj_id, :, i], label=f"{name}", alpha=0.7)
+        axes[1].set_title("GARCH Log Returns")
         axes[1].set_xlabel("Time")
-        axes[1].set_ylabel("Return")
+        axes[1].set_ylabel("Log Return")
         axes[1].legend(loc="upper right")
         axes[1].grid(True, alpha=0.3)
         axes[1].axhline(y=0, color="k", linestyle="--", linewidth=0.5)
@@ -516,6 +510,232 @@ class PortfolioOptimizationGARCH(Environment):
 
         plt.tight_layout()
         plt.show()
+
+    def calibrate_var_params(
+        self,
+        safe_asset: str,
+        risky_asset: str,
+        epsilon: float = 0.05,
+        params: EnvParams = None,
+    ):
+        """
+        Estimate VaR threshold (rho) using ALL pre-generated GARCH trajectories.
+
+        Computes the distribution of cumulative returns over episode length (max_steps)
+        and estimates the epsilon-percentile (VaR) for both assets. The recommended rho
+        is set between the safe and risky asset VaR values.
+
+        Args:
+            safe_asset: Name of the safe asset (e.g., "APPL")
+            risky_asset: Name of the risky asset (e.g., "BTC")
+            epsilon: Probability level for VaR (e.g., 0.05 for 5% VaR)
+            params: Environment parameters (uses default_params if None)
+
+        Returns:
+            Tuple of (rho, var_safe, var_risky) - all as floats
+        """
+        if params is None:
+            params = self.default_params
+
+        # Episode length based on environment configuration
+        horizon = params.max_steps * self.step_size
+
+        # Get asset indices
+        safe_idx = self.asset_names.index(safe_asset)
+        risky_idx = self.asset_names.index(risky_asset)
+
+        # Get returns for ALL trajectories
+        # Shape: (num_trajectories, num_samples, num_assets)
+        log_returns_safe_all = self.log_returns[
+            :, :, safe_idx
+        ]  # (num_trajectories, num_samples)
+        log_returns_risky_all = self.log_returns[
+            :, :, risky_idx
+        ]  # (num_trajectories, num_samples)
+
+        # Calculate cumulative returns over episode-length windows for all trajectories
+        def compute_cumulative_returns(log_returns_traj):
+            """Compute sliding window cumulative returns for one trajectory."""
+            num_windows = log_returns_traj.shape[0] - horizon + 1
+
+            # Create sliding windows
+            cumulative_returns = jnp.array(
+                [log_returns_traj[i : i + horizon].sum() for i in range(num_windows)]
+            )
+            return cumulative_returns
+
+        # Vectorize over all trajectories
+        cumulative_returns_safe = jax.vmap(compute_cumulative_returns)(
+            log_returns_safe_all
+        )
+        cumulative_returns_risky = jax.vmap(compute_cumulative_returns)(
+            log_returns_risky_all
+        )
+
+        # Flatten across all trajectories to get the full distribution
+        # Shape: (num_trajectories * num_windows,)
+        log_returns_safe = cumulative_returns_safe.flatten()
+        log_returns_risky = cumulative_returns_risky.flatten()
+
+        # --- Calculate Empirical VaR (epsilon-percentile) ---
+        # We want P(return <= rho) <= epsilon
+        # So we look for the value at the epsilon-th percentile
+        var_safe = jnp.percentile(log_returns_safe, epsilon * 100)
+        var_risky = jnp.percentile(log_returns_risky, epsilon * 100)
+
+        print(
+            f"\n--- Empirical VaR Results (Episode Length: {params.max_steps} steps, All {self.num_trajectories} Trajectories) ---"
+        )
+        print(
+            f"Total samples analyzed: {len(log_returns_safe):,} ({self.num_trajectories} trajectories × {len(log_returns_safe) // self.num_trajectories} windows)"
+        )
+        print(f"{safe_asset} {epsilon * 100}% VaR (log return): {float(var_safe):.6f}")
+        print(
+            f"{safe_asset} {epsilon * 100}% VaR (% return): {(jnp.exp(var_safe) - 1) * 100:.4f}%"
+        )
+        print(
+            f"{risky_asset} {epsilon * 100}% VaR (log return): {float(var_risky):.6f}"
+        )
+        print(
+            f"{risky_asset} {epsilon * 100}% VaR (% return): {(jnp.exp(var_risky) - 1) * 100:.4f}%"
+        )
+        print(f"\nSample statistics (log returns):")
+        print(
+            f"  {safe_asset} - mean: {float(log_returns_safe.mean()):.6f}, std: {float(log_returns_safe.std()):.6f}"
+        )
+        print(
+            f"  {risky_asset} - mean: {float(log_returns_risky.mean()):.6f}, std: {float(log_returns_risky.std()):.6f}"
+        )
+
+        # --- Determine Rho ---
+        if var_safe <= var_risky:
+            print(
+                f"\n⚠ WARNING: {risky_asset} has better (higher) VaR than {safe_asset}."
+            )
+            print(
+                f"  This might indicate that {safe_asset} is actually riskier at the {epsilon * 100}% tail level."
+            )
+
+        # Set rho in the middle (conservative choice)
+        rho = (var_safe + var_risky) / 2
+
+        print(f"\n{'=' * 60}")
+        print(f">>> RECOMMENDED SETTINGS <<<")
+        print(f"{'=' * 60}")
+        print(f"Episode Length (max_steps)  : {params.max_steps}")
+        print(f"Epsilon (Probability Level) : {epsilon}")
+        print(f"Rho (VaR Threshold)         : {float(rho):.6f} (log return)")
+        print(
+            f"Rho (VaR Threshold)         : {(jnp.exp(rho) - 1) * 100:.4f}% (percentage return)"
+        )
+        print(f"{'=' * 60}\n")
+
+        # Determine plot bounds (use 1st and 99th percentile for better visualization)
+        all_returns = jnp.concatenate([log_returns_safe, log_returns_risky])
+        lower_bound = float(jnp.percentile(all_returns, 1))
+        upper_bound = float(jnp.percentile(all_returns, 99))
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+        # Left plot: Histograms with VaR lines
+        axes[0].hist(
+            log_returns_safe,
+            range=(lower_bound, upper_bound),
+            bins=100,
+            alpha=0.5,
+            label=f"{safe_asset} (Safe)",
+            density=True,
+            color="green",
+        )
+        axes[0].hist(
+            log_returns_risky,
+            range=(lower_bound, upper_bound),
+            bins=100,
+            alpha=0.5,
+            label=f"{risky_asset} (Risky)",
+            density=True,
+            color="red",
+        )
+        axes[0].axvline(
+            float(rho),
+            color="blue",
+            linestyle="--",
+            linewidth=2,
+            label=f"Rho (Threshold): {float(rho):.4f}",
+        )
+        axes[0].axvline(
+            float(var_safe),
+            color="green",
+            linestyle=":",
+            linewidth=2,
+            label=f"{safe_asset} VaR: {float(var_safe):.4f}",
+        )
+        axes[0].axvline(
+            float(var_risky),
+            color="red",
+            linestyle=":",
+            linewidth=2,
+            label=f"{risky_asset} VaR: {float(var_risky):.4f}",
+        )
+        axes[0].set_title(
+            f"Episode Cumulative Returns ({params.max_steps} steps)\n({self.num_trajectories:,} Trajectories, {epsilon * 100}% VaR)"
+        )
+        axes[0].set_xlabel("Cumulative Return")
+        axes[0].set_ylabel("Density")
+        axes[0].legend(loc="upper left")
+        axes[0].grid(True, alpha=0.3)
+
+        # Right plot: Left tail zoom (for VaR visualization)
+        tail_upper = float(jnp.percentile(all_returns, 10))  # Focus on left tail
+        axes[1].hist(
+            log_returns_safe,
+            range=(lower_bound, tail_upper),
+            bins=50,
+            alpha=0.5,
+            label=f"{safe_asset}",
+            density=True,
+            color="green",
+        )
+        axes[1].hist(
+            log_returns_risky,
+            range=(lower_bound, tail_upper),
+            bins=50,
+            alpha=0.5,
+            label=f"{risky_asset}",
+            density=True,
+            color="red",
+        )
+        axes[1].axvline(
+            float(rho),
+            color="blue",
+            linestyle="--",
+            linewidth=2,
+            label=f"Rho: {float(rho):.4f}",
+        )
+        axes[1].axvline(
+            float(var_safe),
+            color="green",
+            linestyle=":",
+            linewidth=2,
+            label=f"{safe_asset} VaR",
+        )
+        axes[1].axvline(
+            float(var_risky),
+            color="red",
+            linestyle=":",
+            linewidth=2,
+            label=f"{risky_asset} VaR",
+        )
+        axes[1].set_title(f"Left Tail (VaR Region)")
+        axes[1].set_xlabel("Cumulative Return")
+        axes[1].set_ylabel("Density")
+        axes[1].legend(loc="upper right")
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+        return float(rho), float(var_safe), float(var_risky)
 
 
 if __name__ == "__main__":
@@ -536,14 +756,14 @@ if __name__ == "__main__":
     garch_params = {
         "BTC": GARCHParams(
             mu=5e-4,
-            omega=0.0000004817,
+            omega=5e-5,
             alpha=jnp.array([0.165]),
             beta=jnp.array([0.8]),
             initial_price=1.0,
         ),
         "APPL": GARCHParams(
             mu=1e-4,
-            omega=0.0000001110,
+            omega=1e-5,
             alpha=jnp.array([0.15]),
             beta=jnp.array([0.8]),
             initial_price=1.0,
@@ -553,8 +773,8 @@ if __name__ == "__main__":
     env = PortfolioOptimizationGARCH(
         rng,
         garch_params,
-        num_trajectories=1,
-        num_samples=10_000,
+        num_trajectories=10_000,
+        num_samples=1000,
     )
 
     # Plot first trajectory
@@ -620,8 +840,8 @@ if __name__ == "__main__":
     appl_weights = trajectory["weights"][:, appl_idx]
 
     # Calculate cumulative return
-    cumulative_returns = jnp.cumsum(rewards)
-    total_return = float(cumulative_returns[-1])
+    cumulative_rewards = jnp.cumsum(rewards)
+    total_log_return = float(cumulative_rewards[-1])
     final_value = float(portfolio_values[-1])
     initial_value = float(portfolio_values[0])
 
@@ -631,7 +851,7 @@ if __name__ == "__main__":
     print(f"Steps completed: {max_steps}")
     print(f"Initial portfolio value: ${initial_value:.2f}")
     print(f"Final portfolio value: ${final_value:.2f}")
-    print(f"Total return (log): {total_return:.6f}")
+    print(f"Total return (log): {total_log_return:.6f}")
     print(f"Total return (percentage): {(final_value / initial_value - 1) * 100:.2f}%")
     print(f"Average reward per step: {float(jnp.mean(rewards)):.6f}")
     print(f"Reward std dev: {float(jnp.std(rewards)):.6f}")
@@ -645,15 +865,15 @@ if __name__ == "__main__":
 
     # Plot 1: Rewards over time
     axes[0].plot(rewards, alpha=0.7, linewidth=1)
-    axes[0].set_title(f"Rewards per Step (Log Returns) - {args.policy} policy")
+    axes[0].set_title(f"Rewards per Step - {args.policy} policy")
     axes[0].set_xlabel("Step")
     axes[0].set_ylabel("Reward")
     axes[0].axhline(y=0, color="k", linestyle="--", linewidth=0.5)
     axes[0].grid(True, alpha=0.3)
 
     # Plot 2: Cumulative returns
-    axes[1].plot(cumulative_returns, color="green", linewidth=2)
-    axes[1].set_title("Cumulative Returns")
+    axes[1].plot(cumulative_rewards, color="green", linewidth=2)
+    axes[1].set_title("Cumulative Log Returns")
     axes[1].set_xlabel("Step")
     axes[1].set_ylabel("Cumulative Log Return")
     axes[1].axhline(y=0, color="k", linestyle="--", linewidth=0.5)
@@ -683,3 +903,5 @@ if __name__ == "__main__":
 
     plt.tight_layout()
     plt.show()
+
+    env.calibrate_var_params(safe_asset="APPL", risky_asset="BTC", epsilon=0.05)
