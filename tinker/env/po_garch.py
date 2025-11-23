@@ -27,19 +27,19 @@ class BinanceFeeTier(Enum):
 @struct.dataclass
 class GARCHParams:
     omega: float  # Constant term in variance equation
-    alpha: chex.Array  # ARCH coefficients (length q)
-    beta: chex.Array  # GARCH coefficients (length p)
+    alpha: jax.Array  # ARCH coefficients (length q)
+    beta: jax.Array  # GARCH coefficients (length p)
     mu: float  # Mean return
     initial_price: float  # Starting price for the asset
 
 
 @struct.dataclass
 class VecGARCHParams:
-    omega: chex.Array  # Constant term in variance equation
-    alpha: chex.Array  # ARCH coefficients (length q)
-    beta: chex.Array  # GARCH coefficients (length p)
-    mu: chex.Array  # Mean return
-    initial_price: chex.Array  # Starting price for the asset
+    omega: jax.Array  # Constant term in variance equation
+    alpha: jax.Array  # ARCH coefficients (length q)
+    beta: jax.Array  # GARCH coefficients (length p)
+    mu: jax.Array  # Mean return
+    initial_price: jax.Array  # Starting price for the asset
 
 
 @struct.dataclass
@@ -47,11 +47,11 @@ class EnvState:
     step: int
     time: int
     trajectory_id: int  # Which trajectory this environment is using
-    prices: chex.Array  # Current prices for all assets
-    log_returns: chex.Array  # Current returns for all assets
-    volatilities: chex.Array  # Current volatilities for all assets
-    holdings: chex.Array  # Current holdings
-    values: chex.Array  # Current values
+    prices: jax.Array  # Current prices for all assets
+    log_returns: jax.Array  # Current returns for all assets
+    volatilities: jax.Array  # Current volatilities for all assets
+    holdings: jax.Array  # Current holdings
+    values: jax.Array  # Current values
     total_value: float
     episode_return: float  # Augmented state with running return target
 
@@ -267,7 +267,7 @@ class PortfolioOptimizationGARCH(Environment):
             low=-jnp.inf, high=jnp.inf, shape=obs_shape, dtype=jnp.float32
         )
 
-    def get_obs_easy(self, state: EnvState, params: EnvParams) -> chex.Array:
+    def get_obs_easy(self, state: EnvState, params: EnvParams) -> jax.Array:
         next_time = state.time + self.step_size
         # Index into the correct trajectory: (num_trajectories, num_samples, num_assets)
         # Use dynamic_slice for JIT compatibility
@@ -282,7 +282,7 @@ class PortfolioOptimizationGARCH(Environment):
         obs = jnp.concatenate([next_vol.flatten(), mu.flatten()])
         return obs
 
-    def get_obs(self, state: EnvState, params: EnvParams) -> chex.Array:
+    def get_obs(self, state: EnvState, params: EnvParams) -> jax.Array:
         """Get observation from current state."""
         # Extract recent returns and volatilities from pre-generated path
         start_time_idx = jnp.maximum(0, state.time - self.step_size + 1)
@@ -318,15 +318,15 @@ class PortfolioOptimizationGARCH(Environment):
         )
         return obs
 
-    def is_terminal(self, state: EnvState, params: EnvParams) -> chex.Array:
+    def is_terminal(self, state: EnvState, params: EnvParams) -> jax.Array:
         """Check if episode is done."""
         max_steps_reached = state.step >= params.max_steps
         portfolio_bankrupt = state.total_value <= 0
         return jnp.logical_or(max_steps_reached, portfolio_bankrupt)
 
     def step_env(
-        self, key: chex.PRNGKey, state: EnvState, action: chex.Array, params: EnvParams
-    ) -> tuple[chex.Array, EnvState, chex.Array, chex.Array, dict]:
+        self, key: chex.PRNGKey, state: EnvState, action: jax.Array, params: EnvParams
+    ) -> tuple[jax.Array, EnvState, jax.Array, jax.Array, dict]:
         """Execute one environment step with pre-generated GARCH prices."""
         time = state.time + self.step_size
 
@@ -418,7 +418,7 @@ class PortfolioOptimizationGARCH(Environment):
 
     def reset_env(
         self, key: chex.PRNGKey, params: EnvParams
-    ) -> Tuple[chex.Array, EnvState]:
+    ) -> Tuple[jax.Array, EnvState]:
         """
         Reset environment and sample from pre-generated GARCH paths.
 

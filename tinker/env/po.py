@@ -1,4 +1,3 @@
-from functools import partial
 from typing import Dict, Tuple
 from enum import Enum
 from gymnax.environments.environment import Environment, EnvParams, EnvState
@@ -11,6 +10,7 @@ from jax import numpy as jnp
 
 
 class BinanceFeeTier(Enum):
+    OFF = 0.0
     REGULAR = 0.001
     VIP_1 = 0.001
     VIP_2 = 0.001
@@ -37,9 +37,9 @@ class KLineFeatures(Enum):
 class EnvState:
     step: int
     time: int
-    prices: chex.Array
-    holdings: chex.Array
-    values: chex.Array
+    prices: jax.Array
+    holdings: jax.Array
+    values: jax.Array
     total_value: float
 
 
@@ -69,11 +69,11 @@ class PortfolioOptimizationV0(Environment):
     @property
     def default_params(self) -> EnvParams:
         return EnvParams(
-            max_steps=2160,
+            max_steps=1000,
             initial_cash=1000.0,
-            taker_fee=BinanceFeeTier.REGULAR.value,
+            taker_fee=BinanceFeeTier.OFF.value,
             gas_fee=0.0,
-            trade_threshold=1,
+            trade_threshold=0.0,
         )
 
     def action_space(self, params: EnvParams) -> spaces.Box:
@@ -90,7 +90,7 @@ class PortfolioOptimizationV0(Environment):
             low=-jnp.inf, high=jnp.inf, shape=obs_shape, dtype=jnp.float32
         )
 
-    def get_obs(self, state: EnvState, params: EnvParams) -> chex.Array:
+    def get_obs(self, state: EnvState, params: EnvParams) -> jax.Array:
         start_time_idx = jnp.maximum(0, state.time - self.step_size + 1)
         start_indices = (start_time_idx, 0, 0)
         slice_sizes = (self.step_size, self.data.shape[1], self.data.shape[2])
@@ -99,18 +99,18 @@ class PortfolioOptimizationV0(Environment):
 
     def reward(
         self, state: EnvState, next_state: EnvState, params: EnvParams
-    ) -> chex.Array:
+    ) -> jax.Array:
         log_return = jnp.log(next_state.total_value) - jnp.log(state.total_value)
         return log_return
 
-    def is_terminal(self, state: EnvState, params: EnvParams) -> chex.Array:
+    def is_terminal(self, state: EnvState, params: EnvParams) -> jax.Array:
         max_steps_reached = state.step >= params.max_steps
         portfolio_bankrupt = state.total_value <= 0
         return jnp.logical_or(max_steps_reached, portfolio_bankrupt)
 
     def step_env(
         self, key: chex.PRNGKey, state: EnvState, action: chex.Array, params: EnvParams
-    ) -> tuple[chex.Array, EnvState, chex.Array, chex.Array, dict]:
+    ) -> tuple[jax.Array, EnvState, jax.Array, jax.Array, dict]:
         time = state.time + self.step_size
         prices = jnp.concatenate(
             [jnp.array([1.0]), self.data[time, :, KLineFeatures.CLOSE.value]]
@@ -172,7 +172,7 @@ class PortfolioOptimizationV0(Environment):
 
     def reset_env(
         self, key: chex.PRNGKey, params: EnvParams
-    ) -> Tuple[chex.Array, EnvState]:
+    ) -> Tuple[jax.Array, EnvState]:
         episode_length = params.max_steps * self.step_size
         max_start = self.data.shape[0] - episode_length
         min_start = self.step_size
@@ -195,7 +195,7 @@ class PortfolioOptimizationV0(Environment):
         return obs, state
 
 
-def load_binance_klines(filepath: str) -> chex.Array:
+def load_binance_klines(filepath: str) -> jax.Array:
     df = pl.read_csv(filepath)
     data = df.select(
         (pl.col("close")),
