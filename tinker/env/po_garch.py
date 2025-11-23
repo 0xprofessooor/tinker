@@ -229,7 +229,7 @@ class PortfolioOptimizationGARCH(Environment):
     @property
     def default_params(self) -> EnvParams:
         return EnvParams(
-            max_steps=1000,
+            max_steps=self.num_samples // self.step_size,
             initial_cash=1000.0,
             taker_fee=BinanceFeeTier.OFF.value,
             gas_fee=0.0,
