@@ -510,17 +510,17 @@ if __name__ == "__main__":
 
     garch_params = {
         "BTC": GARCHParams(
-            mu=5e-4,
-            omega=5e-5,
+            mu=5e-3,
+            omega=1e-4,
             alpha=jnp.array([0.165]),
             beta=jnp.array([0.8]),
             initial_price=1.0,
         ),
         "APPL": GARCHParams(
-            mu=1e-4,
+            mu=3e-3,
             omega=1e-5,
             alpha=jnp.array([0.15]),
-            beta=jnp.array([0.8]),
+            beta=jnp.array([0.5]),
             initial_price=1.0,
         ),
     }

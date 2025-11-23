@@ -618,28 +618,26 @@ if __name__ == "__main__":
 
     garch_params = {
         "BTC": GARCHParams(
-            mu=5e-4,
-            omega=5e-5,
+            mu=5e-3,
+            omega=1e-4,
             alpha=jnp.array([0.165]),
             beta=jnp.array([0.8]),
             initial_price=1.0,
         ),
         "APPL": GARCHParams(
-            mu=1e-4,
+            mu=3e-3,
             omega=1e-5,
             alpha=jnp.array([0.15]),
-            beta=jnp.array([0.8]),
+            beta=jnp.array([0.5]),
             initial_price=1.0,
         ),
     }
     env = PortfolioOptimizationGARCH(
         garch_rng, garch_params, num_samples=1000, num_trajectories=10000
     )
-    env_params = env.default_params
-    env_params.max_steps = 1000
-    env_params.var_probability = 0.05
-    env_params.var_threshold = -1.0
-
+    env_params = env.default_params.replace(
+        max_steps=1000, var_probability=0.05, var_threshold=2.5
+    )
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
         project="Tinker",
