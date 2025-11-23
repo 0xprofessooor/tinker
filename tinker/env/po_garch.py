@@ -53,7 +53,7 @@ class EnvState:
     holdings: jax.Array  # Current holdings
     values: jax.Array  # Current values
     total_value: float
-    episode_return: float  # Augmented state with running return target
+    cost_return: float  # Augmented state with running cost return target
 
 
 @struct.dataclass
@@ -391,12 +391,12 @@ class PortfolioOptimizationGARCH(Environment):
         alpha = (1 / params.var_probability) - 1
         discount_term = params.discount_gamma**state.step
 
-        local_cost = (
-            2.0 * alpha * state.episode_return * reward
+        augmented_cost = (
+            2.0 * alpha * state.cost_return * reward
             + alpha * discount_term * (reward**2)
             + 2.0 * params.var_threshold * reward
         )
-        episode_return = state.episode_return + discount_term * reward
+        cost_return = state.cost_return + discount_term * reward
 
         next_state = EnvState(
             step=state.step + 1,
@@ -408,12 +408,12 @@ class PortfolioOptimizationGARCH(Environment):
             holdings=new_holdings,
             values=adj_new_values,
             total_value=new_total_value,
-            episode_return=episode_return,
+            cost_return=cost_return,
         )
 
         obs = self.get_obs_easy(next_state, params)
         done = self.is_terminal(next_state, params)
-        info = {"cost": local_cost}
+        info = {"cost": augmented_cost}
         return obs, next_state, reward, done, info
 
     def reset_env(
@@ -465,7 +465,7 @@ class PortfolioOptimizationGARCH(Environment):
             holdings=holdings,
             values=values,
             total_value=jnp.sum(values),
-            episode_return=0.0,
+            cost_return=0.0,
         )
         obs = self.get_obs_easy(state, params)
         return obs, state

@@ -41,6 +41,7 @@ class EnvState:
     holdings: jax.Array
     values: jax.Array
     total_value: float
+    cost_return: float  # Augmented state with running cost return target
 
 
 @struct.dataclass
@@ -50,6 +51,9 @@ class EnvParams:
     taker_fee: float
     gas_fee: float
     trade_threshold: float
+    var_threshold: float  # return threshold for VaR constraint
+    var_probability: float  # probability level for VaR constraint
+    discount_gamma: float  # Discount factor for returns
 
 
 class PortfolioOptimizationV0(Environment):
@@ -74,6 +78,9 @@ class PortfolioOptimizationV0(Environment):
             taker_fee=BinanceFeeTier.OFF.value,
             gas_fee=0.0,
             trade_threshold=0.0,
+            var_threshold=-0.0,
+            var_probability=1.0,
+            discount_gamma=1.0,
         )
 
     def action_space(self, params: EnvParams) -> spaces.Box:
@@ -96,12 +103,6 @@ class PortfolioOptimizationV0(Environment):
         slice_sizes = (self.step_size, self.data.shape[1], self.data.shape[2])
         step_data = jax.lax.dynamic_slice(self.data, start_indices, slice_sizes)
         return step_data.flatten()
-
-    def reward(
-        self, state: EnvState, next_state: EnvState, params: EnvParams
-    ) -> jax.Array:
-        log_return = jnp.log(next_state.total_value) - jnp.log(state.total_value)
-        return log_return
 
     def is_terminal(self, state: EnvState, params: EnvParams) -> jax.Array:
         max_steps_reached = state.step >= params.max_steps
@@ -156,6 +157,16 @@ class PortfolioOptimizationV0(Environment):
         adj_new_values = adj_new_values.at[0].add(delta_cash)
         new_holdings = adj_new_values / prices
 
+        reward = jnp.log(new_total_value) - jnp.log(state.total_value)
+        alpha = (1 / params.var_probability) - 1
+        discount_term = params.discount_gamma**state.step
+
+        augmented_cost = (
+            alpha * discount_term * (reward**2)
+            + 2.0 * (alpha * state.cost_return + params.var_threshold) * reward
+        )
+        cost_return = state.cost_return + discount_term * reward
+
         next_state = EnvState(
             step=state.step + 1,
             time=time,
@@ -163,11 +174,11 @@ class PortfolioOptimizationV0(Environment):
             holdings=new_holdings,
             values=adj_new_values,
             total_value=new_total_value,
+            cost_return=cost_return,
         )
         obs = self.get_obs(next_state, params)
-        reward = self.reward(state, next_state, params)
         done = self.is_terminal(next_state, params)
-        info = {}
+        info = {"cost": augmented_cost}
         return obs, next_state, reward, done, info
 
     def reset_env(
@@ -190,6 +201,7 @@ class PortfolioOptimizationV0(Environment):
             holdings=holdings,
             values=values,
             total_value=jnp.sum(values),
+            cost_return=0.0,
         )
         obs = self.get_obs(state, params)
         return obs, state
