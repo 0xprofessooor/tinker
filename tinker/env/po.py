@@ -78,7 +78,7 @@ class PortfolioOptimizationV0(Environment):
             taker_fee=BinanceFeeTier.OFF.value,
             gas_fee=0.0,
             trade_threshold=0.0,
-            var_threshold=-0.0,
+            var_threshold=0.0,
             var_probability=1.0,
             discount_gamma=1.0,
         )
