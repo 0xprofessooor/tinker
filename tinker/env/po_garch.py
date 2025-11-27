@@ -388,12 +388,12 @@ class PortfolioOptimizationGARCH(Environment):
         new_holdings = adj_new_values / prices
 
         reward = jnp.log(new_total_value) - jnp.log(state.total_value)
-        alpha = (1 / params.var_probability) - 1
+        beta = (1 / params.var_probability) - 1
         discount_term = params.discount_gamma**state.step
 
         augmented_cost = (
-            2.0 * alpha * state.cost_return * reward
-            + alpha * discount_term * (reward**2)
+            2.0 * beta * state.cost_return * reward
+            + beta * discount_term * (reward**2)
             + 2.0 * params.var_threshold * reward
         )
         cost_return = state.cost_return + discount_term * reward
