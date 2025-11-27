@@ -52,6 +52,11 @@ class ActorCritic(nnx.Module):
         self.cost_value_fc2 = nnx.Linear(256, 256, rngs=rngs)
         self.cost_value_out = nnx.Linear(256, 1, rngs=rngs)
 
+        # Augmented cost-value critic (for costs)
+        self.aug_cost_value_fc1 = nnx.Linear(obs_dim, 256, rngs=rngs)
+        self.aug_cost_value_fc2 = nnx.Linear(256, 256, rngs=rngs)
+        self.aug_cost_value_out = nnx.Linear(256, 1, rngs=rngs)
+
     def __call__(self, x):
         # Actor network
         actor_x = self.activation(self.actor_fc1(x))
@@ -69,20 +74,27 @@ class ActorCritic(nnx.Module):
         cost_value_x = self.activation(self.cost_value_fc2(cost_value_x))
         cost_value = jnp.squeeze(self.cost_value_out(cost_value_x), axis=-1)
 
-        return pi, value, cost_value
+        # Augmented cost-value critic
+        aug_cost_value_x = self.activation(self.aug_cost_value_fc1(x))
+        aug_cost_value_x = self.activation(self.aug_cost_value_fc2(aug_cost_value_x))
+        aug_cost_value = jnp.squeeze(self.aug_cost_value_out(aug_cost_value_x), axis=-1)
+
+        return pi, value, cost_value, aug_cost_value
 
 
 class Transition(NamedTuple):
     """Transition tuple including cost information."""
 
-    done: jnp.ndarray
-    action: jnp.ndarray
-    value: jnp.ndarray
-    cost_value: jnp.ndarray
-    reward: jnp.ndarray
-    cost: jnp.ndarray
-    log_prob: jnp.ndarray
-    obs: jnp.ndarray
+    done: jnp.Array
+    action: jnp.Array
+    value: jnp.Array
+    cost_value: jnp.Array
+    aug_cost_value: jnp.Array
+    reward: jnp.Array
+    cost: jnp.Array
+    aug_cost: jnp.Array
+    log_prob: jnp.Array
+    obs: jnp.Array
     info: dict
 
 
@@ -324,23 +336,34 @@ def make_train(
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, num_envs)
         obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
+        env_step = jnp.zeros((num_envs,), dtype=jnp.int32)
+        cost_return = jnp.zeros((num_envs,))
+
+        # pre-compute constant parameters
+        beta = (1 / var_probability) - 1
 
         # TRAIN LOOP
         def _update_step(
-            runner_state: Tuple[CPOState, EnvState, jnp.ndarray, chex.PRNGKey], _
+            runner_state: Tuple[
+                CPOState, EnvState, jnp.Array, jnp.Array, jnp.Array, chex.PRNGKey
+            ],
+            _,
         ):
             params = runner_state[0].model_state
             model: ActorCritic = nnx.merge(graphdef, params)
 
             # COLLECT TRAJECTORIES
             def _env_step(
-                runner_state: Tuple[CPOState, EnvState, jnp.ndarray, chex.PRNGKey], _
+                runner_state: Tuple[
+                    CPOState, EnvState, jnp.Array, jnp.Array, jnp.Array, chex.PRNGKey
+                ],
+                _,
             ):
-                cpo_state, env_state, obs, rng = runner_state
+                cpo_state, env_state, obs, env_step, cost_return, rng = runner_state
 
                 # SELECT ACTION (use optimizer.model to access the current model)
                 rng, action_rng = jax.random.split(rng)
-                pi, value, cost_value = model(obs)
+                pi, value, cost_value, aug_cost_value = model(obs)
                 action = pi.sample(seed=action_rng)
                 log_prob = pi.log_prob(action)
 
@@ -354,19 +377,40 @@ def make_train(
                 # Extract cost from info (environment-dependent)
                 # For environments without explicit costs, cost = 0
                 cost = info.get("cost", jnp.zeros_like(reward))
+                discount_term = cost_gamma**env_step
+                aug_cost = (
+                    beta * discount_term * (cost**2)
+                    + 2.0 * (beta * cost_return + var_threshold) * cost
+                )
+
+                cost_return = jax.lax.select(
+                    done,
+                    jnp.zeros_like(cost_return),
+                    cost_return + discount_term * cost,
+                )
+                env_step = jax.lax.select(done, jnp.zeros_like(env_step), env_step + 1)
 
                 transition = Transition(
                     done,
                     action,
                     value,
                     cost_value,
+                    aug_cost_value,
                     reward,
                     cost,
+                    aug_cost,
                     log_prob,
                     obs,
                     info,
                 )
-                runner_state = (cpo_state, next_env_state, next_obs, rng)
+                runner_state = (
+                    cpo_state,
+                    next_env_state,
+                    next_obs,
+                    env_step,
+                    cost_return,
+                    rng,
+                )
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
@@ -374,8 +418,8 @@ def make_train(
             )
 
             # CALCULATE ADVANTAGE AND COST ADVANTAGE
-            cpo_state, env_state, last_obs, rng = runner_state
-            _, last_val, last_cost_val = model(last_obs)
+            cpo_state, env_state, last_obs, env_step, cost_return, rng = runner_state
+            _, last_val, last_cost_val, last_aug_cost_val = model(last_obs)
 
             def _calculate_gae(
                 traj_batch: Transition,
@@ -414,19 +458,30 @@ def make_train(
                 gae_lambda,
             )
 
+            aug_cost_advantages, aug_cost_targets = _calculate_gae(
+                traj_batch._replace(
+                    reward=traj_batch.aug_cost, value=traj_batch.aug_cost_value
+                ),
+                last_aug_cost_val,
+                cost_gamma,
+                gae_lambda,
+            )
+
             # Normalize reward advantages
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
             # Center but do not rescale cost advantages
             cost_advantages = cost_advantages - cost_advantages.mean()
-
+            # Center but do not rescale augmented cost advantages
+            aug_cost_advantages = aug_cost_advantages - aug_cost_advantages.mean()
             # Compute constraint limit
-            discounts = jnp.power(gae_gamma, jnp.arange(train_freq))
-            traj_return = (traj_batch.reward * discounts[:, None]).sum(axis=0).mean()
-            d = (1 / var_probability) * (traj_return**2) + (var_threshold**2)
+            cost_discounts = jnp.power(cost_gamma, jnp.arange(train_freq))
+            traj_cost = (traj_batch.cost * cost_discounts[:, None]).sum(axis=0).mean()
+            aug_cost_limit = (1 / var_probability) * (traj_cost**2) + (var_threshold**2)
             # Compute constraint violation
-            discounts_cost = jnp.power(cost_gamma, jnp.arange(train_freq))
-            traj_cost = (traj_batch.cost * discounts_cost[:, None]).sum(axis=0).mean()
-            c_raw = traj_cost - d
+            traj_aug_cost = (
+                (traj_batch.aug_cost * cost_discounts[:, None]).sum(axis=0).mean()
+            )
+            c_raw = traj_aug_cost - aug_cost_limit
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
             c = c_raw + new_margin
             c = c / (train_freq + 1e-8)
@@ -439,7 +494,7 @@ def make_train(
             def policy_loss_fn(params):
                 """Compute surrogate policy loss."""
                 model: ActorCritic = nnx.merge(graphdef, params)
-                pi, _, _ = model(traj_batch.obs)
+                pi, _, _, _ = model(traj_batch.obs)
                 log_prob = pi.log_prob(traj_batch.action)
                 ratio = jnp.exp(log_prob - traj_batch.log_prob)
 
@@ -452,7 +507,7 @@ def make_train(
             def cost_loss_fn(params):
                 """Compute surrogate cost loss."""
                 model: ActorCritic = nnx.merge(graphdef, params)
-                pi, _, _ = model(traj_batch.obs)
+                pi, _, _, _ = model(traj_batch.obs)
                 log_prob = pi.log_prob(traj_batch.action)
                 ratio = jnp.exp(log_prob - traj_batch.log_prob)
 
@@ -460,25 +515,44 @@ def make_train(
 
                 return cost_loss
 
+            def aug_cost_loss_fn(params):
+                """Compute surrogate augmented cost loss."""
+                model: ActorCritic = nnx.merge(graphdef, params)
+                pi, _, _, _ = model(traj_batch.obs)
+                log_prob = pi.log_prob(traj_batch.action)
+                ratio = jnp.exp(log_prob - traj_batch.log_prob)
+
+                aug_cost_loss = (ratio * aug_cost_advantages).mean()
+
+                return aug_cost_loss
+
             def joint_loss_fn(params):
                 model: ActorCritic = nnx.merge(graphdef, params)
-                pi, _, _ = model(traj_batch.obs)
+                pi, _, _, _ = model(traj_batch.obs)
                 log_prob = pi.log_prob(traj_batch.action)
                 ratio = jnp.exp(log_prob - traj_batch.log_prob)
 
                 policy_loss = -(ratio * advantages).mean()
                 cost_loss = (ratio * cost_advantages).mean()
+                aug_cost_loss = (ratio * aug_cost_advantages).mean()
 
-                return policy_loss, cost_loss
+                return policy_loss, cost_loss, aug_cost_loss
 
             # Get gradients of policy and cost losses
             old_policy_loss, policy_grads = jax.value_and_grad(policy_loss_fn)(params)
             old_cost_loss, cost_grads = jax.value_and_grad(cost_loss_fn)(params)
+            old_aug_cost_loss, aug_cost_grads = jax.value_and_grad(aug_cost_loss_fn)(
+                params
+            )
 
             # Flatten gradients
             g, _ = jax.flatten_util.ravel_pytree(policy_grads)
             flat_cost_grads, _ = jax.flatten_util.ravel_pytree(cost_grads)
-            b = flat_cost_grads - (2 * traj_return / (var_probability + 1e-8)) * g
+            flat_aug_cost_grads, _ = jax.flatten_util.ravel_pytree(aug_cost_grads)
+            b = (
+                flat_aug_cost_grads
+                - (2 * traj_cost / (var_probability + 1e-8)) * flat_cost_grads
+            )
 
             def kl_fn(new_params_flat):
                 """Compute KL divergence between old and new policy."""
@@ -547,21 +621,22 @@ def make_train(
 
             # UPDATE VALUE CRITICS
             def critic_loss_fn(params):
-                """Compute critic loss (for both value and cost-value heads)."""
+                """Compute critic loss (for all heads)."""
                 model = nnx.merge(graphdef, params)
-                _, value, cost_value = model(traj_batch.obs)
+                _, value, cost_value, aug_cost_value = model(traj_batch.obs)
                 value_loss = ((value - return_targets) ** 2).mean()
                 cost_value_loss = ((cost_value - cost_targets) ** 2).mean()
-                total_loss = value_loss + cost_value_loss
-                return total_loss, (value_loss, cost_value_loss)
+                aug_cost_value_loss = ((aug_cost_value - aug_cost_targets) ** 2).mean()
+                total_loss = value_loss + cost_value_loss + aug_cost_value_loss
+                return total_loss, (value_loss, cost_value_loss, aug_cost_value_loss)
 
             def _update_critic(cpo_state: CPOState, _):
                 """Update value and cost critic parameters."""
                 params = cpo_state.model_state
 
-                (_, (value_loss, cost_value_loss)), grads = jax.value_and_grad(
-                    critic_loss_fn, has_aux=True
-                )(params)
+                (_, (value_loss, cost_value_loss, aug_cost_value_loss)), grads = (
+                    jax.value_and_grad(critic_loss_fn, has_aux=True)(params)
+                )
 
                 updates, new_opt_state = tx.update(grads, cpo_state.opt_state, params)
                 new_params = optax.apply_updates(params, updates)
@@ -569,10 +644,10 @@ def make_train(
                 cpo_state = cpo_state.replace(
                     model_state=new_params, opt_state=new_opt_state
                 )
-                return cpo_state, (value_loss, cost_value_loss)
+                return cpo_state, (value_loss, cost_value_loss, aug_cost_value_loss)
 
-            cpo_state, (value_losses, cost_value_losses) = jax.lax.scan(
-                _update_critic, cpo_state, None, critic_epochs
+            cpo_state, (value_losses, cost_value_losses, aug_cost_value_losses) = (
+                jax.lax.scan(_update_critic, cpo_state, None, critic_epochs)
             )
 
             metrics = {
@@ -581,24 +656,25 @@ def make_train(
                 "cost_loss": old_cost_loss,
                 "value_loss": value_losses.mean(),
                 "cost_value_loss": cost_value_losses.mean(),
+                "aug_cost_value_loss": aug_cost_value_losses.mean(),
                 "kl": final_kl,
                 "constraint_violation": c,
                 "margin": new_margin,
-                "traj_return": traj_return,
                 "traj_cost": traj_cost,
+                "traj_aug_cost": traj_aug_cost,
                 "optim_case": optim_case,
                 "returns": traj_batch.info["returned_episode_returns"].mean(),
                 "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
                 "accepted": accepted,
             }
 
-            runner_state = (cpo_state, env_state, last_obs, rng)
+            runner_state = (cpo_state, env_state, last_obs, env_step, cost_return, rng)
 
             return runner_state, metrics
 
         # RUN TRAINING LOOP
         rng, _rng = jax.random.split(rng)
-        runner_state = (cpo_state, env_state, obsv, _rng)
+        runner_state = (cpo_state, env_state, obsv, env_step, cost_return, _rng)
 
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, num_updates
