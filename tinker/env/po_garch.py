@@ -53,7 +53,6 @@ class EnvState:
     holdings: jax.Array  # Current holdings
     values: jax.Array  # Current values
     total_value: float
-    cost_return: float  # Augmented state with running cost return target
 
 
 @struct.dataclass
@@ -64,9 +63,6 @@ class EnvParams:
     gas_fee: float
     trade_threshold: float
     garch_params: Dict[str, GARCHParams]  # GARCH params for each asset
-    var_threshold: float  # return threshold for VaR constraint
-    var_probability: float  # probability level for VaR constraint
-    discount_gamma: float  # Discount factor for returns
 
 
 @jax.jit
@@ -235,9 +231,6 @@ class PortfolioOptimizationGARCH(Environment):
             gas_fee=0.0,
             trade_threshold=0.0,
             garch_params=self._garch_params,
-            var_threshold=-0.5,
-            var_probability=0.05,
-            discount_gamma=1.0,
         )
 
     def action_space(self, params: EnvParams) -> spaces.Box:
@@ -388,15 +381,6 @@ class PortfolioOptimizationGARCH(Environment):
         new_holdings = adj_new_values / prices
 
         reward = jnp.log(new_total_value) - jnp.log(state.total_value)
-        beta = (1 / params.var_probability) - 1
-        discount_term = params.discount_gamma**state.step
-
-        augmented_cost = (
-            2.0 * beta * state.cost_return * reward
-            + beta * discount_term * (reward**2)
-            + 2.0 * params.var_threshold * reward
-        )
-        cost_return = state.cost_return + discount_term * reward
 
         next_state = EnvState(
             step=state.step + 1,
@@ -408,12 +392,11 @@ class PortfolioOptimizationGARCH(Environment):
             holdings=new_holdings,
             values=adj_new_values,
             total_value=new_total_value,
-            cost_return=cost_return,
         )
 
         obs = self.get_obs_easy(next_state, params)
         done = self.is_terminal(next_state, params)
-        info = {"cost": augmented_cost}
+        info = {"cost": reward}
         return obs, next_state, reward, done, info
 
     def reset_env(
@@ -465,7 +448,6 @@ class PortfolioOptimizationGARCH(Environment):
             holdings=holdings,
             values=values,
             total_value=jnp.sum(values),
-            cost_return=0.0,
         )
         obs = self.get_obs_easy(state, params)
         return obs, state
