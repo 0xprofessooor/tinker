@@ -248,8 +248,9 @@ def make_train(
     activation: Callable = jax.nn.tanh,
     lr: float = 3e-4,
     anneal_lr: bool = False,
-    discount_gamma: float = 1.0,
+    gae_gamma: float = 1.0,
     gae_lambda: float = 0.95,
+    cost_gamma: float = 1.0,
     max_grad_norm: float = 0.5,
     target_kl: float = 0.01,
     entropy_coeff: float = 0.0,
@@ -270,8 +271,9 @@ def make_train(
     :param activation: Activation function for the network hidden layers.
     :param lr: Learning rate for the critic optimizer.
     :param anneal_lr: Whether to anneal the learning rate over time.
-    :param discount_gamma: Discount factor.
+    :param gae_gamma: Discount factor.
     :param gae_lambda: Lambda for the Generalized Advantage Estimation.
+    :param cost_gamma: Discount factor for cost returns.
     :param max_grad_norm: Maximum gradient norm for clipping.
     :param target_kl: Target KL divergence threshold.
     :param cost_limit: Constraint threshold for cumulative cost.
@@ -399,7 +401,7 @@ def make_train(
 
             # Reward advantages
             advantages, return_targets = _calculate_gae(
-                traj_batch, last_val, discount_gamma, gae_lambda
+                traj_batch, last_val, gae_gamma, gae_lambda
             )
 
             # Cost advantages
@@ -408,7 +410,7 @@ def make_train(
                     reward=traj_batch.cost, value=traj_batch.cost_value
                 ),
                 last_cost_val,
-                discount_gamma,
+                cost_gamma,
                 gae_lambda,
             )
 
@@ -418,11 +420,12 @@ def make_train(
             cost_advantages = cost_advantages - cost_advantages.mean()
 
             # Compute constraint limit
-            discounts = jnp.power(discount_gamma, jnp.arange(train_freq))
+            discounts = jnp.power(gae_gamma, jnp.arange(train_freq))
             traj_return = (traj_batch.reward * discounts[:, None]).sum(axis=0).mean()
             d = (1 / var_probability) * (traj_return**2) + (var_threshold**2)
             # Compute constraint violation
-            traj_cost = (traj_batch.cost * discounts[:, None]).sum(axis=0).mean()
+            discounts_cost = jnp.power(cost_gamma, jnp.arange(train_freq))
+            traj_cost = (traj_batch.cost * discounts_cost[:, None]).sum(axis=0).mean()
             c_raw = traj_cost - d
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
             c = c_raw + new_margin
