@@ -16,7 +16,7 @@ from gymnax.environments.environment import Environment, EnvParams, EnvState
 from gymnax.wrappers import LogWrapper
 import wandb
 
-from tinker.env.po_garch import (
+from safenax.po_garch import (
     PortfolioOptimizationGARCH,
     GARCHParams,
 )

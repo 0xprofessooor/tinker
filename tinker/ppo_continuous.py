@@ -17,7 +17,7 @@ from flax.training.train_state import TrainState
 from flax.training import checkpoints
 from gymnax.environments.environment import Environment, EnvParams
 from gymnax.wrappers import LogWrapper
-from tinker.env.po_garch import (
+from safenax.po_garch import (
     PortfolioOptimizationGARCH,
     GARCHParams,
 )
