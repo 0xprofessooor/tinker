@@ -649,9 +649,9 @@ if __name__ == "__main__":
                         f"{run_prefix}/batch_returns": float(
                             all_metrics["batch_returns"][run_idx][update_idx]
                         ),
-                        f"{run_prefix}/cost_returns": float(
-                            all_metrics["cost_returns"][run_idx][update_idx]
-                        ),
+                        f"{run_prefix}/cost_returns": all_metrics["cost_returns"][
+                            run_idx
+                        ][update_idx],
                         f"{run_prefix}/batch_cost_returns": float(
                             all_metrics["batch_cost_returns"][run_idx][update_idx]
                         ),
