@@ -277,7 +277,7 @@ def make_train(
 
             # Flatten batch: (train_freq, num_envs, obs_dim) -> (train_freq * num_envs, obs_dim)
             batch_obs = traj_batch.obs.reshape(-1, *traj_batch.obs.shape[2:])
-            obs_norm_state = norm.update(obs_norm_state, batch_obs)
+            obs_norm_state = norm.welford_update(obs_norm_state, batch_obs)
 
             # Normalize all observations in the trajectory batch
             # Shape: (train_freq, num_envs, obs_dim)
