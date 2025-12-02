@@ -13,13 +13,10 @@ import jax
 import jax.numpy as jnp
 import optax
 from gymnax.environments.environment import Environment, EnvParams, EnvState
-from gymnax.wrappers import LogWrapper
 import wandb
 
-from safenax.po_garch import (
-    PortfolioOptimizationGARCH,
-    GARCHParams,
-)
+from safenax.wrappers import LogWrapper, BraxToGymnaxWrapper
+from tinker import norm
 
 
 class ActorCritic(nnx.Module):
@@ -62,7 +59,7 @@ class ActorCritic(nnx.Module):
         actor_x = self.activation(self.actor_fc1(x))
         actor_x = self.activation(self.actor_fc2(actor_x))
         actor_mean = self.actor_mean(actor_x)
-        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(self.log_std.value))
+        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(self.log_std[...]))
 
         # Value critic
         value_x = self.activation(self.value_fc1(x))
@@ -85,16 +82,16 @@ class ActorCritic(nnx.Module):
 class Transition(NamedTuple):
     """Transition tuple including cost information."""
 
-    done: jnp.Array
-    action: jnp.Array
-    value: jnp.Array
-    cost_value: jnp.Array
-    aug_cost_value: jnp.Array
-    reward: jnp.Array
-    cost: jnp.Array
-    aug_cost: jnp.Array
-    log_prob: jnp.Array
-    obs: jnp.Array
+    done: jax.Array
+    action: jax.Array
+    value: jax.Array
+    cost_value: jax.Array
+    aug_cost_value: jax.Array
+    reward: jax.Array
+    cost: jax.Array
+    aug_cost: jax.Array
+    log_prob: jax.Array
+    obs: jax.Array
     info: dict
 
 
@@ -260,9 +257,9 @@ def make_train(
     activation: Callable = jax.nn.tanh,
     lr: float = 3e-4,
     anneal_lr: bool = False,
-    gae_gamma: float = 1.0,
+    gae_gamma: float = 0.99,
     gae_lambda: float = 0.95,
-    cost_gamma: float = 1.0,
+    cost_gamma: float = 0.999,
     max_grad_norm: float = 0.5,
     target_kl: float = 0.01,
     entropy_coeff: float = 0.0,
@@ -339,13 +336,16 @@ def make_train(
         env_step = jnp.zeros((num_envs,), dtype=jnp.int32)
         cost_return = jnp.zeros((num_envs,))
 
+        # INIT OBSERVATION NORMALIZATION
+        obs_norm_state = norm.init(env.observation_space(env_params).shape)
+
         # pre-compute constant parameters
         beta = (1 / var_probability) - 1
 
         # TRAIN LOOP
         def _update_step(
             runner_state: Tuple[
-                CPOState, EnvState, jnp.Array, jnp.Array, jnp.Array, chex.PRNGKey
+                CPOState, EnvState, jax.Array, jax.Array, jax.Array, chex.PRNGKey
             ],
             _,
         ):
@@ -355,15 +355,32 @@ def make_train(
             # COLLECT TRAJECTORIES
             def _env_step(
                 runner_state: Tuple[
-                    CPOState, EnvState, jnp.Array, jnp.Array, jnp.Array, chex.PRNGKey
+                    CPOState,
+                    EnvState,
+                    norm.RunningMeanStdState,
+                    jax.Array,
+                    jax.Array,
+                    jax.Array,
+                    chex.PRNGKey,
                 ],
                 _,
             ):
-                cpo_state, env_state, obs, env_step, cost_return, rng = runner_state
+                (
+                    cpo_state,
+                    env_state,
+                    obs_norm_state,
+                    obs,
+                    env_step,
+                    cost_return,
+                    rng,
+                ) = runner_state
 
                 # SELECT ACTION (use optimizer.model to access the current model)
                 rng, action_rng = jax.random.split(rng)
-                pi, value, cost_value, aug_cost_value = model(obs)
+                normalized_obs = jax.vmap(norm.normalize, in_axes=(None, 0))(
+                    obs_norm_state, obs
+                )
+                pi, value, cost_value, aug_cost_value = model(normalized_obs)
                 action = pi.sample(seed=action_rng)
                 log_prob = pi.log_prob(action)
 
@@ -406,6 +423,7 @@ def make_train(
                 runner_state = (
                     cpo_state,
                     next_env_state,
+                    obs_norm_state,
                     next_obs,
                     env_step,
                     cost_return,
@@ -417,9 +435,34 @@ def make_train(
                 _env_step, runner_state, None, train_freq
             )
 
+            # UPDATE OBSERVATION NORMALIZATION and normalize all collected observations
+            (
+                cpo_state,
+                env_state,
+                obs_norm_state,
+                last_obs,
+                env_step,
+                cost_return,
+                rng,
+            ) = runner_state
+            # Flatten batch: (train_freq, num_envs, obs_dim) -> (train_freq * num_envs, obs_dim)
+            batch_obs = traj_batch.obs.reshape(-1, *traj_batch.obs.shape[2:])
+            obs_norm_state = norm.welford_update(obs_norm_state, batch_obs)
+
+            # Normalize all observations in the trajectory batch
+            # Shape: (train_freq, num_envs, obs_dim)
+            normalized_traj_obs = jax.vmap(
+                jax.vmap(norm.normalize, in_axes=(None, 0)), in_axes=(None, 0)
+            )(obs_norm_state, traj_batch.obs)
+            normalized_last_obs = jax.vmap(norm.normalize, in_axes=(None, 0))(
+                obs_norm_state, last_obs
+            )
+
+            # Replace observations in traj_batch with normalized ones
+            traj_batch = traj_batch._replace(obs=normalized_traj_obs)
+
             # CALCULATE ADVANTAGE AND COST ADVANTAGE
-            cpo_state, env_state, last_obs, env_step, cost_return, rng = runner_state
-            _, last_val, last_cost_val, last_aug_cost_val = model(last_obs)
+            _, last_val, last_cost_val, last_aug_cost_val = model(normalized_last_obs)
 
             def _calculate_gae(
                 traj_batch: Transition,
@@ -488,7 +531,7 @@ def make_train(
 
             # UPDATE POLICY (CPO STEP)
             # Clone current model for reference in KL and line search
-            pi_old, _, _ = model(traj_batch.obs)
+            pi_old, _, _, _ = model(traj_batch.obs)
             flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
 
             def policy_loss_fn(params):
@@ -558,7 +601,7 @@ def make_train(
                 """Compute KL divergence between old and new policy."""
                 params_unflat = unravel_fn(new_params_flat)
                 model_new: ActorCritic = nnx.merge(graphdef, params_unflat)
-                pi_new, _, _ = model_new(traj_batch.obs)
+                pi_new, _, _, _ = model_new(traj_batch.obs)
                 return pi_new.kl_divergence(pi_old).mean()
 
             hvp_fn = lambda v: hvp(kl_fn, (flat_params,), (v,))
@@ -576,13 +619,13 @@ def make_train(
                 new_flat_params = flat_params - step_size * direction
                 new_params = unravel_fn(new_flat_params)
 
-                new_policy_loss, new_cost_loss = joint_loss_fn(new_params)
+                new_policy_loss, _, new_aug_cost_loss = joint_loss_fn(new_params)
                 kl = kl_fn(new_flat_params)
 
                 # Check acceptance criteria
                 loss_improve = (optim_case > 1) | (new_policy_loss <= old_policy_loss)
                 cost_improve = (
-                    (new_cost_loss - old_cost_loss <= jnp.maximum(-c, 0))
+                    (new_aug_cost_loss - old_aug_cost_loss <= jnp.maximum(-c, 0))
                     if use_constraint
                     else True
                 )
@@ -654,6 +697,7 @@ def make_train(
                 "num_updates": cpo_state.num_updates,
                 "policy_loss": old_policy_loss,
                 "cost_loss": old_cost_loss,
+                "aug_cost_loss": old_aug_cost_loss,
                 "value_loss": value_losses.mean(),
                 "cost_value_loss": cost_value_losses.mean(),
                 "aug_cost_value_loss": aug_cost_value_losses.mean(),
@@ -664,17 +708,34 @@ def make_train(
                 "traj_aug_cost": traj_aug_cost,
                 "optim_case": optim_case,
                 "returns": traj_batch.info["returned_episode_returns"].mean(),
+                "cost_returns": traj_batch.info["returned_episode_cost_returns"].mean(),
                 "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
                 "accepted": accepted,
             }
 
-            runner_state = (cpo_state, env_state, last_obs, env_step, cost_return, rng)
+            runner_state = (
+                cpo_state,
+                env_state,
+                obs_norm_state,
+                last_obs,
+                env_step,
+                cost_return,
+                rng,
+            )
 
             return runner_state, metrics
 
         # RUN TRAINING LOOP
         rng, _rng = jax.random.split(rng)
-        runner_state = (cpo_state, env_state, obsv, env_step, cost_return, _rng)
+        runner_state = (
+            cpo_state,
+            env_state,
+            obs_norm_state,
+            obsv,
+            env_step,
+            cost_return,
+            _rng,
+        )
 
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, num_updates
@@ -689,39 +750,46 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 1
     WANDB = "online"
+    ENV_NAME = "fragile_ant"
 
     rng = jax.random.PRNGKey(SEED)
-    rngs = jax.random.split(rng, NUM_SEEDS + 1)
-    garch_rng = rngs[0]
-    train_rngs = rngs[1:]
+    train_rngs = jax.random.split(rng, NUM_SEEDS)
 
-    garch_params = {
-        "BTC": GARCHParams(
-            mu=5e-3,
-            omega=1e-4,
-            alpha=jnp.array([0.165]),
-            beta=jnp.array([0.8]),
-            initial_price=1.0,
-        ),
-        "APPL": GARCHParams(
-            mu=3e-3,
-            omega=1e-5,
-            alpha=jnp.array([0.15]),
-            beta=jnp.array([0.5]),
-            initial_price=1.0,
-        ),
-    }
-    env = PortfolioOptimizationGARCH(
-        garch_rng, garch_params, num_samples=1000, num_trajectories=10000
-    )
-    env_params = env.default_params.replace(
-        max_steps=1000, var_probability=0.05, var_threshold=2.5
-    )
+    env = BraxToGymnaxWrapper(ENV_NAME)
+    env_params = None
+
+    # rng = jax.random.PRNGKey(SEED)
+    # rngs = jax.random.split(rng, NUM_SEEDS + 1)
+    # garch_rng = rngs[0]
+    # train_rngs = rngs[1:]
+    #
+    # garch_params = {
+    #    "BTC": GARCHParams(
+    #        mu=5e-3,
+    #        omega=1e-4,
+    #        alpha=jnp.array([0.165]),
+    #        beta=jnp.array([0.8]),
+    #        initial_price=1.0,
+    #    ),
+    #    "APPL": GARCHParams(
+    #        mu=3e-3,
+    #        omega=1e-5,
+    #        alpha=jnp.array([0.15]),
+    #        beta=jnp.array([0.5]),
+    #        initial_price=1.0,
+    #    ),
+    # }
+    # env = PortfolioOptimizationGARCH(
+    #    garch_rng, garch_params, num_samples=1000, num_trajectories=10000
+    # )
+    # env_params = env.default_params.replace(
+    #    max_steps=1000, var_probability=0.05, var_threshold=2.5
+    # )
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
         project="Tinker",
-        tags=["VAR-CPO", f"{env.name.upper()}", f"jax_{jax.__version__}"],
-        name=f"varcpo_{env.name}",
+        tags=["VAR-CPO", f"{ENV_NAME.upper()}", f"jax_{jax.__version__}"],
+        name=f"varcpo_{ENV_NAME}",
         mode=WANDB,
     )
 
@@ -733,10 +801,11 @@ if __name__ == "__main__":
         env_params,
         num_steps=int(1e6),
         num_envs=10,
-        train_freq=env_params.max_steps,
-        var_probability=env_params.var_probability,
-        var_threshold=env_params.var_threshold,
+        train_freq=1000,
+        var_probability=0.05,
+        var_threshold=800.0,
         margin_lr=0.0,
+        anneal_lr=True,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
@@ -756,6 +825,9 @@ if __name__ == "__main__":
                         f"{run_prefix}/returns": all_metrics["returns"][run_idx][
                             update_idx
                         ],
+                        f"{run_prefix}/cost_returns": all_metrics["cost_returns"][
+                            run_idx
+                        ][update_idx],
                         f"{run_prefix}/policy_loss": all_metrics["policy_loss"][
                             run_idx
                         ][update_idx],
