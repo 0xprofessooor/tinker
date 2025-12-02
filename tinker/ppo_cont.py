@@ -16,12 +16,11 @@ from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from flax.training import checkpoints
 from gymnax.environments.environment import Environment, EnvParams
-from gymnax.wrappers import LogWrapper
 from safenax.po_garch import (
     PortfolioOptimizationGARCH,
     GARCHParams,
 )
-from safenax.wrappers import BraxToGymnaxWrapper
+from safenax.wrappers import BraxToGymnaxWrapper, LogWrapper
 from tinker import norm
 
 import wandb
@@ -410,9 +409,13 @@ def make_train(
                 "critic_loss": loss_info[1][0].mean(),
                 "entropy": loss_info[1][2].mean(),
                 "batch_returns": traj_batch.info["returned_episode_returns"].mean(),
+                "batch_cost_returns": traj_batch.info[
+                    "returned_episode_cost_returns"
+                ].mean(),
                 "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
                 "dones": traj_batch.info["returned_episode"],
                 "returns": traj_batch.info["returned_episode_returns"],
+                "cost_returns": traj_batch.info["returned_episode_cost_returns"],
             }
 
             return runner_state, metrics
@@ -640,11 +643,17 @@ if __name__ == "__main__":
                         # f"{run_prefix}/dones": all_metrics["dones"][run_idx][
                         #    update_idx
                         # ],
-                        # f"{run_prefix}/returns": all_metrics["returns"][run_idx][
-                        #    update_idx
-                        # ],
+                        f"{run_prefix}/returns": all_metrics["returns"][run_idx][
+                            update_idx
+                        ],
                         f"{run_prefix}/batch_returns": float(
                             all_metrics["batch_returns"][run_idx][update_idx]
+                        ),
+                        f"{run_prefix}/cost_returns": float(
+                            all_metrics["cost_returns"][run_idx][update_idx]
+                        ),
+                        f"{run_prefix}/batch_cost_returns": float(
+                            all_metrics["batch_cost_returns"][run_idx][update_idx]
                         ),
                         f"{run_prefix}/actor_loss": float(
                             all_metrics["actor_loss"][run_idx][update_idx]
