@@ -21,6 +21,8 @@ from safenax.po_garch import (
     PortfolioOptimizationGARCH,
     GARCHParams,
 )
+from safenax.wrappers import BraxToGymnaxWrapper
+from tinker import norm
 
 import wandb
 
@@ -236,15 +238,21 @@ def make_train(
         reset_rng = jax.random.split(_rng, num_envs)
         obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
 
+        # INIT OBSERVATION NORMALIZATION
+        obs_norm_state = norm.init(env.observation_space(env_params).shape)
+
         # TRAIN LOOP
         def _update_step(runner_state, _):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, _):
-                train_state, env_state, last_obs, rng = runner_state
+                train_state, env_state, obs_norm_state, last_obs, rng = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
-                pi, value = network.apply(train_state.params, last_obs)
+                normalized_obs = jax.vmap(norm.normalize, in_axes=(None, 0))(
+                    obs_norm_state, last_obs
+                )
+                pi, value = network.apply(train_state.params, normalized_obs)
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
 
@@ -257,16 +265,34 @@ def make_train(
                 transition = Transition(
                     done, action, value, reward, log_prob, last_obs, info
                 )
-                runner_state = (train_state, env_state, obsv, rng)
+                runner_state = (train_state, env_state, obs_norm_state, obsv, rng)
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, train_freq
             )
 
+            # UPDATE OBSERVATION NORMALIZATION and normalize all collected observations
+            train_state, env_state, obs_norm_state, last_obs, rng = runner_state
+
+            # Flatten batch: (train_freq, num_envs, obs_dim) -> (train_freq * num_envs, obs_dim)
+            batch_obs = traj_batch.obs.reshape(-1, *traj_batch.obs.shape[2:])
+            obs_norm_state = norm.update(obs_norm_state, batch_obs)
+
+            # Normalize all observations in the trajectory batch
+            # Shape: (train_freq, num_envs, obs_dim)
+            normalized_traj_obs = jax.vmap(
+                jax.vmap(norm.normalize, in_axes=(None, 0)), in_axes=(None, 0)
+            )(obs_norm_state, traj_batch.obs)
+            normalized_last_obs = jax.vmap(norm.normalize, in_axes=(None, 0))(
+                obs_norm_state, last_obs
+            )
+
+            # Replace observations in traj_batch with normalized ones
+            traj_batch = traj_batch._replace(obs=normalized_traj_obs)
+
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, rng = runner_state
-            _, last_val = network.apply(train_state.params, last_obs)
+            _, last_val = network.apply(train_state.params, normalized_last_obs)
 
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -377,7 +403,7 @@ def make_train(
             train_state = update_state[0]
             rng = update_state[-1]
 
-            runner_state = (train_state, env_state, last_obs, rng)
+            runner_state = (train_state, env_state, obs_norm_state, last_obs, rng)
             metrics = {
                 "updates": train_state.step,
                 "actor_loss": loss_info[1][1].mean(),
@@ -392,7 +418,7 @@ def make_train(
             return runner_state, metrics
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, _rng)
+        runner_state = (train_state, env_state, obs_norm_state, obsv, _rng)
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, num_updates
         )
@@ -465,11 +491,11 @@ if __name__ == "__main__":
     pendulum_config = {
         "ENV_NAME": "Pendulum-v1",
         "LR": 3e-4,
-        "NUM_ENVS": 1,
+        "NUM_ENVS": 5,
         "TRAIN_FREQ": 2048,
         "TOTAL_TIMESTEPS": 1e6,
         "UPDATE_EPOCHS": 10,
-        "BATCH_SIZE": 64,
+        "BATCH_SIZE": 128,
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
@@ -479,10 +505,10 @@ if __name__ == "__main__":
         "ACTIVATION": "tanh",
         "ANNEAL_LR": False,
         "WANDB_MODE": "online",
-        "NUM_SEEDS": 5,
+        "NUM_SEEDS": 1,
         "SEED": 0,
     }
-    config = {
+    po_garch_config = {
         "ENV_NAME": "PO-GARCH",
         "LR": 3e-4,
         "NUM_ENVS": 10,
@@ -500,39 +526,64 @@ if __name__ == "__main__":
         "ANNEAL_LR": False,
         "WANDB_MODE": "online",
         "NUM_SEEDS": 1,
+        "SEED": 30,
+    }
+    config = {
+        "ENV_NAME": "fragile_ant",
+        "LR": 3e-4,
+        "NUM_ENVS": 10,
+        "TRAIN_FREQ": 1024,
+        "TOTAL_TIMESTEPS": 1e6,
+        "UPDATE_EPOCHS": 10,
+        "BATCH_SIZE": 256,
+        "GAMMA": 0.99,
+        "GAE_LAMBDA": 0.95,
+        "CLIP_EPS": 0.2,
+        "ENT_COEF": 0.0075,
+        "VF_COEF": 0.5,
+        "MAX_GRAD_NORM": 0.5,
+        "ACTIVATION": "tanh",
+        "ANNEAL_LR": True,
+        "WANDB_MODE": "online",
+        "NUM_SEEDS": 1,
         "SEED": 0,
     }
 
-    rng = jax.random.PRNGKey(config["SEED"])
-    rngs = jax.random.split(rng, config["NUM_SEEDS"] + 1)
-    garch_rng = rngs[0]
-    train_rngs = rngs[1:]
+    # rng = jax.random.PRNGKey(config["SEED"])
+    # rngs = jax.random.split(rng, config["NUM_SEEDS"] + 1)
+    # garch_rng = rngs[0]
+    # train_rngs = rngs[1:]
+    #
+    # garch_params = {
+    #    "BTC": GARCHParams(
+    #        mu=5e-3,
+    #        omega=1e-4,
+    #        alpha=jnp.array([0.165]),
+    #        beta=jnp.array([0.8]),
+    #        initial_price=1.0,
+    #    ),
+    #    "APPL": GARCHParams(
+    #        mu=3e-3,
+    #        omega=1e-5,
+    #        alpha=jnp.array([0.15]),
+    #        beta=jnp.array([0.5]),
+    #        initial_price=1.0,
+    #    ),
+    # }
+    # env = PortfolioOptimizationGARCH(
+    #    garch_rng,
+    #    garch_params,
+    #    num_samples=1000,
+    #    num_trajectories=config["NUM_ENVS"] * 1000,
+    # )
+    # env_params = env.default_params.replace(
+    #    max_steps=1000,
+    # )
 
-    garch_params = {
-        "BTC": GARCHParams(
-            mu=5e-3,
-            omega=1e-4,
-            alpha=jnp.array([0.165]),
-            beta=jnp.array([0.8]),
-            initial_price=1.0,
-        ),
-        "APPL": GARCHParams(
-            mu=3e-3,
-            omega=1e-5,
-            alpha=jnp.array([0.15]),
-            beta=jnp.array([0.5]),
-            initial_price=1.0,
-        ),
-    }
-    env = PortfolioOptimizationGARCH(
-        garch_rng,
-        garch_params,
-        num_samples=1000,
-        num_trajectories=config["NUM_ENVS"] * 1000,
-    )
-    env_params = env.default_params.replace(
-        max_steps=1000,
-    )
+    rng = jax.random.PRNGKey(config["SEED"])
+    train_rngs = jax.random.split(rng, config["NUM_SEEDS"])
+    env = BraxToGymnaxWrapper(config["ENV_NAME"])
+    env_params = None
 
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
@@ -586,12 +637,12 @@ if __name__ == "__main__":
                         f"{run_prefix}/updates": all_metrics["updates"][run_idx][
                             update_idx
                         ],
-                        f"{run_prefix}/dones": all_metrics["dones"][run_idx][
-                            update_idx
-                        ],
-                        f"{run_prefix}/returns": all_metrics["returns"][run_idx][
-                            update_idx
-                        ],
+                        # f"{run_prefix}/dones": all_metrics["dones"][run_idx][
+                        #    update_idx
+                        # ],
+                        # f"{run_prefix}/returns": all_metrics["returns"][run_idx][
+                        #    update_idx
+                        # ],
                         f"{run_prefix}/batch_returns": float(
                             all_metrics["batch_returns"][run_idx][update_idx]
                         ),
