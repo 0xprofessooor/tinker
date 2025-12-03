@@ -15,6 +15,7 @@ from gymnax.environments.environment import Environment, EnvParams, EnvState
 import wandb
 
 from safenax.wrappers import LogWrapper, BraxToGymnaxWrapper
+from safenax.po_garch import GARCHParams, PortfolioOptimizationGARCH
 from tinker import norm
 
 
@@ -565,13 +566,17 @@ def make_train(
                 return policy_loss, cost_loss, aug_cost_loss
 
             # Compute constraint limit
-            traj_cost = traj_batch.cost.sum(axis=0).mean()
-            is_mean_unsafe = traj_cost > var_threshold
-            aug_cost_limit = (1 / var_probability) * (traj_cost**2) + (var_threshold**2)
+            traj_cost = traj_batch.cost.sum(axis=0)
+            traj_cost_return = traj_cost.mean()
+            is_mean_unsafe = traj_cost_return > var_threshold
+            aug_cost_limit = (1 / var_probability) * (traj_cost_return**2) + (
+                var_threshold**2
+            )
             # Compute constraint violation
-            traj_aug_cost = traj_batch.aug_cost.sum(axis=0).mean()
-            c_cheb = traj_aug_cost - aug_cost_limit
-            c_linear = traj_cost - var_threshold
+            traj_aug_cost = traj_batch.aug_cost.sum(axis=0)
+            traj_aug_cost_return = traj_aug_cost.mean()
+            c_cheb = traj_aug_cost_return - aug_cost_limit
+            c_linear = traj_cost_return - var_threshold
             c_raw = jax.lax.select(is_mean_unsafe, c_linear, c_cheb)
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
             c = c_raw + new_margin
@@ -597,7 +602,7 @@ def make_train(
             flat_aug_cost_grads, _ = jax.flatten_util.ravel_pytree(aug_cost_grads)
             b_cheb = (
                 flat_aug_cost_grads
-                - (2 * traj_cost / (var_probability + 1e-8)) * flat_cost_grads
+                - (2 * traj_cost_return / (var_probability + 1e-8)) * flat_cost_grads
             )
             b = jax.lax.select(is_mean_unsafe, flat_cost_grads, b_cheb)
 
@@ -713,14 +718,19 @@ def make_train(
                 "kl": final_kl,
                 "constraint_violation": c,
                 "margin": new_margin,
-                "traj_cost": traj_cost,
-                "traj_aug_cost": traj_aug_cost,
+                "traj_cost_return": traj_cost_return,
+                "traj_cost_dist": traj_cost,
+                "traj_aug_cost_dist": traj_aug_cost,
+                "traj_aug_cost_return": traj_aug_cost_return,
                 "optim_case": optim_case,
-                "returns": traj_batch.info["returned_episode_returns"].mean(),
-                "cost_returns": traj_batch.info["returned_episode_cost_returns"].mean(),
+                "episode_returns": traj_batch.info["returned_episode_returns"].mean(),
+                "episode_cost_returns": traj_batch.info[
+                    "returned_episode_cost_returns"
+                ].mean(),
+                "episode_cost_dist": traj_batch.info["returned_episode_cost_returns"],
                 "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
-                "accepted": accepted,
-                "is_mean_unsafe": is_mean_unsafe,
+                "accepted": accepted.mean(),
+                "is_mean_unsafe": is_mean_unsafe.mean(),
             }
 
             runner_state = (
@@ -760,7 +770,7 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 1
     WANDB = "online"
-    ENV_NAME = "fragile_ant"
+    ENV_NAME = "po-garch"
 
     rng = jax.random.PRNGKey(SEED)
     train_rngs = jax.random.split(rng, NUM_SEEDS)
@@ -774,26 +784,26 @@ if __name__ == "__main__":
     # train_rngs = rngs[1:]
     #
     # garch_params = {
-    #    "BTC": GARCHParams(
-    #        mu=5e-3,
-    #        omega=1e-4,
-    #        alpha=jnp.array([0.165]),
-    #        beta=jnp.array([0.8]),
-    #        initial_price=1.0,
-    #    ),
-    #    "APPL": GARCHParams(
-    #        mu=3e-3,
-    #        omega=1e-5,
-    #        alpha=jnp.array([0.15]),
-    #        beta=jnp.array([0.5]),
-    #        initial_price=1.0,
-    #    ),
+    #   "BTC": GARCHParams(
+    #       mu=5e-3,
+    #       omega=1e-4,
+    #       alpha=jnp.array([0.165]),
+    #       beta=jnp.array([0.8]),
+    #       initial_price=1.0,
+    #   ),
+    #   "APPL": GARCHParams(
+    #       mu=3e-3,
+    #       omega=1e-5,
+    #       alpha=jnp.array([0.15]),
+    #       beta=jnp.array([0.5]),
+    #       initial_price=1.0,
+    #   ),
     # }
     # env = PortfolioOptimizationGARCH(
-    #    garch_rng, garch_params, num_samples=1000, num_trajectories=10000
+    #   garch_rng, garch_params, num_samples=1000, num_trajectories=10000
     # )
     # env_params = env.default_params.replace(
-    #    max_steps=1000, var_probability=0.05, var_threshold=2.5
+    #   max_steps=1000,
     # )
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
@@ -829,15 +839,15 @@ if __name__ == "__main__":
                 run_prefix = f"run_{run_idx}"
                 log_dict.update(
                     {
-                        f"{run_prefix}/num_updates": all_metrics["num_updates"][
+                        f"{run_prefix}/episode_returns": all_metrics["episode_returns"][
                             run_idx
                         ][update_idx],
-                        f"{run_prefix}/returns": all_metrics["returns"][run_idx][
-                            update_idx
-                        ],
-                        f"{run_prefix}/cost_returns": all_metrics["cost_returns"][
-                            run_idx
-                        ][update_idx],
+                        f"{run_prefix}/episode_cost_returns": all_metrics[
+                            "episode_cost_returns"
+                        ][run_idx][update_idx],
+                        f"{run_prefix}/episode_cost_dist": all_metrics[
+                            "episode_cost_dist"
+                        ][run_idx][update_idx],
                         f"{run_prefix}/policy_loss": all_metrics["policy_loss"][
                             run_idx
                         ][update_idx],
@@ -857,18 +867,36 @@ if __name__ == "__main__":
                         f"{run_prefix}/constraint_violation": all_metrics[
                             "constraint_violation"
                         ][run_idx][update_idx],
-                        f"{run_prefix}/traj_cost": all_metrics["traj_cost"][run_idx][
-                            update_idx
-                        ],
-                        f"{run_prefix}/margin": all_metrics["margin"][run_idx][
-                            update_idx
-                        ],
+                        f"{run_prefix}/traj_cost_std": all_metrics["traj_cost_dist"][
+                            run_idx
+                        ][update_idx].std(),
+                        f"{run_prefix}/traj_cost_min": all_metrics["traj_cost_dist"][
+                            run_idx
+                        ][update_idx].min(),
+                        f"{run_prefix}/traj_cost_max": all_metrics["traj_cost_dist"][
+                            run_idx
+                        ][update_idx].max(),
+                        f"{run_prefix}/traj_cost_return": all_metrics[
+                            "traj_cost_return"
+                        ][run_idx][update_idx],
                         f"{run_prefix}/is_mean_unsafe": all_metrics["is_mean_unsafe"][
                             run_idx
                         ][update_idx],
                         f"{run_prefix}/accepted": all_metrics["accepted"][run_idx][
                             update_idx
                         ],
+                        f"{run_prefix}/traj_aug_cost_min": all_metrics[
+                            "traj_aug_cost_dist"
+                        ][run_idx][update_idx].min(),
+                        f"{run_prefix}/traj_aug_cost_max": all_metrics[
+                            "traj_aug_cost_dist"
+                        ][run_idx][update_idx].max(),
+                        f"{run_prefix}/traj_aug_cost_std": all_metrics[
+                            "traj_aug_cost_dist"
+                        ][run_idx][update_idx].std(),
+                        f"{run_prefix}/traj_aug_cost_return": all_metrics[
+                            "traj_aug_cost_return"
+                        ][run_idx][update_idx],
                     }
                 )
 
