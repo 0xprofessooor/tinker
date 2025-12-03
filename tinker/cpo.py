@@ -503,7 +503,7 @@ def make_train(
                 kl = kl_fn(new_flat_params)
 
                 # Check acceptance criteria
-                loss_improve = (optim_case > 1) | (new_policy_loss <= old_policy_loss)
+                loss_improve = (optim_case <= 1) | (new_policy_loss <= old_policy_loss)
                 cost_improve = (
                     (new_cost_loss - old_cost_loss <= jnp.maximum(-c, 0))
                     if use_constraint

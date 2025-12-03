@@ -1,7 +1,6 @@
-"""Constrained Policy Optimization (CPO)
+"""Value-at-Risk Constrained Policy Optimization (CPO)
 
-Based on the paper: https://arxiv.org/abs/1705.10528
-Implements CPO for safe reinforcement learning with cost constraints.
+Implements a VaR constrained CPO for safe reinforcement learning with chance constraints.
 """
 
 import os
@@ -516,24 +515,8 @@ def make_train(
             cost_advantages = cost_advantages - cost_advantages.mean()
             # Center but do not rescale augmented cost advantages
             aug_cost_advantages = aug_cost_advantages - aug_cost_advantages.mean()
-            # Compute constraint limit
-            cost_discounts = jnp.power(cost_gamma, jnp.arange(train_freq))
-            traj_cost = (traj_batch.cost * cost_discounts[:, None]).sum(axis=0).mean()
-            aug_cost_limit = (1 / var_probability) * (traj_cost**2) + (var_threshold**2)
-            # Compute constraint violation
-            traj_aug_cost = (
-                (traj_batch.aug_cost * cost_discounts[:, None]).sum(axis=0).mean()
-            )
-            c_raw = traj_aug_cost - aug_cost_limit
-            new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
-            c = c_raw + new_margin
-            c = c / (train_freq + 1e-8)
 
             # UPDATE POLICY (CPO STEP)
-            # Clone current model for reference in KL and line search
-            pi_old, _, _, _ = model(traj_batch.obs)
-            flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
-
             def policy_loss_fn(params):
                 """Compute surrogate policy loss."""
                 model: ActorCritic = nnx.merge(graphdef, params)
@@ -581,21 +564,42 @@ def make_train(
 
                 return policy_loss, cost_loss, aug_cost_loss
 
+            # Compute constraint limit
+            traj_cost = traj_batch.cost.sum(axis=0).mean()
+            is_mean_unsafe = traj_cost > var_threshold
+            aug_cost_limit = (1 / var_probability) * (traj_cost**2) + (var_threshold**2)
+            # Compute constraint violation
+            traj_aug_cost = traj_batch.aug_cost.sum(axis=0).mean()
+            c_cheb = traj_aug_cost - aug_cost_limit
+            c_linear = traj_cost - var_threshold
+            c_raw = jax.lax.select(is_mean_unsafe, c_linear, c_cheb)
+            new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
+            c = c_raw + new_margin
+            c = c / (train_freq + 1e-8)
+
+            # Clone current model for reference in KL and line search
+            pi_old, _, _, _ = model(traj_batch.obs)
+            flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
+
             # Get gradients of policy and cost losses
             old_policy_loss, policy_grads = jax.value_and_grad(policy_loss_fn)(params)
             old_cost_loss, cost_grads = jax.value_and_grad(cost_loss_fn)(params)
             old_aug_cost_loss, aug_cost_grads = jax.value_and_grad(aug_cost_loss_fn)(
                 params
             )
+            old_constraint_loss = jax.lax.select(
+                is_mean_unsafe, old_cost_loss, old_aug_cost_loss
+            )
 
             # Flatten gradients
             g, _ = jax.flatten_util.ravel_pytree(policy_grads)
             flat_cost_grads, _ = jax.flatten_util.ravel_pytree(cost_grads)
             flat_aug_cost_grads, _ = jax.flatten_util.ravel_pytree(aug_cost_grads)
-            b = (
+            b_cheb = (
                 flat_aug_cost_grads
                 - (2 * traj_cost / (var_probability + 1e-8)) * flat_cost_grads
             )
+            b = jax.lax.select(is_mean_unsafe, flat_cost_grads, b_cheb)
 
             def kl_fn(new_params_flat):
                 """Compute KL divergence between old and new policy."""
@@ -619,13 +623,18 @@ def make_train(
                 new_flat_params = flat_params - step_size * direction
                 new_params = unravel_fn(new_flat_params)
 
-                new_policy_loss, _, new_aug_cost_loss = joint_loss_fn(new_params)
+                new_policy_loss, new_cost_loss, new_aug_cost_loss = joint_loss_fn(
+                    new_params
+                )
                 kl = kl_fn(new_flat_params)
 
                 # Check acceptance criteria
-                loss_improve = (optim_case > 1) | (new_policy_loss <= old_policy_loss)
+                loss_improve = (optim_case <= 1) | (new_policy_loss <= old_policy_loss)
+                new_constraint_loss = jax.lax.select(
+                    is_mean_unsafe, new_cost_loss, new_aug_cost_loss
+                )
                 cost_improve = (
-                    (new_aug_cost_loss - old_aug_cost_loss <= jnp.maximum(-c, 0))
+                    (new_constraint_loss - old_constraint_loss <= jnp.maximum(-c, 0))
                     if use_constraint
                     else True
                 )
@@ -711,6 +720,7 @@ def make_train(
                 "cost_returns": traj_batch.info["returned_episode_cost_returns"].mean(),
                 "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
                 "accepted": accepted,
+                "is_mean_unsafe": is_mean_unsafe,
             }
 
             runner_state = (
@@ -803,7 +813,7 @@ if __name__ == "__main__":
         num_envs=10,
         train_freq=1000,
         var_probability=0.05,
-        var_threshold=800.0,
+        var_threshold=400.0,
         margin_lr=0.0,
         anneal_lr=True,
     )
@@ -851,6 +861,12 @@ if __name__ == "__main__":
                             update_idx
                         ],
                         f"{run_prefix}/margin": all_metrics["margin"][run_idx][
+                            update_idx
+                        ],
+                        f"{run_prefix}/is_mean_unsafe": all_metrics["is_mean_unsafe"][
+                            run_idx
+                        ][update_idx],
+                        f"{run_prefix}/accepted": all_metrics["accepted"][run_idx][
                             update_idx
                         ],
                     }
