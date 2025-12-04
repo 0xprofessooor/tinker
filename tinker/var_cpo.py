@@ -566,15 +566,18 @@ def make_train(
                 return policy_loss, cost_loss, aug_cost_loss
 
             # Compute constraint limit
-            traj_cost = traj_batch.cost.sum(axis=0)
-            traj_cost_return = traj_cost.mean()
+            avg_episode_len = traj_batch.info["returned_episode_lengths"].mean()
+            num_episodes_est = train_freq / (avg_episode_len + 1e-8)
+            cost_discounts = jnp.power(cost_gamma, jnp.arange(train_freq))
+            traj_cost = (traj_batch.cost * cost_discounts[:, None]).sum(axis=0)
+            traj_cost_return = traj_cost.mean() / (num_episodes_est + 1e-8)
             is_mean_unsafe = traj_cost_return > var_threshold
             aug_cost_limit = (1 / var_probability) * (traj_cost_return**2) + (
                 var_threshold**2
             )
             # Compute constraint violation
-            traj_aug_cost = traj_batch.aug_cost.sum(axis=0)
-            traj_aug_cost_return = traj_aug_cost.mean()
+            traj_aug_cost = (traj_batch.aug_cost * cost_discounts[:, None]).sum(axis=0)
+            traj_aug_cost_return = traj_aug_cost.mean() / (num_episodes_est + 1e-8)
             c_cheb = traj_aug_cost_return - aug_cost_limit
             c_linear = traj_cost_return - var_threshold
             c_raw = jax.lax.select(is_mean_unsafe, c_linear, c_cheb)
@@ -728,7 +731,7 @@ def make_train(
                     "returned_episode_cost_returns"
                 ].mean(),
                 "episode_cost_dist": traj_batch.info["returned_episode_cost_returns"],
-                "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
+                "episode_lengths": avg_episode_len,
                 "accepted": accepted.mean(),
                 "is_mean_unsafe": is_mean_unsafe.mean(),
             }
@@ -770,7 +773,7 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 1
     WANDB = "online"
-    ENV_NAME = "po-garch"
+    ENV_NAME = "fragile_ant"
 
     rng = jax.random.PRNGKey(SEED)
     train_rngs = jax.random.split(rng, NUM_SEEDS)
