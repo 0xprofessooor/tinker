@@ -33,50 +33,39 @@ class ActorCritic(nnx.Module):
         self.action_dim = action_dim
         self.activation = activation
 
+        # Shared encoder
+        self.encoder = nnx.Sequential(
+            nnx.Linear(obs_dim, 256, rngs=rngs),
+            activation,
+            nnx.Linear(256, 256, rngs=rngs),
+            activation,
+        )
+
         # Actor network
-        self.actor_fc1 = nnx.Linear(obs_dim, 256, rngs=rngs)
-        self.actor_fc2 = nnx.Linear(256, 256, rngs=rngs)
         self.actor_mean = nnx.Linear(256, action_dim, rngs=rngs)
         self.log_std = nnx.Param(jnp.zeros(action_dim))
 
         # Value critic (for rewards)
-        self.value_fc1 = nnx.Linear(obs_dim, 256, rngs=rngs)
-        self.value_fc2 = nnx.Linear(256, 256, rngs=rngs)
-        self.value_out = nnx.Linear(256, 1, rngs=rngs)
-
+        self.value_head = nnx.Linear(256, 1, rngs=rngs)
         # Cost-value critic (for costs)
-        self.cost_value_fc1 = nnx.Linear(obs_dim, 256, rngs=rngs)
-        self.cost_value_fc2 = nnx.Linear(256, 256, rngs=rngs)
-        self.cost_value_out = nnx.Linear(256, 1, rngs=rngs)
-
-        # Augmented cost-value critic (for costs)
-        self.aug_cost_value_fc1 = nnx.Linear(obs_dim, 256, rngs=rngs)
-        self.aug_cost_value_fc2 = nnx.Linear(256, 256, rngs=rngs)
-        self.aug_cost_value_out = nnx.Linear(256, 1, rngs=rngs)
+        self.cost_value_head = nnx.Linear(256, 1, rngs=rngs)
+        # Auxiliary cost-value critic (for costs)
+        self.aux_value_head = nnx.Linear(256, 1, rngs=rngs)
 
     def __call__(self, x):
+        # Forward pass shared features once
+        features = self.encoder(x)
+
         # Actor network
-        actor_x = self.activation(self.actor_fc1(x))
-        actor_x = self.activation(self.actor_fc2(actor_x))
-        actor_mean = self.actor_mean(actor_x)
+        actor_mean = self.actor_mean(features)
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(self.log_std[...]))
 
-        # Value critic
-        value_x = self.activation(self.value_fc1(x))
-        value_x = self.activation(self.value_fc2(value_x))
-        value = jnp.squeeze(self.value_out(value_x), axis=-1)
+        # Critics
+        value = jnp.squeeze(self.value_head(features), axis=-1)
+        cost_value = jnp.squeeze(self.cost_value_head(features), axis=-1)
+        aux_value = jnp.squeeze(self.aux_value_head(features), axis=-1)
 
-        # Cost-value critic
-        cost_value_x = self.activation(self.cost_value_fc1(x))
-        cost_value_x = self.activation(self.cost_value_fc2(cost_value_x))
-        cost_value = jnp.squeeze(self.cost_value_out(cost_value_x), axis=-1)
-
-        # Augmented cost-value critic
-        aug_cost_value_x = self.activation(self.aug_cost_value_fc1(x))
-        aug_cost_value_x = self.activation(self.aug_cost_value_fc2(aug_cost_value_x))
-        aug_cost_value = jnp.squeeze(self.aug_cost_value_out(aug_cost_value_x), axis=-1)
-
-        return pi, value, cost_value, aug_cost_value
+        return pi, value, cost_value, aux_value
 
 
 class Transition(NamedTuple):
@@ -86,10 +75,13 @@ class Transition(NamedTuple):
     action: jax.Array
     value: jax.Array
     cost_value: jax.Array
-    aug_cost_value: jax.Array
+    aux_value: jax.Array
     reward: jax.Array
     cost: jax.Array
     aug_cost: jax.Array
+    running_cost: jax.Array
+    running_aug_cost: jax.Array
+    cost_discount: jax.Array
     log_prob: jax.Array
     obs: jax.Array
     info: dict
@@ -333,19 +325,27 @@ def make_train(
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, num_envs)
         obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
-        env_step = jnp.zeros((num_envs,), dtype=jnp.int32)
-        cost_return = jnp.zeros((num_envs,))
+        running_cost = jnp.zeros((num_envs,))
+        running_aug_cost = jnp.zeros((num_envs,))
+        cost_discount = jnp.ones((num_envs,))
 
         # INIT OBSERVATION NORMALIZATION
         obs_norm_state = norm.init(env.observation_space(env_params).shape)
 
         # pre-compute constant parameters
-        beta = (1 / var_probability) - 1
+        beta = jnp.minimum((1 / (var_probability + 1e-6)) - 1, 1e4)
 
         # TRAIN LOOP
         def _update_step(
             runner_state: Tuple[
-                CPOState, EnvState, jax.Array, jax.Array, jax.Array, chex.PRNGKey
+                CPOState,
+                EnvState,
+                norm.RunningMeanStdState,
+                jax.Array,
+                jax.Array,
+                jax.Array,
+                jax.Array,
+                chex.PRNGKey,
             ],
             _,
         ):
@@ -361,6 +361,7 @@ def make_train(
                     jax.Array,
                     jax.Array,
                     jax.Array,
+                    jax.Array,
                     chex.PRNGKey,
                 ],
                 _,
@@ -370,8 +371,9 @@ def make_train(
                     env_state,
                     obs_norm_state,
                     obs,
-                    env_step,
-                    cost_return,
+                    running_cost,
+                    running_aug_cost,
+                    cost_discount,
                     rng,
                 ) = runner_state
 
@@ -380,7 +382,7 @@ def make_train(
                 normalized_obs = jax.vmap(norm.normalize, in_axes=(None, 0))(
                     obs_norm_state, obs
                 )
-                pi, value, cost_value, aug_cost_value = model(normalized_obs)
+                pi, value, cost_value, aux_value = model(normalized_obs)
                 action = pi.sample(seed=action_rng)
                 log_prob = pi.log_prob(action)
 
@@ -394,39 +396,52 @@ def make_train(
                 # Extract cost from info (environment-dependent)
                 # For environments without explicit costs, cost = 0
                 cost = info.get("cost", jnp.zeros_like(reward))
-                discount_term = cost_gamma**env_step
                 aug_cost = (
-                    beta * discount_term * (cost**2)
-                    + 2.0 * (beta * cost_return + var_threshold) * cost
+                    beta * cost_discount * (cost**2)
+                    + 2.0 * (beta * running_cost + var_threshold) * cost
                 )
-
-                cost_return = jax.lax.select(
-                    done,
-                    jnp.zeros_like(cost_return),
-                    cost_return + discount_term * cost,
-                )
-                env_step = jax.lax.select(done, jnp.zeros_like(env_step), env_step + 1)
 
                 transition = Transition(
                     done,
                     action,
                     value,
                     cost_value,
-                    aug_cost_value,
+                    aux_value,
                     reward,
                     cost,
                     aug_cost,
+                    running_cost,
+                    running_aug_cost,
+                    cost_discount,
                     log_prob,
                     obs,
                     info,
                 )
+
+                next_running_cost = jax.lax.select(
+                    done,
+                    jnp.zeros_like(running_cost),
+                    running_cost + cost_discount * cost,
+                )
+                next_running_aug_cost = jax.lax.select(
+                    done,
+                    jnp.zeros_like(running_aug_cost),
+                    running_aug_cost + cost_discount * aug_cost,
+                )
+                next_cost_discount = jax.lax.select(
+                    done,
+                    jnp.ones_like(cost_discount),
+                    cost_discount * cost_gamma,
+                )
+
                 runner_state = (
                     cpo_state,
                     next_env_state,
                     obs_norm_state,
                     next_obs,
-                    env_step,
-                    cost_return,
+                    next_running_cost,
+                    next_running_aug_cost,
+                    next_cost_discount,
                     rng,
                 )
                 return runner_state, transition
@@ -441,8 +456,9 @@ def make_train(
                 env_state,
                 obs_norm_state,
                 last_obs,
-                env_step,
-                cost_return,
+                running_cost,
+                running_aug_cost,
+                cost_discount,
                 rng,
             ) = runner_state
             # Flatten batch: (train_freq, num_envs, obs_dim) -> (train_freq * num_envs, obs_dim)
@@ -462,7 +478,7 @@ def make_train(
             traj_batch = traj_batch._replace(obs=normalized_traj_obs)
 
             # CALCULATE ADVANTAGE AND COST ADVANTAGE
-            _, last_val, last_cost_val, last_aug_cost_val = model(normalized_last_obs)
+            _, last_val, last_cost_val, last_aux_val = model(normalized_last_obs)
 
             def _calculate_gae(
                 traj_batch: Transition,
@@ -501,13 +517,29 @@ def make_train(
                 gae_lambda,
             )
 
-            aug_cost_advantages, aug_cost_targets = _calculate_gae(
-                traj_batch._replace(
-                    reward=traj_batch.aug_cost, value=traj_batch.aug_cost_value
-                ),
-                last_aug_cost_val,
-                cost_gamma,
+            # Augmented cost advantages
+            next_cost_values = jnp.concatenate(
+                [traj_batch.cost_value[1:], last_cost_val[None, ...]], axis=0
+            )
+            aux_reward = (beta * traj_batch.cost) * (
+                traj_batch.cost
+                + 2.0 * (cost_gamma * next_cost_values * (1 - traj_batch.done))
+            )
+            aux_advantages, aux_targets = _calculate_gae(
+                traj_batch._replace(reward=aux_reward, value=traj_batch.aux_value),
+                last_aux_val,
+                cost_gamma**2,
                 gae_lambda,
+            )
+            aug_cost_advantages = (
+                traj_batch.cost_discount * aux_advantages
+                + 2.0
+                * (beta * traj_batch.running_cost + var_threshold)
+                * cost_advantages
+            )
+            aug_cost_targets = (
+                traj_batch.cost_discount * aux_targets
+                + 2.0 * (beta * traj_batch.running_cost + var_threshold) * cost_targets
             )
 
             # Normalize reward advantages
@@ -571,15 +603,17 @@ def make_train(
             cost_discounts = jnp.power(cost_gamma, jnp.arange(train_freq))
             traj_cost = (traj_batch.cost * cost_discounts[:, None]).sum(axis=0)
             traj_cost_return = traj_cost.mean() / (num_episodes_est + 1e-8)
-            is_mean_unsafe = traj_cost_return > var_threshold
-            aug_cost_limit = (1 / var_probability) * (traj_cost_return**2) + (
+            td_cost_return = (traj_batch.running_cost + cost_targets).mean()
+            is_mean_unsafe = td_cost_return > var_threshold
+            aug_cost_limit = (1 / var_probability) * (td_cost_return**2) + (
                 var_threshold**2
             )
             # Compute constraint violation
             traj_aug_cost = (traj_batch.aug_cost * cost_discounts[:, None]).sum(axis=0)
             traj_aug_cost_return = traj_aug_cost.mean() / (num_episodes_est + 1e-8)
-            c_cheb = traj_aug_cost_return - aug_cost_limit
-            c_linear = traj_cost_return - var_threshold
+            td_aug_cost_return = (traj_batch.running_aug_cost + aug_cost_targets).mean()
+            c_cheb = td_aug_cost_return - aug_cost_limit
+            c_linear = td_cost_return - var_threshold
             c_raw = jax.lax.select(is_mean_unsafe, c_linear, c_cheb)
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
             c = c_raw + new_margin
@@ -605,7 +639,7 @@ def make_train(
             flat_aug_cost_grads, _ = jax.flatten_util.ravel_pytree(aug_cost_grads)
             b_cheb = (
                 flat_aug_cost_grads
-                - (2 * traj_cost_return / (var_probability + 1e-8)) * flat_cost_grads
+                - (2 * td_cost_return / (var_probability + 1e-8)) * flat_cost_grads
             )
             b = jax.lax.select(is_mean_unsafe, flat_cost_grads, b_cheb)
 
@@ -683,18 +717,18 @@ def make_train(
             def critic_loss_fn(params):
                 """Compute critic loss (for all heads)."""
                 model = nnx.merge(graphdef, params)
-                _, value, cost_value, aug_cost_value = model(traj_batch.obs)
+                _, value, cost_value, aux_value = model(traj_batch.obs)
                 value_loss = ((value - return_targets) ** 2).mean()
                 cost_value_loss = ((cost_value - cost_targets) ** 2).mean()
-                aug_cost_value_loss = ((aug_cost_value - aug_cost_targets) ** 2).mean()
-                total_loss = value_loss + cost_value_loss + aug_cost_value_loss
-                return total_loss, (value_loss, cost_value_loss, aug_cost_value_loss)
+                aux_value_loss = ((aux_value - aux_targets) ** 2).mean()
+                total_loss = value_loss + cost_value_loss + aux_value_loss
+                return total_loss, (value_loss, cost_value_loss, aux_value_loss)
 
             def _update_critic(cpo_state: CPOState, _):
                 """Update value and cost critic parameters."""
                 params = cpo_state.model_state
 
-                (_, (value_loss, cost_value_loss, aug_cost_value_loss)), grads = (
+                (_, (value_loss, cost_value_loss, aux_value_loss)), grads = (
                     jax.value_and_grad(critic_loss_fn, has_aux=True)(params)
                 )
 
@@ -704,9 +738,9 @@ def make_train(
                 cpo_state = cpo_state.replace(
                     model_state=new_params, opt_state=new_opt_state
                 )
-                return cpo_state, (value_loss, cost_value_loss, aug_cost_value_loss)
+                return cpo_state, (value_loss, cost_value_loss, aux_value_loss)
 
-            cpo_state, (value_losses, cost_value_losses, aug_cost_value_losses) = (
+            cpo_state, (value_losses, cost_value_losses, aux_value_losses) = (
                 jax.lax.scan(_update_critic, cpo_state, None, critic_epochs)
             )
 
@@ -717,13 +751,13 @@ def make_train(
                 "aug_cost_loss": old_aug_cost_loss,
                 "value_loss": value_losses.mean(),
                 "cost_value_loss": cost_value_losses.mean(),
-                "aug_cost_value_loss": aug_cost_value_losses.mean(),
+                "aux_value_loss": aux_value_losses.mean(),
                 "kl": final_kl,
                 "constraint_violation": c,
                 "margin": new_margin,
+                "td_cost_return": td_cost_return,
+                "td_aug_cost_return": td_aug_cost_return,
                 "traj_cost_return": traj_cost_return,
-                "traj_cost_dist": traj_cost,
-                "traj_aug_cost_dist": traj_aug_cost,
                 "traj_aug_cost_return": traj_aug_cost_return,
                 "optim_case": optim_case,
                 "episode_returns": traj_batch.info["returned_episode_returns"].mean(),
@@ -731,7 +765,7 @@ def make_train(
                     "returned_episode_cost_returns"
                 ].mean(),
                 "episode_cost_dist": traj_batch.info["returned_episode_cost_returns"],
-                "episode_lengths": avg_episode_len,
+                "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
                 "accepted": accepted.mean(),
                 "is_mean_unsafe": is_mean_unsafe.mean(),
             }
@@ -741,8 +775,9 @@ def make_train(
                 env_state,
                 obs_norm_state,
                 last_obs,
-                env_step,
-                cost_return,
+                running_cost,
+                running_aug_cost,
+                cost_discount,
                 rng,
             )
 
@@ -755,8 +790,9 @@ def make_train(
             env_state,
             obs_norm_state,
             obsv,
-            env_step,
-            cost_return,
+            running_cost,
+            running_aug_cost,
+            cost_discount,
             _rng,
         )
 
@@ -825,8 +861,8 @@ if __name__ == "__main__":
         num_steps=int(1e6),
         num_envs=10,
         train_freq=1000,
-        var_probability=0.05,
-        var_threshold=400.0,
+        var_probability=0.1,
+        var_threshold=500.0,
         margin_lr=0.0,
         anneal_lr=True,
     )
@@ -870,33 +906,21 @@ if __name__ == "__main__":
                         f"{run_prefix}/constraint_violation": all_metrics[
                             "constraint_violation"
                         ][run_idx][update_idx],
-                        f"{run_prefix}/traj_cost_std": all_metrics["traj_cost_dist"][
+                        f"{run_prefix}/td_cost_return": all_metrics["td_cost_return"][
                             run_idx
-                        ][update_idx].std(),
-                        f"{run_prefix}/traj_cost_min": all_metrics["traj_cost_dist"][
-                            run_idx
-                        ][update_idx].min(),
-                        f"{run_prefix}/traj_cost_max": all_metrics["traj_cost_dist"][
-                            run_idx
-                        ][update_idx].max(),
-                        f"{run_prefix}/traj_cost_return": all_metrics[
-                            "traj_cost_return"
-                        ][run_idx][update_idx],
+                        ][update_idx],
                         f"{run_prefix}/is_mean_unsafe": all_metrics["is_mean_unsafe"][
                             run_idx
                         ][update_idx],
                         f"{run_prefix}/accepted": all_metrics["accepted"][run_idx][
                             update_idx
                         ],
-                        f"{run_prefix}/traj_aug_cost_min": all_metrics[
-                            "traj_aug_cost_dist"
-                        ][run_idx][update_idx].min(),
-                        f"{run_prefix}/traj_aug_cost_max": all_metrics[
-                            "traj_aug_cost_dist"
-                        ][run_idx][update_idx].max(),
-                        f"{run_prefix}/traj_aug_cost_std": all_metrics[
-                            "traj_aug_cost_dist"
-                        ][run_idx][update_idx].std(),
+                        f"{run_prefix}/td_aug_cost_return": all_metrics[
+                            "td_aug_cost_return"
+                        ][run_idx][update_idx],
+                        f"{run_prefix}/traj_cost_return": all_metrics[
+                            "traj_cost_return"
+                        ][run_idx][update_idx],
                         f"{run_prefix}/traj_aug_cost_return": all_metrics[
                             "traj_aug_cost_return"
                         ][run_idx][update_idx],
