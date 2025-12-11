@@ -612,22 +612,27 @@ def make_train(
             episode_sq_cost_return = (sparse_costs**2).sum() / num_episodes
             episode_cost_var = episode_sq_cost_return - episode_cost_return**2
 
+            # Compute empirical probability of exceeding VaR threshold
+            exceeds_threshold = sparse_costs > var_threshold
+            num_exceedances = exceeds_threshold.sum()
+            empirical_var_probability = num_exceedances / num_episodes
+
             # Compute constraint limit
             td_cost_return = (traj_batch.running_cost + cost_targets).mean()
-            is_mean_unsafe = episode_cost_return > var_threshold
-            aug_cost_limit = (1 / var_probability) * (episode_cost_return**2) + (
+            is_mean_unsafe = td_cost_return > var_threshold
+            aug_cost_limit = (1 / var_probability) * (td_cost_return**2) + (
                 var_threshold**2
             )
             # Compute constraint violation
             td_aug_cost_return = (traj_batch.running_aug_cost + aug_cost_targets).mean()
-            c_cheb = episode_aug_cost_return - aug_cost_limit
-            c_linear = episode_cost_return - var_threshold
+            c_cheb = td_aug_cost_return - aug_cost_limit
+            c_linear = td_cost_return - var_threshold
             c_raw = jax.lax.select(is_mean_unsafe, c_linear, c_cheb)
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
             c = c_raw + new_margin
 
             cheb_constraint = (
-                beta * episode_cost_var - (var_threshold - episode_cost_return) ** 2
+                beta * episode_cost_var - (var_threshold - td_cost_return) ** 2
             )
 
             # Clone current model for reference in KL and line search
@@ -650,7 +655,7 @@ def make_train(
             flat_aug_cost_grads, _ = jax.flatten_util.ravel_pytree(aug_cost_grads)
             b_cheb = (
                 flat_aug_cost_grads
-                - (2 * episode_cost_return / (var_probability + 1e-8)) * flat_cost_grads
+                - (2 * td_cost_return / (var_probability + 1e-8)) * flat_cost_grads
             )
             b = jax.lax.select(is_mean_unsafe, flat_cost_grads, b_cheb)
 
@@ -772,6 +777,8 @@ def make_train(
                 "td_cost_return": td_cost_return,
                 "episode_aug_cost_return": episode_aug_cost_return,
                 "td_aug_cost_return": td_aug_cost_return,
+                "empirical_var_probability": empirical_var_probability,
+                "num_exceedances": num_exceedances,
                 "optim_case": optim_case,
                 "episode_return": traj_batch.info["returned_episode_returns"].mean(),
                 "info_cost_returns": traj_batch.info[
@@ -901,6 +908,8 @@ if __name__ == "__main__":
             "episode_cost_return",
             "td_aug_cost_return",
             "episode_aug_cost_return",
+            "empirical_var_probability",
+            "num_exceedances",
             "is_mean_unsafe",
             "accepted",
         ]
