@@ -613,7 +613,7 @@ def make_train(
             episode_cost_var = episode_sq_cost_return - episode_cost_return**2
 
             # Compute empirical probability of exceeding VaR threshold
-            exceeds_threshold = sparse_costs > var_threshold
+            exceeds_threshold = (sparse_costs > var_threshold) & is_terminal
             num_exceedances = exceeds_threshold.sum()
             empirical_var_probability = num_exceedances / num_episodes
 
@@ -831,39 +831,37 @@ if __name__ == "__main__":
     WANDB = "online"
     ENV_NAME = "fragile_ant"
 
-    rng = jax.random.PRNGKey(SEED)
-    train_rngs = jax.random.split(rng, NUM_SEEDS)
-
-    env = BraxToGymnaxWrapper(ENV_NAME, episode_length=100)
-    env_params = None
-
     # rng = jax.random.PRNGKey(SEED)
-    # rngs = jax.random.split(rng, NUM_SEEDS + 1)
-    # garch_rng = rngs[0]
-    # train_rngs = rngs[1:]
-    #
-    # garch_params = {
-    #  "BTC": GARCHParams(
-    #      mu=5e-3,
-    #      omega=1e-4,
-    #      alpha=jnp.array([0.165]),
-    #      beta=jnp.array([0.8]),
-    #      initial_price=1.0,
-    #  ),
-    #  "APPL": GARCHParams(
-    #      mu=3e-3,
-    #      omega=1e-5,
-    #      alpha=jnp.array([0.15]),
-    #      beta=jnp.array([0.5]),
-    #      initial_price=1.0,
-    #  ),
-    # }
-    # env = PortfolioOptimizationGARCH(
-    #  garch_rng, garch_params, num_samples=1000, num_trajectories=10000
-    # )
-    # env_params = env.default_params.replace(
-    #  max_steps=1000,
-    # )
+    # train_rngs = jax.random.split(rng, NUM_SEEDS)
+
+    # env = BraxToGymnaxWrapper(ENV_NAME, episode_length=100)
+    # env_params = None
+
+    rng = jax.random.PRNGKey(SEED)
+    rngs = jax.random.split(rng, NUM_SEEDS + 1)
+    garch_rng = rngs[0]
+    train_rngs = rngs[1:]
+
+    garch_params = {
+        "BTC": GARCHParams(
+            mu=5e-3,
+            omega=1e-4,
+            alpha=jnp.array([0.165]),
+            beta=jnp.array([0.8]),
+            initial_price=1.0,
+        ),
+        "APPL": GARCHParams(
+            mu=3e-3,
+            omega=1e-5,
+            alpha=jnp.array([0.15]),
+            beta=jnp.array([0.5]),
+            initial_price=1.0,
+        ),
+    }
+    env = PortfolioOptimizationGARCH(
+        garch_rng, garch_params, num_samples=1000, num_trajectories=10000
+    )
+    env_params = env.default_params
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
         project="Tinker",
@@ -878,11 +876,11 @@ if __name__ == "__main__":
     train_fn = make_train(
         env,
         env_params,
-        num_steps=int(1e6),
+        num_steps=int(1e7),
         num_envs=10,
-        train_freq=1000,
-        var_probability=0.1,
-        var_threshold=20.0,
+        train_freq=10000,
+        var_probability=0.05,
+        var_threshold=-2.5,
         margin_lr=0.0,
         anneal_lr=True,
     )
