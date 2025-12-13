@@ -14,7 +14,9 @@ import optax
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from gymnax.environments.environment import Environment, EnvParams
-from gymnax.wrappers import LogWrapper
+from gymnax.environments import spaces
+from safenax.wrappers import LogWrapper
+from safenax.frozen_lake import FrozenLake
 
 import wandb
 
@@ -119,7 +121,20 @@ def make_train(
         # INIT NETWORK
         network = ActorCritic(env.action_space(env_params).n, activation=activation)
         rng, _rng = jax.random.split(rng)
-        init_x = jnp.zeros(env.observation_space(env_params).shape)
+        obs_space = env.observation_space(env_params)
+        if isinstance(obs_space, spaces.Discrete):
+            init_x = jnp.zeros((obs_space.n,))
+
+            def preprocess_obs(obs: jax.Array) -> jax.Array:
+                """One-hot encode discrete observations."""
+                return jax.nn.one_hot(obs, obs_space.n)
+        else:
+            init_x = jnp.zeros(obs_space.shape)
+
+            def preprocess_obs(obs: jax.Array) -> jax.Array:
+                """Pass-through for continuous observations."""
+                return obs
+
         network_params = network.init(_rng, init_x)
         if anneal_lr:
             tx = optax.chain(
@@ -141,6 +156,7 @@ def make_train(
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, num_envs)
         obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
+        obsv = preprocess_obs(obsv)
 
         # TRAIN LOOP
         def _update_step(runner_state, _):
@@ -160,6 +176,7 @@ def make_train(
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0, None)
                 )(rng_step, env_state, action, env_params)
+                obsv = preprocess_obs(obsv)
                 transition = Transition(
                     done, action, value, reward, log_prob, last_obs, info
                 )
@@ -289,7 +306,10 @@ def make_train(
                 "actor_loss": loss_info[1][1].mean(),
                 "critic_loss": loss_info[1][0].mean(),
                 "entropy": loss_info[1][2].mean(),
-                "batch_returns": traj_batch.info["returned_episode_returns"].mean(),
+                "episode_cost_returns": traj_batch.info[
+                    "returned_episode_cost_returns"
+                ].mean(),
+                "episode_returns": traj_batch.info["returned_episode_returns"].mean(),
                 "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
                 "dones": traj_batch.info["returned_episode"],
                 "returns": traj_batch.info["returned_episode_returns"],
@@ -368,7 +388,7 @@ def run(
 
 
 if __name__ == "__main__":
-    config = {
+    cartpol_config = {
         "ENV_NAME": "CartPole-v1",
         "LR": 3e-4,
         "NUM_ENVS": 1,
@@ -389,11 +409,33 @@ if __name__ == "__main__":
         "SEED": 0,
     }
 
-    basic_env, env_params = gymnax.make(config["ENV_NAME"])
+    config = {
+        "ENV_NAME": "FrozenLake-v1",
+        "LR": 3e-4,
+        "NUM_ENVS": 10,
+        "TRAIN_FREQ": 128,
+        "TOTAL_TIMESTEPS": 2e5,
+        "UPDATE_EPOCHS": 4,
+        "BATCH_SIZE": 32,
+        "GAMMA": 0.99,
+        "GAE_LAMBDA": 0.95,
+        "CLIP_EPS": 0.2,
+        "ENT_COEF": 0.01,
+        "VF_COEF": 0.5,
+        "MAX_GRAD_NORM": 0.5,
+        "ACTIVATION": "tanh",
+        "ANNEAL_LR": False,
+        "WANDB_MODE": "online",  # set to online to activate wandb
+        "NUM_SEEDS": 1,
+        "SEED": 0,
+    }
+
+    env = FrozenLake()
+    env_params = env.default_params
 
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
-        project="Tinker",
+        project="FrozenLake",
         tags=["PPO", config["ENV_NAME"].upper(), f"jax_{jax.__version__}"],
         name=f"ppo_{config['ENV_NAME']}",
         config=config,
@@ -401,7 +443,7 @@ if __name__ == "__main__":
     )
 
     train_fn = make_train(
-        env=basic_env,
+        env=env,
         env_params=env_params,
         num_steps=config["TOTAL_TIMESTEPS"],
         num_envs=config["NUM_ENVS"],
@@ -430,7 +472,7 @@ if __name__ == "__main__":
     if config["WANDB_MODE"] == "online":
         print("Logging metrics to WandB...")
         num_updates = len(
-            all_metrics["batch_returns"][0]
+            all_metrics["episode_returns"][0]
         )  # Get number of training updates
 
         # Log each update step for all runs
@@ -453,8 +495,11 @@ if __name__ == "__main__":
                         f"{run_prefix}/returns": all_metrics["returns"][run_idx][
                             update_idx
                         ],
-                        f"{run_prefix}/batch_returns": float(
-                            all_metrics["batch_returns"][run_idx][update_idx]
+                        f"{run_prefix}/episode_returns": float(
+                            all_metrics["episode_returns"][run_idx][update_idx]
+                        ),
+                        f"{run_prefix}/episode_cost_returns": float(
+                            all_metrics["episode_cost_returns"][run_idx][update_idx]
                         ),
                         f"{run_prefix}/actor_loss": float(
                             all_metrics["actor_loss"][run_idx][update_idx]
