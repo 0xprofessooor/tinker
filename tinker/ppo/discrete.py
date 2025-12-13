@@ -1,4 +1,4 @@
-"""DEPRECATED Proximal Policy Optimization (PPO) with Categorical Policy."""
+"""Proximal Policy Optimization (PPO) with Categorical Policy."""
 
 import os
 from typing import NamedTuple, Tuple

@@ -1,4 +1,4 @@
-"""Proximal Policy Optimization (PPO) with Continuous Action Space."""
+"""DEPRECATED Proximal Policy Optimization (PPO) with Continuous Action Space."""
 
 import json
 import os

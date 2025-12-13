@@ -1,4 +1,4 @@
-"""DEPRECATED Value-at-Risk Constrained Policy Optimization (CPO)
+"""Value-at-Risk Constrained Policy Optimization (CPO)
 
 Implements a VaR constrained CPO for safe reinforcement learning with chance constraints.
 """
@@ -11,12 +11,12 @@ from flax import nnx, struct
 import jax
 import jax.numpy as jnp
 import optax
+from gymnax.environments import spaces
 from gymnax.environments.environment import Environment, EnvParams, EnvState
 import wandb
 
 from safenax.wrappers import LogWrapper, BraxToGymnaxWrapper
-from safenax.po_garch import GARCHParams, PortfolioOptimizationGARCH
-from tinker import norm
+from safenax.frozen_lake import FrozenLake
 
 
 class ActorCritic(nnx.Module):
@@ -38,7 +38,6 @@ class ActorCritic(nnx.Module):
         self.actor_fc1 = nnx.Linear(aug_obs_dim, 256, rngs=rngs)
         self.actor_fc2 = nnx.Linear(256, 256, rngs=rngs)
         self.actor_mean = nnx.Linear(256, action_dim, rngs=rngs)
-        self.log_std = nnx.Param(jnp.zeros(action_dim))
 
         # Value critic (for rewards)
         self.value_fc1 = nnx.Linear(aug_obs_dim, 256, rngs=rngs)
@@ -60,7 +59,7 @@ class ActorCritic(nnx.Module):
         actor_x = self.activation(self.actor_fc1(aug_obs))
         actor_x = self.activation(self.actor_fc2(actor_x))
         actor_mean = self.actor_mean(actor_x)
-        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(self.log_std[...]))
+        pi = distrax.Categorical(logits=actor_mean)
 
         # Value critic
         value_x = self.activation(self.value_fc1(aug_obs))
@@ -304,9 +303,22 @@ def make_train(
     def train(rng: chex.PRNGKey) -> Tuple[CPOState, dict]:
         # INIT NETWORK
         rng, model_rng = jax.random.split(rng)
+        if isinstance(env.observation_space(env_params), spaces.Discrete):
+            obs_dim = env.observation_space(env_params).n
+
+            def preprocess_obs(obs: jax.Array) -> jax.Array:
+                """One-hot encode discrete observations."""
+                return jax.nn.one_hot(obs, obs_dim)
+        else:
+            obs_dim = env.observation_space(env_params).shape[0]
+
+            def preprocess_obs(obs: jax.Array) -> jax.Array:
+                """Pass-through for continuous observations."""
+                return obs
+
         model = ActorCritic(
-            obs_dim=env.observation_space(env_params).shape[0],
-            action_dim=env.action_space(env_params).shape[0],
+            obs_dim=obs_dim,
+            action_dim=env.action_space(env_params).n,
             activation=activation,
             rngs=nnx.Rngs(model_rng),
         )
@@ -338,9 +350,7 @@ def make_train(
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, num_envs)
         obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
-        obs_norm_state = norm.init(env.observation_space(env_params).shape)
-        obs_norm_state = norm.welford_update(obs_norm_state, obsv)
-        norm_obsv = jax.vmap(norm.normalize, in_axes=(None, 0))(obs_norm_state, obsv)
+        norm_obsv = preprocess_obs(obsv)
         running_cost = jnp.zeros((num_envs,))
         running_aug_cost = jnp.zeros((num_envs,))
         cost_discount = jnp.ones((num_envs,))
@@ -366,7 +376,6 @@ def make_train(
                 runner_state: Tuple[
                     CPOState,
                     EnvState,
-                    norm.RunningMeanStdState,
                     jax.Array,
                     jax.Array,
                     jax.Array,
@@ -378,7 +387,6 @@ def make_train(
                 (
                     cpo_state,
                     env_state,
-                    obs_norm_state,
                     aug_obs,
                     running_cost,
                     running_aug_cost,
@@ -441,9 +449,7 @@ def make_train(
                     cost_discount * cost_gamma,
                 )
 
-                next_norm_obs = jax.vmap(norm.normalize, in_axes=(None, 0))(
-                    obs_norm_state, next_obs
-                )
+                next_norm_obs = preprocess_obs(next_obs)
                 next_norm_budget = next_running_cost / (var_threshold + 1e-8)
                 next_aug_obs = jnp.concatenate(
                     [
@@ -457,7 +463,6 @@ def make_train(
                 runner_state = (
                     cpo_state,
                     next_env_state,
-                    obs_norm_state,
                     next_aug_obs,
                     next_running_cost,
                     next_running_aug_cost,
@@ -474,16 +479,12 @@ def make_train(
             (
                 cpo_state,
                 env_state,
-                obs_norm_state,
                 last_aug_obs,
                 running_cost,
                 running_aug_cost,
                 cost_discount,
                 rng,
             ) = runner_state
-            # Flatten batch: (train_freq, num_envs, obs_dim) -> (train_freq * num_envs, obs_dim)
-            batch_obs = traj_batch.next_obs.reshape(-1, *traj_batch.next_obs.shape[2:])
-            obs_norm_state = norm.welford_update(obs_norm_state, batch_obs)
 
             # CALCULATE ADVANTAGE AND COST ADVANTAGE
             _, last_val, last_cost_val, last_aug_cost_val = model(last_aug_obs)
@@ -793,7 +794,6 @@ def make_train(
             runner_state = (
                 cpo_state,
                 env_state,
-                obs_norm_state,
                 last_aug_obs,
                 running_cost,
                 running_aug_cost,
@@ -808,7 +808,6 @@ def make_train(
         runner_state = (
             cpo_state,
             env_state,
-            obs_norm_state,
             aug_obsv,
             running_cost,
             running_aug_cost,
@@ -829,44 +828,19 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 1
     WANDB = "online"
-    ENV_NAME = "fragile_ant"
+    ENV_NAME = "FrozenLake-v1"
 
     rng = jax.random.PRNGKey(SEED)
     train_rngs = jax.random.split(rng, NUM_SEEDS)
 
-    env = BraxToGymnaxWrapper(ENV_NAME, episode_length=100)
-    env_params = None
+    env = FrozenLake()
+    env_params = env.default_params
 
-    # rng = jax.random.PRNGKey(SEED)
-    # rngs = jax.random.split(rng, NUM_SEEDS + 1)
-    # garch_rng = rngs[0]
-    # train_rngs = rngs[1:]
-    #
-    # garch_params = {
-    #    "BTC": GARCHParams(
-    #        mu=5e-3,
-    #        omega=1e-4,
-    #        alpha=jnp.array([0.165]),
-    #        beta=jnp.array([0.8]),
-    #        initial_price=1.0,
-    #    ),
-    #    "APPL": GARCHParams(
-    #        mu=3e-3,
-    #        omega=1e-5,
-    #        alpha=jnp.array([0.15]),
-    #        beta=jnp.array([0.5]),
-    #        initial_price=1.0,
-    #    ),
-    # }
-    # env = PortfolioOptimizationGARCH(
-    #    garch_rng, garch_params, num_samples=100, num_trajectories=10000
-    # )
-    # env_params = env.default_params
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
-        project="Tinker",
+        project="FrozenLake",
         tags=["VAR-CPO", f"{ENV_NAME.upper()}", f"jax_{jax.__version__}"],
-        name=f"varcpo_{ENV_NAME}_mc",
+        name=f"varcpo_{ENV_NAME}",
         mode=WANDB,
     )
 
@@ -876,11 +850,11 @@ if __name__ == "__main__":
     train_fn = make_train(
         env,
         env_params,
-        num_steps=int(10e6),
+        num_steps=int(2e5),
         num_envs=10,
-        train_freq=1000,
+        train_freq=200,
         var_probability=0.1,
-        var_threshold=20.0,
+        var_threshold=0.2,
         margin_lr=0.0,
         anneal_lr=True,
     )
