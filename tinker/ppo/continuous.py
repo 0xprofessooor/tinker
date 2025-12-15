@@ -16,10 +16,7 @@ from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from flax.training import checkpoints
 from gymnax.environments.environment import Environment, EnvParams
-from safenax.po_garch import (
-    PortfolioOptimizationGARCH,
-    GARCHParams,
-)
+from safenax import EcoAntV1
 from safenax.wrappers import BraxToGymnaxWrapper, LogWrapper
 from tinker import norm
 
@@ -532,7 +529,7 @@ if __name__ == "__main__":
         "SEED": 30,
     }
     config = {
-        "ENV_NAME": "fragile_ant",
+        "ENV_NAME": EcoAntV1().name,
         "LR": 3e-4,
         "NUM_ENVS": 10,
         "TRAIN_FREQ": 1024,
@@ -585,12 +582,12 @@ if __name__ == "__main__":
 
     rng = jax.random.PRNGKey(config["SEED"])
     train_rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    env = BraxToGymnaxWrapper(config["ENV_NAME"])
-    env_params = None
+    env = BraxToGymnaxWrapper(env=EcoAntV1(battery_limit=50.0), episode_length=100)
+    env_params = env.default_params
 
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
-        project="Tinker",
+        project="EcoAnt",
         tags=["PPO", config["ENV_NAME"].upper(), f"jax_{jax.__version__}"],
         name=f"ppo_{config['ENV_NAME']}",
         config=config,
@@ -643,16 +640,16 @@ if __name__ == "__main__":
                         # f"{run_prefix}/dones": all_metrics["dones"][run_idx][
                         #    update_idx
                         # ],
-                        f"{run_prefix}/returns": all_metrics["returns"][run_idx][
-                            update_idx
-                        ],
-                        f"{run_prefix}/batch_returns": float(
-                            all_metrics["batch_returns"][run_idx][update_idx]
-                        ),
-                        f"{run_prefix}/cost_returns": all_metrics["cost_returns"][
+                        f"{run_prefix}/episode_return_dist": all_metrics["returns"][
                             run_idx
                         ][update_idx],
-                        f"{run_prefix}/batch_cost_returns": float(
+                        f"{run_prefix}/episode_return": float(
+                            all_metrics["batch_returns"][run_idx][update_idx]
+                        ),
+                        f"{run_prefix}/episode_cost_return_dist": all_metrics[
+                            "cost_returns"
+                        ][run_idx][update_idx],
+                        f"{run_prefix}/episode_cost_return": float(
                             all_metrics["batch_cost_returns"][run_idx][update_idx]
                         ),
                         f"{run_prefix}/actor_loss": float(
@@ -676,6 +673,6 @@ if __name__ == "__main__":
     # Save the best policy (from the first seed)
     # runner_states is a tuple: (train_state, env_state, last_obs, rng)
     # Each element is vmapped, so runner_states[0] gives all train_states
-    best_train_state = jax.tree_util.tree_map(lambda x: x[0], runner_states[0])
-    save_path = f"checkpoints/ppo_{config['ENV_NAME']}_seed{config['SEED']}"
-    save_policy(best_train_state, save_path, config)
+    # best_train_state = jax.tree_util.tree_map(lambda x: x[0], runner_states[0])
+    # save_path = f"checkpoints/ppo_{config['ENV_NAME']}_seed{config['SEED']}"
+    # save_policy(best_train_state, save_path, config)

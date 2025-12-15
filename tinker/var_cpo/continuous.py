@@ -15,7 +15,7 @@ from gymnax.environments.environment import Environment, EnvParams, EnvState
 import wandb
 
 from safenax.wrappers import LogWrapper, BraxToGymnaxWrapper
-from safenax.po_garch import GARCHParams, PortfolioOptimizationGARCH
+from safenax import EcoAntV2
 from tinker import norm
 
 
@@ -829,44 +829,20 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 1
     WANDB = "online"
-    ENV_NAME = "fragile_ant"
+    PROJECT_NAME = "EcoAnt"
 
     rng = jax.random.PRNGKey(SEED)
     train_rngs = jax.random.split(rng, NUM_SEEDS)
 
-    env = BraxToGymnaxWrapper(ENV_NAME, episode_length=100)
-    env_params = None
+    brax_env = EcoAntV2(battery_limit=50.0)
+    env = BraxToGymnaxWrapper(env=brax_env, episode_length=100)
+    env_params = env.default_params
 
-    # rng = jax.random.PRNGKey(SEED)
-    # rngs = jax.random.split(rng, NUM_SEEDS + 1)
-    # garch_rng = rngs[0]
-    # train_rngs = rngs[1:]
-    #
-    # garch_params = {
-    #    "BTC": GARCHParams(
-    #        mu=5e-3,
-    #        omega=1e-4,
-    #        alpha=jnp.array([0.165]),
-    #        beta=jnp.array([0.8]),
-    #        initial_price=1.0,
-    #    ),
-    #    "APPL": GARCHParams(
-    #        mu=3e-3,
-    #        omega=1e-5,
-    #        alpha=jnp.array([0.15]),
-    #        beta=jnp.array([0.5]),
-    #        initial_price=1.0,
-    #    ),
-    # }
-    # env = PortfolioOptimizationGARCH(
-    #    garch_rng, garch_params, num_samples=100, num_trajectories=10000
-    # )
-    # env_params = env.default_params
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
-        project="Tinker",
-        tags=["VAR-CPO", f"{ENV_NAME.upper()}", f"jax_{jax.__version__}"],
-        name=f"varcpo_{ENV_NAME}_mc",
+        project=PROJECT_NAME,
+        tags=["VAR-CPO", f"{brax_env.name.upper()}", f"jax_{jax.__version__}"],
+        name=f"varcpo_{brax_env.name}",
         mode=WANDB,
     )
 
@@ -876,11 +852,11 @@ if __name__ == "__main__":
     train_fn = make_train(
         env,
         env_params,
-        num_steps=int(10e6),
+        num_steps=int(1e6),
         num_envs=10,
         train_freq=1000,
         var_probability=0.1,
-        var_threshold=20.0,
+        var_threshold=50.0,
         margin_lr=0.0,
         anneal_lr=True,
     )
