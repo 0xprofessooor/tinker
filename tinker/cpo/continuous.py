@@ -17,7 +17,7 @@ from gymnax.environments.environment import Environment, EnvParams, EnvState
 import wandb
 
 from safenax.wrappers import BraxToGymnaxWrapper, LogWrapper
-from safenax import EcoAntV1
+from safenax import EcoAntV1, FrozenLakeV2
 from tinker import norm
 
 
@@ -706,15 +706,18 @@ if __name__ == "__main__":
 
     rng = jax.random.PRNGKey(SEED)
     train_rngs = jax.random.split(rng, NUM_SEEDS)
-    brax_env = EcoAntV1(battery_limit=50.0)
-    env = BraxToGymnaxWrapper(env=brax_env, episode_length=100)
+    # brax_env = EcoAntV1(battery_limit=50.0)
+    # env = BraxToGymnaxWrapper(env=brax_env, episode_length=100)
+    # env_params = env.default_params
+
+    env = FrozenLakeV2()
     env_params = env.default_params
 
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
-        project="EcoAnt",
-        tags=["CPO", f"{brax_env.name.upper()}", f"jax_{jax.__version__}"],
-        name=f"cpo_{brax_env.name}",
+        project="FrozenLake",
+        tags=["CPO", f"{env.name.upper()}", f"jax_{jax.__version__}"],
+        name=f"cpo_{env.name}",
         mode=WANDB,
     )
 
