@@ -17,7 +17,7 @@ from gymnax.environments.environment import Environment, EnvParams, EnvState
 import wandb
 
 from safenax.wrappers import BraxToGymnaxWrapper, LogWrapper
-from safenax import EcoAntV1, FrozenLakeV2
+from safenax import EcoAntV1
 from tinker import norm
 
 
@@ -706,11 +706,8 @@ if __name__ == "__main__":
 
     rng = jax.random.PRNGKey(SEED)
     train_rngs = jax.random.split(rng, NUM_SEEDS)
-    # brax_env = EcoAntV1(battery_limit=50.0)
-    # env = BraxToGymnaxWrapper(env=brax_env, episode_length=100)
-    # env_params = env.default_params
-
-    env = FrozenLakeV2()
+    brax_env = EcoAntV1(battery_limit=50.0)
+    env = BraxToGymnaxWrapper(env=brax_env, episode_length=100)
     env_params = env.default_params
 
     wandb.login(os.environ.get("WANDB_KEY"))
@@ -775,6 +772,9 @@ if __name__ == "__main__":
                             "episode_cost_return"
                         ][run_idx][update_idx],
                         f"{run_prefix}/margin": all_metrics["margin"][run_idx][
+                            update_idx
+                        ],
+                        f"{run_prefix}/accepted": all_metrics["accepted"][run_idx][
                             update_idx
                         ],
                     }

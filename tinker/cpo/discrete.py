@@ -17,7 +17,7 @@ from gymnax.environments import spaces
 from safenax.wrappers import LogWrapper
 import wandb
 
-from safenax.frozen_lake import FrozenLake
+from safenax import FrozenLakeV2
 
 
 class ActorCritic(nnx.Module):
@@ -475,7 +475,7 @@ def make_train(
             c_raw = episode_cost_return - cost_limit
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
             c = c_raw + new_margin
-            c = c / (train_freq + 1e-8)
+            # c = c / (train_freq + 1e-8)
 
             # UPDATE POLICY (CPO STEP)
             # Clone current model for reference in KL and line search
@@ -620,6 +620,9 @@ def make_train(
                 _update_critic, cpo_state, None, critic_epochs
             )
 
+            thin_tiles_visited = jnp.sum(
+                jnp.where(traj_batch.info["tile_type"] == 84, 1, 0)
+            )
             metrics = {
                 "num_updates": cpo_state.num_updates,
                 "policy_loss": old_policy_loss,
@@ -629,11 +632,12 @@ def make_train(
                 "kl": final_kl,
                 "constraint_violation": c,
                 "margin": new_margin,
+                "episode_cost_return": episode_cost_return,
                 "optim_case": optim_case,
                 "episode_return": traj_batch.info["returned_episode_returns"].mean(),
-                "episode_cost_return": episode_cost_return,
                 "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
                 "accepted": accepted,
+                "thin_tiles_visited": thin_tiles_visited,
             }
 
             runner_state = (
@@ -664,19 +668,18 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 1
     WANDB = "online"
-    ENV_NAME = "FrozenLake-v1"
 
     rng = jax.random.PRNGKey(SEED)
     train_rngs = jax.random.split(rng, NUM_SEEDS)
 
-    env = FrozenLake()
+    env = FrozenLakeV2()
     env_params = env.default_params
 
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
         project="FrozenLake",
-        tags=["CPO", f"{ENV_NAME.upper()}", f"jax_{jax.__version__}"],
-        name=f"cpo_{ENV_NAME}",
+        tags=["CPO", f"{env.name.upper()}", f"jax_{jax.__version__}"],
+        name=f"cpo_{env.name}",
         mode=WANDB,
     )
 
@@ -688,8 +691,8 @@ if __name__ == "__main__":
         env_params,
         num_steps=int(2e5),
         num_envs=10,
-        cost_limit=0.1,
         train_freq=200,
+        cost_limit=215.0,
         margin_lr=0.0,
         anneal_lr=True,
     )
@@ -736,6 +739,12 @@ if __name__ == "__main__":
                         f"{run_prefix}/margin": all_metrics["margin"][run_idx][
                             update_idx
                         ],
+                        f"{run_prefix}/accepted": all_metrics["accepted"][run_idx][
+                            update_idx
+                        ],
+                        f"{run_prefix}/thin_tiles_visited": all_metrics[
+                            "thin_tiles_visited"
+                        ][run_idx][update_idx],
                     }
                 )
 
