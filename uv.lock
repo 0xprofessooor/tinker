@@ -2223,7 +2223,7 @@ wheels = [
 
 [[package]]
 name = "safenax"
-version = "0.4.4"
+version = "0.4.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "brax" },
@@ -2234,9 +2234,9 @@ dependencies = [
     { name = "matplotlib" },
     { name = "polars" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/98/af/b9447cfc4ca8b53b8c5f70b87867cef7dbe2537583b838d1e5c5db950d91/safenax-0.4.4.tar.gz", hash = "sha256:859df9ac56488aaeab78b7d17e242227b0805cfde78b31a50a2801910da3b034", size = 126611, upload-time = "2025-12-15T17:27:44.934Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3d/55/c4f0847280d10ffc52f1946d15665fcf8fc65cc87042efa6e83a57559bbf/safenax-0.4.5.tar.gz", hash = "sha256:c45e8c3574063c0774976f0526ff816ac6248621f587b3104871e5dcbe0f29fd", size = 129084, upload-time = "2025-12-16T15:42:38.704Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c2/34/b8ac4463d68cd8229157b6dcdc1d49e4461e9523ab6d16344facaae6850c/safenax-0.4.4-py3-none-any.whl", hash = "sha256:f631406e4f187548d1e9613a36db7974c626f0ca8d54baa90af0b2ce1c3c2fc7", size = 23898, upload-time = "2025-12-15T17:27:43.287Z" },
+    { url = "https://files.pythonhosted.org/packages/42/c1/55a01cb5648405b025c9da6fa50a74233d4dd83c9591ae7ce396c2107c86/safenax-0.4.5-py3-none-any.whl", hash = "sha256:f0993f48a58a584ad362cff3bcc36dbcfd5a65367bb99d680c4a7f9be67562c7", size = 27731, upload-time = "2025-12-16T15:42:37.044Z" },
 ]
 
 [[package]]
@@ -2555,7 +2555,7 @@ requires-dist = [
     { name = "jax", specifier = ">=0.8.0" },
     { name = "optax", specifier = ">=0.2.6" },
     { name = "polars", specifier = ">=1.34.0" },
-    { name = "safenax", specifier = ">=0.4.4" },
+    { name = "safenax", specifier = ">=0.4.5" },
     { name = "wandb", specifier = ">=0.22.2" },
 ]
 
