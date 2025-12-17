@@ -662,7 +662,7 @@ def make_train(
                 "episode_cost_return": episode_cost_return,
                 "optim_case": optim_case,
                 "episode_return": traj_batch.info["returned_episode_returns"].mean(),
-                "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
+                "episode_length": traj_batch.info["returned_episode_lengths"].mean(),
                 "accepted": accepted,
             }
 
@@ -761,7 +761,7 @@ if __name__ == "__main__":
                         f"{run_prefix}/cost_value_loss": all_metrics["cost_value_loss"][
                             run_idx
                         ][update_idx],
-                        f"{run_prefix}/episode_lengths": all_metrics["episode_lengths"][
+                        f"{run_prefix}/episode_length": all_metrics["episode_length"][
                             run_idx
                         ][update_idx],
                         f"{run_prefix}/kl": all_metrics["kl"][run_idx][update_idx],

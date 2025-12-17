@@ -635,7 +635,7 @@ def make_train(
                 "episode_cost_return": episode_cost_return,
                 "optim_case": optim_case,
                 "episode_return": traj_batch.info["returned_episode_returns"].mean(),
-                "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
+                "episode_length": traj_batch.info["returned_episode_lengths"].mean(),
                 "accepted": accepted,
                 "thin_tiles_visited": thin_tiles_visited,
             }
@@ -672,7 +672,13 @@ if __name__ == "__main__":
     rng = jax.random.PRNGKey(SEED)
     train_rngs = jax.random.split(rng, NUM_SEEDS)
 
-    env = FrozenLakeV2()
+    env = FrozenLakeV2(
+        map_name="4x4",
+        is_slippery=False,
+        safe_cost_std=0.0,
+        thin_shock_prob=0.1,
+        thin_shock_val=10.0,
+    )
     env_params = env.default_params
 
     wandb.login(os.environ.get("WANDB_KEY"))
@@ -689,10 +695,10 @@ if __name__ == "__main__":
     train_fn = make_train(
         env,
         env_params,
-        num_steps=int(2e5),
+        num_steps=int(1e6),
         num_envs=10,
-        train_freq=200,
-        cost_limit=215.0,
+        train_freq=1000,
+        cost_limit=20.0,
         margin_lr=0.0,
         anneal_lr=True,
     )
@@ -726,7 +732,7 @@ if __name__ == "__main__":
                         f"{run_prefix}/cost_value_loss": all_metrics["cost_value_loss"][
                             run_idx
                         ][update_idx],
-                        f"{run_prefix}/episode_lengths": all_metrics["episode_lengths"][
+                        f"{run_prefix}/episode_length": all_metrics["episode_length"][
                             run_idx
                         ][update_idx],
                         f"{run_prefix}/kl": all_metrics["kl"][run_idx][update_idx],

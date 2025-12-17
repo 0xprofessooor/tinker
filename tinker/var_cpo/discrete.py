@@ -761,8 +761,6 @@ def make_train(
                 jnp.where(traj_batch.info["tile_type"] == 84, 1, 0)
             )
             metrics = {
-                "states": traj_batch.next_obs,
-                "actions": traj_batch.action,
                 "num_updates": cpo_state.num_updates,
                 "policy_loss": old_policy_loss,
                 "cost_loss": old_cost_loss,

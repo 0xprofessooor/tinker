@@ -631,10 +631,6 @@ def make_train(
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
             c = c_raw + new_margin
 
-            cheb_constraint = (
-                beta * episode_cost_var - (var_threshold - episode_cost_return) ** 2
-            )
-
             # Clone current model for reference in KL and line search
             pi_old, _, _, _ = model(traj_batch.aug_obs)
             flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
@@ -770,8 +766,7 @@ def make_train(
                 "aug_cost_value_loss": aug_cost_value_losses.mean(),
                 "kl": final_kl,
                 "constraint_violation": c,
-                "aug_cheb_constraint_violation": c_cheb,
-                "chebyshev_constraint_violation": cheb_constraint,
+                "cheb_constraint_violation": c_cheb,
                 "margin": new_margin,
                 "episode_cost_return": episode_cost_return,
                 "td_cost_return": td_cost_return,
@@ -784,8 +779,8 @@ def make_train(
                 "info_cost_returns": traj_batch.info[
                     "returned_episode_cost_returns"
                 ].mean(),
+                "episode_length": traj_batch.info["returned_episode_lengths"].mean(),
                 "info_cost_dist": traj_batch.info["returned_episode_cost_returns"],
-                "num_episodes": num_episodes,
                 "accepted": accepted.mean(),
                 "is_mean_unsafe": is_mean_unsafe.mean(),
             }
@@ -873,11 +868,10 @@ if __name__ == "__main__":
             "cost_loss",
             "value_loss",
             "cost_value_loss",
-            "num_episodes",
+            "episode_length",
             "kl",
             "constraint_violation",
-            "chebyshev_constraint_violation",
-            "aug_cheb_constraint_violation",
+            "cheb_constraint_violation",
             "td_cost_return",
             "episode_cost_return",
             "td_aug_cost_return",
