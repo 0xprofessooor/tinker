@@ -16,7 +16,7 @@ from gymnax.environments.environment import Environment, EnvParams, EnvState
 import wandb
 
 from safenax.wrappers import LogWrapper, BraxToGymnaxWrapper
-from safenax.frozen_lake import FrozenLake
+from safenax import FrozenLakeV2
 
 
 class ActorCritic(nnx.Module):
@@ -632,10 +632,6 @@ def make_train(
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
             c = c_raw + new_margin
 
-            cheb_constraint = (
-                beta * episode_cost_var - (var_threshold - episode_cost_return) ** 2
-            )
-
             # Clone current model for reference in KL and line search
             pi_old, _, _, _ = model(traj_batch.aug_obs)
             flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
@@ -761,7 +757,12 @@ def make_train(
                 jax.lax.scan(_update_critic, cpo_state, None, critic_epochs)
             )
 
+            thin_tiles_visited = jnp.sum(
+                jnp.where(traj_batch.info["tile_type"] == 84, 1, 0)
+            )
             metrics = {
+                "states": traj_batch.next_obs,
+                "actions": traj_batch.action,
                 "num_updates": cpo_state.num_updates,
                 "policy_loss": old_policy_loss,
                 "cost_loss": old_cost_loss,
@@ -771,8 +772,7 @@ def make_train(
                 "aug_cost_value_loss": aug_cost_value_losses.mean(),
                 "kl": final_kl,
                 "constraint_violation": c,
-                "aug_cheb_constraint_violation": c_cheb,
-                "chebyshev_constraint_violation": cheb_constraint,
+                "cheb_constraint_violation": c_cheb,
                 "margin": new_margin,
                 "episode_cost_return": episode_cost_return,
                 "td_cost_return": td_cost_return,
@@ -786,9 +786,10 @@ def make_train(
                     "returned_episode_cost_returns"
                 ].mean(),
                 "info_cost_dist": traj_batch.info["returned_episode_cost_returns"],
-                "num_episodes": num_episodes,
+                "episode_length": traj_batch.info["returned_episode_lengths"].mean(),
                 "accepted": accepted.mean(),
                 "is_mean_unsafe": is_mean_unsafe.mean(),
+                "thin_tiles_visited": thin_tiles_visited,
             }
 
             runner_state = (
@@ -828,19 +829,24 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 1
     WANDB = "online"
-    ENV_NAME = "FrozenLake-v1"
 
     rng = jax.random.PRNGKey(SEED)
     train_rngs = jax.random.split(rng, NUM_SEEDS)
 
-    env = FrozenLake()
+    env = FrozenLakeV2(
+        map_name="4x4",
+        is_slippery=False,
+        safe_cost_std=0.0,
+        thin_shock_prob=0.1,
+        thin_shock_val=10.0,
+    )
     env_params = env.default_params
 
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
         project="FrozenLake",
-        tags=["VAR-CPO", f"{ENV_NAME.upper()}", f"jax_{jax.__version__}"],
-        name=f"varcpo_{ENV_NAME}",
+        tags=["VAR-CPO", f"{env.name.upper()}", f"jax_{jax.__version__}"],
+        name=f"varcpo_{env.name}",
         mode=WANDB,
     )
 
@@ -850,11 +856,11 @@ if __name__ == "__main__":
     train_fn = make_train(
         env,
         env_params,
-        num_steps=int(2e5),
+        num_steps=int(4e5),
         num_envs=10,
         train_freq=200,
-        var_probability=0.1,
-        var_threshold=0.2,
+        var_threshold=20.0,
+        var_probability=0.05,
         margin_lr=0.0,
         anneal_lr=True,
     )
@@ -871,11 +877,10 @@ if __name__ == "__main__":
             "cost_loss",
             "value_loss",
             "cost_value_loss",
-            "num_episodes",
+            "episode_length",
             "kl",
             "constraint_violation",
-            "chebyshev_constraint_violation",
-            "aug_cheb_constraint_violation",
+            "cheb_constraint_violation",
             "td_cost_return",
             "episode_cost_return",
             "td_aug_cost_return",
@@ -884,6 +889,7 @@ if __name__ == "__main__":
             "num_exceedances",
             "is_mean_unsafe",
             "accepted",
+            "thin_tiles_visited",
         ]
 
         num_steps = len(all_metrics["num_updates"][0])
