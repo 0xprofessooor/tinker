@@ -3,7 +3,6 @@
 Implements a VaR constrained CPO for safe reinforcement learning with chance constraints.
 """
 
-import os
 from typing import NamedTuple, Tuple, Callable
 import chex
 import distrax
@@ -13,10 +12,11 @@ import jax.numpy as jnp
 import optax
 from gymnax.environments import spaces
 from gymnax.environments.environment import Environment, EnvParams, EnvState
-import wandb
 
 from safenax.wrappers import LogWrapper, BraxToGymnaxWrapper
 from safenax import FrozenLakeV2
+
+from tinker import log
 
 
 class ActorCritic(nnx.Module):
@@ -825,11 +825,10 @@ def make_train(
 
 if __name__ == "__main__":
     SEED = 0
-    NUM_SEEDS = 1
-    WANDB = "online"
+    NUM_SEEDS = 5
 
     rng = jax.random.PRNGKey(SEED)
-    train_rngs = jax.random.split(rng, NUM_SEEDS)
+    rngs = jax.random.split(rng, NUM_SEEDS)
 
     env = FrozenLakeV2(
         map_name="4x4",
@@ -840,22 +839,11 @@ if __name__ == "__main__":
     )
     env_params = env.default_params
 
-    wandb.login(os.environ.get("WANDB_KEY"))
-    wandb.init(
-        project="FrozenLake",
-        tags=["VAR-CPO", f"{env.name.upper()}", f"jax_{jax.__version__}"],
-        name=f"varcpo_{env.name}",
-        mode=WANDB,
-    )
-
-    rng = jax.random.PRNGKey(SEED)
-    rngs = jax.random.split(rng, NUM_SEEDS)
-
     train_fn = make_train(
         env,
         env_params,
-        num_steps=int(4e5),
-        num_envs=10,
+        num_steps=int(2e5),
+        num_envs=2,
         train_freq=200,
         var_threshold=20.0,
         var_probability=0.05,
@@ -865,40 +853,40 @@ if __name__ == "__main__":
     train_vjit = jax.jit(jax.vmap(train_fn))
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
 
-    if WANDB == "online":
-        # Define metrics to log - edit this list to add/remove metrics
-        metrics_to_log = [
-            "episode_return",
-            "info_cost_returns",
-            "info_cost_dist",
-            "policy_loss",
-            "cost_loss",
-            "value_loss",
-            "cost_value_loss",
-            "episode_length",
-            "kl",
-            "constraint_violation",
-            "cheb_constraint_violation",
-            "td_cost_return",
-            "episode_cost_return",
-            "td_aug_cost_return",
-            "episode_aug_cost_return",
-            "empirical_var_probability",
-            "num_exceedances",
-            "is_mean_unsafe",
-            "accepted",
-            "thin_tiles_visited",
-        ]
+    metrics_to_log = [
+        "episode_return",
+        "info_cost_returns",
+        "info_cost_dist",
+        "policy_loss",
+        "cost_loss",
+        "value_loss",
+        "cost_value_loss",
+        "episode_length",
+        "kl",
+        "constraint_violation",
+        "cheb_constraint_violation",
+        "td_cost_return",
+        "episode_cost_return",
+        "td_aug_cost_return",
+        "episode_aug_cost_return",
+        "empirical_var_probability",
+        "num_exceedances",
+        "is_mean_unsafe",
+        "accepted",
+        "thin_tiles_visited",
+    ]
 
-        num_steps = len(all_metrics["num_updates"][0])
-        for update_idx in range(num_steps):
-            log_dict = {}
+    log.save_wandb(
+        project="FrozenLake",
+        algo_name="var_cpo",
+        env_name=env.name,
+        metrics=all_metrics,
+        metrics_to_log=metrics_to_log,
+    )
 
-            for run_idx in range(NUM_SEEDS):
-                run_prefix = f"run_{run_idx}"
-                for metric_name in metrics_to_log:
-                    log_dict[f"{run_prefix}/{metric_name}"] = all_metrics[metric_name][
-                        run_idx
-                    ][update_idx]
-
-            wandb.log(log_dict)
+    log.save_local(
+        algo_name="var_cpo",
+        env_name=env.name,
+        metrics=all_metrics,
+        metrics_to_log=metrics_to_log,
+    )
