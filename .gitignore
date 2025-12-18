@@ -7,6 +7,7 @@ notebooks/
 data/
 .DS_Store
 checkpoints/
+results/
 
 # C extensions
 *.so
