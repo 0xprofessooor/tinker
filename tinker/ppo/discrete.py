@@ -16,9 +16,9 @@ from flax.training.train_state import TrainState
 from gymnax.environments.environment import Environment, EnvParams
 from gymnax.environments import spaces
 from safenax.wrappers import LogWrapper
-from safenax.frozen_lake import FrozenLake
+from safenax import FrozenLakeV2
 
-import wandb
+from tinker import log
 
 
 class ActorCritic(nn.Module):
@@ -301,18 +301,23 @@ def make_train(
             rng = update_state[-1]
 
             runner_state = (train_state, env_state, last_obs, rng)
+            thin_tiles_visited = jnp.sum(
+                jnp.where(traj_batch.info["tile_type"] == 84, 1, 0)
+            )
             metrics = {
                 "updates": train_state.step,
                 "actor_loss": loss_info[1][1].mean(),
                 "critic_loss": loss_info[1][0].mean(),
                 "entropy": loss_info[1][2].mean(),
-                "episode_cost_returns": traj_batch.info[
+                "cost_dist": traj_batch.info["returned_episode_cost_returns"],
+                "episode_cost_return": traj_batch.info[
                     "returned_episode_cost_returns"
                 ].mean(),
-                "episode_returns": traj_batch.info["returned_episode_returns"].mean(),
-                "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
+                "episode_return": traj_batch.info["returned_episode_returns"].mean(),
+                "episode_length": traj_batch.info["returned_episode_lengths"].mean(),
                 "dones": traj_batch.info["returned_episode"],
                 "returns": traj_batch.info["returned_episode_returns"],
+                "thin_tiles_visited": thin_tiles_visited,
             }
 
             return runner_state, metrics
@@ -410,13 +415,13 @@ if __name__ == "__main__":
     }
 
     config = {
-        "ENV_NAME": "FrozenLake-v1",
+        "ENV_NAME": "FrozenLake-v2",
         "LR": 3e-4,
-        "NUM_ENVS": 10,
-        "TRAIN_FREQ": 128,
+        "NUM_ENVS": 5,
+        "TRAIN_FREQ": 200,
         "TOTAL_TIMESTEPS": 2e5,
         "UPDATE_EPOCHS": 4,
-        "BATCH_SIZE": 32,
+        "BATCH_SIZE": 40,
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
@@ -424,23 +429,20 @@ if __name__ == "__main__":
         "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "tanh",
-        "ANNEAL_LR": False,
+        "ANNEAL_LR": True,
         "WANDB_MODE": "online",  # set to online to activate wandb
-        "NUM_SEEDS": 1,
+        "NUM_SEEDS": 5,
         "SEED": 0,
     }
 
-    env = FrozenLake()
-    env_params = env.default_params
-
-    wandb.login(os.environ.get("WANDB_KEY"))
-    wandb.init(
-        project="FrozenLake",
-        tags=["PPO", config["ENV_NAME"].upper(), f"jax_{jax.__version__}"],
-        name=f"ppo_{config['ENV_NAME']}",
-        config=config,
-        mode=config["WANDB_MODE"],
+    env = FrozenLakeV2(
+        map_name="4x4",
+        is_slippery=False,
+        safe_cost_std=0.0,
+        thin_shock_prob=0.1,
+        thin_shock_val=10.0,
     )
+    env_params = env.default_params
 
     train_fn = make_train(
         env=env,
@@ -468,53 +470,28 @@ if __name__ == "__main__":
     train_vjit = jax.jit(jax.vmap(train_fn))
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
 
-    # Log metrics from each parallel run separately to WandB
-    if config["WANDB_MODE"] == "online":
-        print("Logging metrics to WandB...")
-        num_updates = len(
-            all_metrics["episode_returns"][0]
-        )  # Get number of training updates
+    metrics_to_log = [
+        "actor_loss",
+        "critic_loss",
+        "entropy",
+        "episode_return",
+        "episode_cost_return",
+        "episode_length",
+        "thin_tiles_visited",
+        "cost_dist",
+    ]
 
-        # Log each update step for all runs
-        for update_idx in range(num_updates):
-            log_dict = {}
+    log.save_wandb(
+        project="FrozenLake",
+        algo_name="ppo",
+        env_name=env.name,
+        metrics=all_metrics,
+        metrics_to_log=metrics_to_log,
+    )
 
-            # Log metrics for each parallel run
-            for run_idx in range(config["NUM_SEEDS"]):
-                run_prefix = f"run_{run_idx}"
-
-                # Extract metrics for this update and run
-                log_dict.update(
-                    {
-                        f"{run_prefix}/updates": all_metrics["updates"][run_idx][
-                            update_idx
-                        ],
-                        f"{run_prefix}/dones": all_metrics["dones"][run_idx][
-                            update_idx
-                        ],
-                        f"{run_prefix}/returns": all_metrics["returns"][run_idx][
-                            update_idx
-                        ],
-                        f"{run_prefix}/episode_returns": float(
-                            all_metrics["episode_returns"][run_idx][update_idx]
-                        ),
-                        f"{run_prefix}/episode_cost_returns": float(
-                            all_metrics["episode_cost_returns"][run_idx][update_idx]
-                        ),
-                        f"{run_prefix}/actor_loss": float(
-                            all_metrics["actor_loss"][run_idx][update_idx]
-                        ),
-                        f"{run_prefix}/critic_loss": float(
-                            all_metrics["critic_loss"][run_idx][update_idx]
-                        ),
-                        f"{run_prefix}/entropy": float(
-                            all_metrics["entropy"][run_idx][update_idx]
-                        ),
-                        f"{run_prefix}/episode_lengths": float(
-                            all_metrics["episode_lengths"][run_idx][update_idx]
-                        ),
-                    }
-                )
-
-            # Log to WandB
-            wandb.log(log_dict)
+    log.save_local(
+        algo_name="ppo",
+        env_name=env.name,
+        metrics=all_metrics,
+        metrics_to_log=metrics_to_log,
+    )

@@ -4,7 +4,6 @@ Based on the paper: https://arxiv.org/abs/1705.10528
 Implements CPO for safe reinforcement learning with cost constraints.
 """
 
-import os
 from typing import NamedTuple, Tuple, Callable
 import chex
 import distrax
@@ -15,9 +14,9 @@ import optax
 from gymnax.environments.environment import Environment, EnvParams, EnvState
 from gymnax.environments import spaces
 from safenax.wrappers import LogWrapper
-import wandb
 
 from safenax import FrozenLakeV2
+from tinker import log
 
 
 class ActorCritic(nnx.Module):
@@ -634,6 +633,7 @@ def make_train(
                 "margin": new_margin,
                 "episode_cost_return": episode_cost_return,
                 "optim_case": optim_case,
+                "cost_dist": traj_batch.info["returned_episode_cost_returns"],
                 "episode_return": traj_batch.info["returned_episode_returns"].mean(),
                 "episode_length": traj_batch.info["returned_episode_lengths"].mean(),
                 "accepted": accepted,
@@ -666,11 +666,7 @@ def make_train(
 
 if __name__ == "__main__":
     SEED = 0
-    NUM_SEEDS = 1
-    WANDB = "online"
-
-    rng = jax.random.PRNGKey(SEED)
-    train_rngs = jax.random.split(rng, NUM_SEEDS)
+    NUM_SEEDS = 5
 
     env = FrozenLakeV2(
         map_name="4x4",
@@ -681,23 +677,15 @@ if __name__ == "__main__":
     )
     env_params = env.default_params
 
-    wandb.login(os.environ.get("WANDB_KEY"))
-    wandb.init(
-        project="FrozenLake",
-        tags=["CPO", f"{env.name.upper()}", f"jax_{jax.__version__}"],
-        name=f"cpo_{env.name}",
-        mode=WANDB,
-    )
-
     rng = jax.random.PRNGKey(SEED)
     rngs = jax.random.split(rng, NUM_SEEDS)
 
     train_fn = make_train(
         env,
         env_params,
-        num_steps=int(1e6),
-        num_envs=10,
-        train_freq=1000,
+        num_steps=int(2e5),
+        num_envs=5,
+        train_freq=200,
         cost_limit=20.0,
         margin_lr=0.0,
         anneal_lr=True,
@@ -705,53 +693,32 @@ if __name__ == "__main__":
     train_vjit = jax.jit(jax.vmap(train_fn))
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
 
-    if WANDB == "online":
-        num_steps = len(all_metrics["num_updates"][0])
-        for update_idx in range(num_steps):
-            log_dict = {}
+    metrics_to_log = [
+        "episode_return",
+        "episode_length",
+        "episode_cost_return",
+        "constraint_violation",
+        "thin_tiles_visited",
+        "policy_loss",
+        "cost_loss",
+        "value_loss",
+        "cost_value_loss",
+        "kl",
+        "accepted",
+        "cost_dist",
+    ]
 
-            for run_idx in range(NUM_SEEDS):
-                run_prefix = f"run_{run_idx}"
-                log_dict.update(
-                    {
-                        f"{run_prefix}/num_updates": all_metrics["num_updates"][
-                            run_idx
-                        ][update_idx],
-                        f"{run_prefix}/episode_return": all_metrics["episode_return"][
-                            run_idx
-                        ][update_idx],
-                        f"{run_prefix}/policy_loss": all_metrics["policy_loss"][
-                            run_idx
-                        ][update_idx],
-                        f"{run_prefix}/cost_loss": all_metrics["cost_loss"][run_idx][
-                            update_idx
-                        ],
-                        f"{run_prefix}/value_loss": all_metrics["value_loss"][run_idx][
-                            update_idx
-                        ],
-                        f"{run_prefix}/cost_value_loss": all_metrics["cost_value_loss"][
-                            run_idx
-                        ][update_idx],
-                        f"{run_prefix}/episode_length": all_metrics["episode_length"][
-                            run_idx
-                        ][update_idx],
-                        f"{run_prefix}/kl": all_metrics["kl"][run_idx][update_idx],
-                        f"{run_prefix}/constraint_violation": all_metrics[
-                            "constraint_violation"
-                        ][run_idx][update_idx],
-                        f"{run_prefix}/episode_cost_return": all_metrics[
-                            "episode_cost_return"
-                        ][run_idx][update_idx],
-                        f"{run_prefix}/margin": all_metrics["margin"][run_idx][
-                            update_idx
-                        ],
-                        f"{run_prefix}/accepted": all_metrics["accepted"][run_idx][
-                            update_idx
-                        ],
-                        f"{run_prefix}/thin_tiles_visited": all_metrics[
-                            "thin_tiles_visited"
-                        ][run_idx][update_idx],
-                    }
-                )
+    log.save_wandb(
+        project="FrozenLake",
+        algo_name="cpo",
+        env_name=env.name,
+        metrics=all_metrics,
+        metrics_to_log=metrics_to_log,
+    )
 
-            wandb.log(log_dict)
+    log.save_local(
+        algo_name="cpo",
+        env_name=env.name,
+        metrics=all_metrics,
+        metrics_to_log=metrics_to_log,
+    )
