@@ -7,7 +7,6 @@ from typing import NamedTuple, Tuple
 import chex
 import distrax
 import flax.linen as nn
-import gymnax
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -18,9 +17,7 @@ from flax.training import checkpoints
 from gymnax.environments.environment import Environment, EnvParams
 from safenax import EcoAntV1
 from safenax.wrappers import BraxToGymnaxWrapper, LogWrapper
-from tinker import norm
-
-import wandb
+from tinker import norm, log
 
 
 class ActorCritic(nn.Module):
@@ -400,19 +397,28 @@ def make_train(
             rng = update_state[-1]
 
             runner_state = (train_state, env_state, obs_norm_state, last_obs, rng)
+
+            is_terminal = traj_batch.done
+            num_episodes = jnp.maximum(is_terminal.sum(), 1.0)
+            sparse_battery_used = jnp.where(
+                is_terminal, 50 - traj_batch.info["battery"], 0
+            )
+            episode_battery_used = sparse_battery_used.sum() / num_episodes
+
             metrics = {
                 "updates": train_state.step,
                 "actor_loss": loss_info[1][1].mean(),
                 "critic_loss": loss_info[1][0].mean(),
                 "entropy": loss_info[1][2].mean(),
-                "batch_returns": traj_batch.info["returned_episode_returns"].mean(),
-                "batch_cost_returns": traj_batch.info[
+                "episode_return": traj_batch.info["returned_episode_returns"].mean(),
+                "episode_cost_return": traj_batch.info[
                     "returned_episode_cost_returns"
                 ].mean(),
-                "episode_lengths": traj_batch.info["returned_episode_lengths"].mean(),
+                "episode_length": traj_batch.info["returned_episode_lengths"].mean(),
                 "dones": traj_batch.info["returned_episode"],
-                "returns": traj_batch.info["returned_episode_returns"],
-                "cost_returns": traj_batch.info["returned_episode_cost_returns"],
+                "return_dist": traj_batch.info["returned_episode_returns"],
+                "cost_return_dist": traj_batch.info["returned_episode_cost_returns"],
+                "episode_battery_used": episode_battery_used,
             }
 
             return runner_state, metrics
@@ -531,11 +537,11 @@ if __name__ == "__main__":
     config = {
         "ENV_NAME": EcoAntV1().name,
         "LR": 3e-4,
-        "NUM_ENVS": 10,
-        "TRAIN_FREQ": 1024,
-        "TOTAL_TIMESTEPS": 1e6,
+        "NUM_ENVS": 5,
+        "TRAIN_FREQ": 100,
+        "TOTAL_TIMESTEPS": int(1e6),
         "UPDATE_EPOCHS": 10,
-        "BATCH_SIZE": 256,
+        "BATCH_SIZE": 50,
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
@@ -545,54 +551,15 @@ if __name__ == "__main__":
         "ACTIVATION": "tanh",
         "ANNEAL_LR": True,
         "WANDB_MODE": "online",
-        "NUM_SEEDS": 1,
+        "NUM_SEEDS": 5,
         "SEED": 0,
     }
 
-    # rng = jax.random.PRNGKey(config["SEED"])
-    # rngs = jax.random.split(rng, config["NUM_SEEDS"] + 1)
-    # garch_rng = rngs[0]
-    # train_rngs = rngs[1:]
-    #
-    # garch_params = {
-    #    "BTC": GARCHParams(
-    #        mu=5e-3,
-    #        omega=1e-4,
-    #        alpha=jnp.array([0.165]),
-    #        beta=jnp.array([0.8]),
-    #        initial_price=1.0,
-    #    ),
-    #    "APPL": GARCHParams(
-    #        mu=3e-3,
-    #        omega=1e-5,
-    #        alpha=jnp.array([0.15]),
-    #        beta=jnp.array([0.5]),
-    #        initial_price=1.0,
-    #    ),
-    # }
-    # env = PortfolioOptimizationGARCH(
-    #    garch_rng,
-    #    garch_params,
-    #    num_samples=1000,
-    #    num_trajectories=config["NUM_ENVS"] * 1000,
-    # )
-    # env_params = env.default_params.replace(
-    #    max_steps=1000,
-    # )
-
     rng = jax.random.PRNGKey(config["SEED"])
     train_rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    env = BraxToGymnaxWrapper(env=EcoAntV1(battery_limit=50.0), episode_length=100)
+    brax_env = EcoAntV1(battery_limit=50.0)
+    env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = env.default_params
-
-    wandb.login(os.environ.get("WANDB_KEY"))
-    wandb.init(
-        project="EcoAnt",
-        tags=["PPO", config["ENV_NAME"].upper(), f"jax_{jax.__version__}"],
-        name=f"ppo_{config['ENV_NAME']}",
-        config=config,
-        mode=config["WANDB_MODE"],
-    )
 
     train_fn = make_train(
         env=env,
@@ -616,63 +583,15 @@ if __name__ == "__main__":
     train_vjit = jax.jit(jax.vmap(train_fn))
     runner_states, all_metrics = jax.block_until_ready(train_vjit(train_rngs))
 
-    # Log metrics from each parallel run separately to WandB
-    if config["WANDB_MODE"] == "online":
-        print("Logging metrics to WandB...")
-        num_updates = len(
-            all_metrics["batch_returns"][0]
-        )  # Get number of training updates
+    log.save_local(
+        algo_name="ppo",
+        env_name=brax_env.name,
+        metrics=all_metrics,
+    )
 
-        # Log each update step for all runs
-        for update_idx in range(num_updates):
-            log_dict = {}
-
-            # Log metrics for each parallel run
-            for run_idx in range(config["NUM_SEEDS"]):
-                run_prefix = f"run_{run_idx}"
-
-                # Extract metrics for this update and run
-                log_dict.update(
-                    {
-                        f"{run_prefix}/updates": all_metrics["updates"][run_idx][
-                            update_idx
-                        ],
-                        # f"{run_prefix}/dones": all_metrics["dones"][run_idx][
-                        #    update_idx
-                        # ],
-                        f"{run_prefix}/episode_return_dist": all_metrics["returns"][
-                            run_idx
-                        ][update_idx],
-                        f"{run_prefix}/episode_return": float(
-                            all_metrics["batch_returns"][run_idx][update_idx]
-                        ),
-                        f"{run_prefix}/episode_cost_return_dist": all_metrics[
-                            "cost_returns"
-                        ][run_idx][update_idx],
-                        f"{run_prefix}/episode_cost_return": float(
-                            all_metrics["batch_cost_returns"][run_idx][update_idx]
-                        ),
-                        f"{run_prefix}/actor_loss": float(
-                            all_metrics["actor_loss"][run_idx][update_idx]
-                        ),
-                        f"{run_prefix}/critic_loss": float(
-                            all_metrics["critic_loss"][run_idx][update_idx]
-                        ),
-                        f"{run_prefix}/entropy": float(
-                            all_metrics["entropy"][run_idx][update_idx]
-                        ),
-                        f"{run_prefix}/episode_lengths": float(
-                            all_metrics["episode_lengths"][run_idx][update_idx]
-                        ),
-                    }
-                )
-
-            # Log to WandB
-            wandb.log(log_dict)
-
-    # Save the best policy (from the first seed)
-    # runner_states is a tuple: (train_state, env_state, last_obs, rng)
-    # Each element is vmapped, so runner_states[0] gives all train_states
-    # best_train_state = jax.tree_util.tree_map(lambda x: x[0], runner_states[0])
-    # save_path = f"checkpoints/ppo_{config['ENV_NAME']}_seed{config['SEED']}"
-    # save_policy(best_train_state, save_path, config)
+    log.save_wandb(
+        project="EcoAnt",
+        algo_name="ppo",
+        env_name=brax_env.name,
+        metrics=all_metrics,
+    )
