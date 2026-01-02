@@ -501,7 +501,7 @@ def make_train(
             td_cost_return = (traj_batch.running_cost + cost_targets).mean()
 
             # Compute constraint violation
-            c_raw = traj_cost_return - cost_limit
+            c_raw = td_cost_return - cost_limit
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
             c = c_raw + new_margin
             # c = c / (train_freq + 1e-8)
@@ -650,7 +650,7 @@ def make_train(
             )
 
             sparse_battery_used = jnp.where(
-                is_terminal, 50 - traj_batch.info["battery"], 0
+                is_terminal, 500 - traj_batch.info["battery"], 0
             )
             episode_battery_used = sparse_battery_used.sum() / num_episodes
 
@@ -707,7 +707,7 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 5
 
-    brax_env = EcoAntV1(battery_limit=50.0)
+    brax_env = EcoAntV1(battery_limit=500.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = env.default_params
 
@@ -717,9 +717,9 @@ if __name__ == "__main__":
     train_fn = make_train(
         env,
         env_params,
-        num_steps=int(1e6),
+        num_steps=int(2e6),
         num_envs=5,
-        train_freq=1000,
+        train_freq=500,
         cost_limit=0.1,
         cost_gamma=0.999,
         margin_lr=0.0,
