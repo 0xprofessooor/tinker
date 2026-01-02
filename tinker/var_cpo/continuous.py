@@ -3,7 +3,6 @@
 Implements a VaR constrained CPO for safe reinforcement learning with chance constraints.
 """
 
-import os
 from typing import NamedTuple, Tuple, Callable
 import chex
 import distrax
@@ -12,11 +11,10 @@ import jax
 import jax.numpy as jnp
 import optax
 from gymnax.environments.environment import Environment, EnvParams, EnvState
-import wandb
 
 from safenax.wrappers import LogWrapper, BraxToGymnaxWrapper
 from safenax import EcoAntV2
-from tinker import norm
+from tinker import norm, log
 
 
 class ActorCritic(nnx.Module):
@@ -606,11 +604,8 @@ def make_train(
                 is_terminal, terminal_aug_costs, 0.0
             )  # (train_freq, num_envs)
 
-            episode_cost_return = sparse_costs.sum() / num_episodes
-            episode_aug_cost_return = sparse_aug_costs.sum() / num_episodes
-
-            episode_sq_cost_return = (sparse_costs**2).sum() / num_episodes
-            episode_cost_var = episode_sq_cost_return - episode_cost_return**2
+            traj_cost_return = sparse_costs.sum() / num_episodes
+            traj_aug_cost_return = sparse_aug_costs.sum() / num_episodes
 
             # Compute empirical probability of exceeding VaR threshold
             exceeds_threshold = (sparse_costs > var_threshold) & is_terminal
@@ -619,14 +614,14 @@ def make_train(
 
             # Compute constraint limit
             td_cost_return = (traj_batch.running_cost + cost_targets).mean()
-            is_mean_unsafe = episode_cost_return > var_threshold
-            aug_cost_limit = (1 / var_probability) * (episode_cost_return**2) + (
+            is_mean_unsafe = td_cost_return > var_threshold
+            aug_cost_limit = (1 / var_probability) * (td_cost_return**2) + (
                 var_threshold**2
             )
             # Compute constraint violation
             td_aug_cost_return = (traj_batch.running_aug_cost + aug_cost_targets).mean()
-            c_cheb = episode_aug_cost_return - aug_cost_limit
-            c_linear = episode_cost_return - var_threshold
+            c_cheb = td_aug_cost_return - aug_cost_limit
+            c_linear = td_cost_return - var_threshold
             c_raw = jax.lax.select(is_mean_unsafe, c_linear, c_cheb)
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
             c = c_raw + new_margin
@@ -651,7 +646,7 @@ def make_train(
             flat_aug_cost_grads, _ = jax.flatten_util.ravel_pytree(aug_cost_grads)
             b_cheb = (
                 flat_aug_cost_grads
-                - (2 * episode_cost_return / (var_probability + 1e-8)) * flat_cost_grads
+                - (2 * td_cost_return / (var_probability + 1e-8)) * flat_cost_grads
             )
             b = jax.lax.select(is_mean_unsafe, flat_cost_grads, b_cheb)
 
@@ -757,30 +752,22 @@ def make_train(
             )
 
             metrics = {
-                "num_updates": cpo_state.num_updates,
-                "policy_loss": old_policy_loss,
-                "cost_loss": old_cost_loss,
-                "aug_cost_loss": old_aug_cost_loss,
-                "value_loss": value_losses.mean(),
-                "cost_value_loss": cost_value_losses.mean(),
-                "aug_cost_value_loss": aug_cost_value_losses.mean(),
                 "kl": final_kl,
                 "constraint_violation": c,
                 "cheb_constraint_violation": c_cheb,
                 "margin": new_margin,
-                "episode_cost_return": episode_cost_return,
+                "traj_cost_return": traj_cost_return,
                 "td_cost_return": td_cost_return,
-                "episode_aug_cost_return": episode_aug_cost_return,
+                "traj_aug_cost_return": traj_aug_cost_return,
                 "td_aug_cost_return": td_aug_cost_return,
                 "empirical_var_probability": empirical_var_probability,
                 "num_exceedances": num_exceedances,
                 "optim_case": optim_case,
                 "episode_return": traj_batch.info["returned_episode_returns"].mean(),
-                "info_cost_returns": traj_batch.info[
+                "episode_cost_return": traj_batch.info[
                     "returned_episode_cost_returns"
                 ].mean(),
                 "episode_length": traj_batch.info["returned_episode_lengths"].mean(),
-                "info_cost_dist": traj_batch.info["returned_episode_cost_returns"],
                 "accepted": accepted.mean(),
                 "is_mean_unsafe": is_mean_unsafe.mean(),
             }
@@ -822,24 +809,12 @@ def make_train(
 
 if __name__ == "__main__":
     SEED = 0
-    NUM_SEEDS = 1
-    WANDB = "online"
+    NUM_SEEDS = 5
     PROJECT_NAME = "EcoAnt"
 
-    rng = jax.random.PRNGKey(SEED)
-    train_rngs = jax.random.split(rng, NUM_SEEDS)
-
-    brax_env = EcoAntV2(battery_limit=50.0)
-    env = BraxToGymnaxWrapper(env=brax_env, episode_length=100)
+    brax_env = EcoAntV2(battery_limit=500.0)
+    env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = env.default_params
-
-    wandb.login(os.environ.get("WANDB_KEY"))
-    wandb.init(
-        project=PROJECT_NAME,
-        tags=["VAR-CPO", f"{brax_env.name.upper()}", f"jax_{jax.__version__}"],
-        name=f"varcpo_{brax_env.name}",
-        mode=WANDB,
-    )
 
     rng = jax.random.PRNGKey(SEED)
     rngs = jax.random.split(rng, NUM_SEEDS)
@@ -847,50 +822,26 @@ if __name__ == "__main__":
     train_fn = make_train(
         env,
         env_params,
-        num_steps=int(1e6),
-        num_envs=10,
-        train_freq=1000,
+        num_steps=int(2e6),
+        num_envs=5,
+        train_freq=100,
         var_probability=0.1,
-        var_threshold=50.0,
+        var_threshold=500.0,
         margin_lr=0.0,
         anneal_lr=True,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
 
-    if WANDB == "online":
-        # Define metrics to log - edit this list to add/remove metrics
-        metrics_to_log = [
-            "episode_return",
-            "info_cost_returns",
-            "info_cost_dist",
-            "policy_loss",
-            "cost_loss",
-            "value_loss",
-            "cost_value_loss",
-            "episode_length",
-            "kl",
-            "constraint_violation",
-            "cheb_constraint_violation",
-            "td_cost_return",
-            "episode_cost_return",
-            "td_aug_cost_return",
-            "episode_aug_cost_return",
-            "empirical_var_probability",
-            "num_exceedances",
-            "is_mean_unsafe",
-            "accepted",
-        ]
+    log.save_local(
+        algo_name="var_cpo",
+        env_name=brax_env.name,
+        metrics=all_metrics,
+    )
 
-        num_steps = len(all_metrics["num_updates"][0])
-        for update_idx in range(num_steps):
-            log_dict = {}
-
-            for run_idx in range(NUM_SEEDS):
-                run_prefix = f"run_{run_idx}"
-                for metric_name in metrics_to_log:
-                    log_dict[f"{run_prefix}/{metric_name}"] = all_metrics[metric_name][
-                        run_idx
-                    ][update_idx]
-
-            wandb.log(log_dict)
+    log.save_wandb(
+        project=PROJECT_NAME,
+        algo_name="var_cpo",
+        env_name=brax_env.name,
+        metrics=all_metrics,
+    )
