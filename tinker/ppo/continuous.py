@@ -401,7 +401,7 @@ def make_train(
             is_terminal = traj_batch.done
             num_episodes = jnp.maximum(is_terminal.sum(), 1.0)
             sparse_battery_used = jnp.where(
-                is_terminal, 50 - traj_batch.info["battery"], 0
+                is_terminal, 500 - traj_batch.info["battery"], 0
             )
             episode_battery_used = sparse_battery_used.sum() / num_episodes
 
@@ -539,7 +539,7 @@ if __name__ == "__main__":
         "LR": 3e-4,
         "NUM_ENVS": 5,
         "TRAIN_FREQ": 500,
-        "TOTAL_TIMESTEPS": int(1e6),
+        "TOTAL_TIMESTEPS": int(2e6),
         "UPDATE_EPOCHS": 10,
         "BATCH_SIZE": 250,
         "GAMMA": 0.99,
@@ -557,7 +557,7 @@ if __name__ == "__main__":
 
     rng = jax.random.PRNGKey(config["SEED"])
     train_rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    brax_env = EcoAntV1(battery_limit=50.0)
+    brax_env = EcoAntV1(battery_limit=500.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = env.default_params
 
