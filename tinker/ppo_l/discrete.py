@@ -268,7 +268,7 @@ def make_train(
                             ).mean()
                         )
 
-                        total_value_loss = val_r_loss + val_c_loss
+                        total_value_loss = val_r_loss  # + val_c_loss
 
                         # ACTOR LOSS
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
