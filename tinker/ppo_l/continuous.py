@@ -443,9 +443,9 @@ if __name__ == "__main__":
         "LR": 3e-4,
         "NUM_ENVS": 5,
         "TRAIN_FREQ": 500,
-        "TOTAL_TIMESTEPS": int(1e6),
+        "TOTAL_TIMESTEPS": int(2e6),
         "UPDATE_EPOCHS": 10,
-        "BATCH_SIZE": 250,
+        "BATCH_SIZE": 500,
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
@@ -457,14 +457,14 @@ if __name__ == "__main__":
         "NUM_SEEDS": 5,
         "SEED": 0,
         # PPO-L Configs
-        "COST_LIMIT": 50.0,  # Target max cost per episode
+        "COST_LIMIT": 500.0,  # Target max cost per episode
         "LAG_LR": 0.1,  # Learning rate for lambda
         "INIT_LAMBDA": 0.5,
     }
 
     rng = jax.random.PRNGKey(config["SEED"])
     train_rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    brax_env = EcoAntV1(battery_limit=50.0)
+    brax_env = EcoAntV1(battery_limit=500.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = env.default_params
 
