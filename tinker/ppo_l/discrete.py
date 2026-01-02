@@ -410,7 +410,7 @@ if __name__ == "__main__":
         # PPO-L Specifics
         "COST_LIMIT": 15.0,
         "LAG_LR": 0.02,
-        "INIT_LAMBDA": 0.5,
+        "INIT_LAMBDA": 0.0,
     }
 
     env = FrozenLakeV2(
