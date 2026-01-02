@@ -5,7 +5,6 @@ Based on the paper: https://arxiv.org/abs/1705.10528
 Implements CPO for safe reinforcement learning with cost constraints.
 """
 
-import os
 from typing import NamedTuple, Tuple, Callable
 import chex
 import distrax
@@ -14,11 +13,10 @@ import jax
 import jax.numpy as jnp
 import optax
 from gymnax.environments.environment import Environment, EnvParams, EnvState
-import wandb
 
 from safenax.wrappers import BraxToGymnaxWrapper, LogWrapper
 from safenax import EcoAntV1
-from tinker import norm
+from tinker import norm, log
 
 
 class ActorCritic(nnx.Module):
@@ -499,10 +497,11 @@ def make_train(
                 is_terminal, terminal_costs, 0.0
             )  # (train_freq, num_envs)
 
-            episode_cost_return = sparse_costs.sum() / num_episodes
+            traj_cost_return = sparse_costs.sum() / num_episodes
+            td_cost_return = (traj_batch.running_cost + cost_targets).mean()
 
             # Compute constraint violation
-            c_raw = episode_cost_return - cost_limit
+            c_raw = td_cost_return - cost_limit
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
             c = c_raw + new_margin
             # c = c / (train_freq + 1e-8)
@@ -650,19 +649,24 @@ def make_train(
                 _update_critic, cpo_state, None, critic_epochs
             )
 
+            sparse_battery_used = jnp.where(
+                is_terminal, 50 - traj_batch.info["battery"], 0
+            )
+            episode_battery_used = sparse_battery_used.sum() / num_episodes
+
             metrics = {
-                "num_updates": cpo_state.num_updates,
-                "policy_loss": old_policy_loss,
-                "cost_loss": old_cost_loss,
-                "value_loss": value_losses.mean(),
-                "cost_value_loss": cost_value_losses.mean(),
                 "kl": final_kl,
                 "constraint_violation": c,
                 "margin": new_margin,
-                "episode_cost_return": episode_cost_return,
+                "traj_cost_return": traj_cost_return,
+                "td_cost_return": td_cost_return,
                 "optim_case": optim_case,
                 "episode_return": traj_batch.info["returned_episode_returns"].mean(),
+                "episode_cost_return": traj_batch.info[
+                    "returned_episode_cost_returns"
+                ].mean(),
                 "episode_length": traj_batch.info["returned_episode_lengths"].mean(),
+                "episode_battery_used": episode_battery_used,
                 "accepted": accepted,
             }
 
@@ -701,22 +705,11 @@ def make_train(
 
 if __name__ == "__main__":
     SEED = 0
-    NUM_SEEDS = 1
-    WANDB = "online"
+    NUM_SEEDS = 5
 
-    rng = jax.random.PRNGKey(SEED)
-    train_rngs = jax.random.split(rng, NUM_SEEDS)
     brax_env = EcoAntV1(battery_limit=50.0)
-    env = BraxToGymnaxWrapper(env=brax_env, episode_length=100)
+    env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = env.default_params
-
-    wandb.login(os.environ.get("WANDB_KEY"))
-    wandb.init(
-        project="FrozenLake",
-        tags=["CPO", f"{env.name.upper()}", f"jax_{jax.__version__}"],
-        name=f"cpo_{env.name}",
-        mode=WANDB,
-    )
 
     rng = jax.random.PRNGKey(SEED)
     rngs = jax.random.split(rng, NUM_SEEDS)
@@ -725,59 +718,25 @@ if __name__ == "__main__":
         env,
         env_params,
         num_steps=int(1e6),
-        num_envs=10,
-        train_freq=1000,
+        num_envs=5,
+        train_freq=200,
         cost_limit=0.1,
+        cost_gamma=0.999,
         margin_lr=0.0,
         anneal_lr=True,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
 
-    if WANDB == "online":
-        num_steps = len(all_metrics["num_updates"][0])
-        for update_idx in range(num_steps):
-            log_dict = {}
+    log.save_local(
+        algo_name="cpo",
+        env_name=brax_env.name,
+        metrics=all_metrics,
+    )
 
-            for run_idx in range(NUM_SEEDS):
-                run_prefix = f"run_{run_idx}"
-                log_dict.update(
-                    {
-                        f"{run_prefix}/num_updates": all_metrics["num_updates"][
-                            run_idx
-                        ][update_idx],
-                        f"{run_prefix}/episode_return": all_metrics["episode_return"][
-                            run_idx
-                        ][update_idx],
-                        f"{run_prefix}/policy_loss": all_metrics["policy_loss"][
-                            run_idx
-                        ][update_idx],
-                        f"{run_prefix}/cost_loss": all_metrics["cost_loss"][run_idx][
-                            update_idx
-                        ],
-                        f"{run_prefix}/value_loss": all_metrics["value_loss"][run_idx][
-                            update_idx
-                        ],
-                        f"{run_prefix}/cost_value_loss": all_metrics["cost_value_loss"][
-                            run_idx
-                        ][update_idx],
-                        f"{run_prefix}/episode_length": all_metrics["episode_length"][
-                            run_idx
-                        ][update_idx],
-                        f"{run_prefix}/kl": all_metrics["kl"][run_idx][update_idx],
-                        f"{run_prefix}/constraint_violation": all_metrics[
-                            "constraint_violation"
-                        ][run_idx][update_idx],
-                        f"{run_prefix}/episode_cost_return": all_metrics[
-                            "episode_cost_return"
-                        ][run_idx][update_idx],
-                        f"{run_prefix}/margin": all_metrics["margin"][run_idx][
-                            update_idx
-                        ],
-                        f"{run_prefix}/accepted": all_metrics["accepted"][run_idx][
-                            update_idx
-                        ],
-                    }
-                )
-
-            wandb.log(log_dict)
+    log.save_wandb(
+        project="EcoAnt",
+        algo_name="cpo",
+        env_name=brax_env.name,
+        metrics=all_metrics,
+    )
