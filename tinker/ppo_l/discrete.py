@@ -409,7 +409,7 @@ if __name__ == "__main__":
         "SEED": 0,
         # PPO-L Specifics
         "COST_LIMIT": 15.0,
-        "LAG_LR": 0.02,
+        "LAG_LR": 0.0,
         "INIT_LAMBDA": 0.0,
     }
 
