@@ -454,7 +454,7 @@ if __name__ == "__main__":
         "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "tanh",
         "ANNEAL_LR": True,
-        "NUM_SEEDS": 1,
+        "NUM_SEEDS": 5,
         "SEED": 0,
         # PPO-L Configs
         "COST_LIMIT": 50.0,  # Target max cost per episode
