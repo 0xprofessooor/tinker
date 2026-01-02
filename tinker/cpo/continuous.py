@@ -501,7 +501,7 @@ def make_train(
             td_cost_return = (traj_batch.running_cost + cost_targets).mean()
 
             # Compute constraint violation
-            c_raw = td_cost_return - cost_limit
+            c_raw = traj_cost_return - cost_limit
             new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
             c = c_raw + new_margin
             # c = c / (train_freq + 1e-8)
@@ -719,7 +719,7 @@ if __name__ == "__main__":
         env_params,
         num_steps=int(1e6),
         num_envs=5,
-        train_freq=500,
+        train_freq=1000,
         cost_limit=0.1,
         cost_gamma=0.999,
         margin_lr=0.0,
