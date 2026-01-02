@@ -541,7 +541,7 @@ if __name__ == "__main__":
         "TRAIN_FREQ": 500,
         "TOTAL_TIMESTEPS": int(2e6),
         "UPDATE_EPOCHS": 10,
-        "BATCH_SIZE": 250,
+        "BATCH_SIZE": 500,
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
