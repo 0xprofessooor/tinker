@@ -729,14 +729,14 @@ if __name__ == "__main__":
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
 
     log.save_local(
-        algo_name="cpo500",
+        algo_name="cpo",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
 
     log.save_wandb(
         project="EcoAnt",
-        algo_name="cpo500",
+        algo_name="cpo",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
