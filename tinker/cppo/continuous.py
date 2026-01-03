@@ -341,8 +341,8 @@ def make_train(
             cvar_loss = jnp.mean(jnp.maximum(0.0, all_check_vals - cppo_state["nu"]))
             cvar_est = cppo_state["nu"] + (1.0 / (1.0 - confidence)) * cvar_loss
 
-            # Update Lambda: Increase if Risk (CVaR) > cvar_limit
-            new_lam = cppo_state["lam"] + lam_lr * (cvar_est - cvar_limit)
+            # Update Lambda: Based on Nu vs Limit
+            new_lam = cppo_state["lam"] + lam_lr * (cppo_state["nu"] - cvar_limit)
             new_lam = jnp.maximum(0.0, new_lam)
 
             # Update Nu: Track Moving Average (Heuristic from original repo)
