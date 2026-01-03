@@ -405,7 +405,7 @@ if __name__ == "__main__":
         env,
         env_params,
         num_steps=int(2e6),
-        train_freq=1000,
+        train_freq=500,
         num_envs=5,
         confidence=0.9,
         cvar_limit=500.0,
