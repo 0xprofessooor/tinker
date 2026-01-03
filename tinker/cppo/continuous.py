@@ -93,7 +93,7 @@ def make_train(
     # CPPO Hyperparameters
     confidence: float,
     cvar_limit: float,
-    lam_lr: float = 1e-2,
+    lam_lr: float = 1e-3,
     nu_start: float = 0.0,
     lam_start: float = 0.5,
     nu_delay: float = 0.8,
