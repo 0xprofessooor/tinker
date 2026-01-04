@@ -342,7 +342,7 @@ def make_train(
                         )
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                    total_loss, grads = grad_fn(
+                    (total_loss, aux_losses), grads = grad_fn(
                         train_state.params,
                         traj_batch,
                         advantages,
@@ -350,14 +350,14 @@ def make_train(
                         cost_targets,
                     )
                     train_state = train_state.apply_gradients(grads=grads)
-                    return train_state, total_loss
+                    return train_state, aux_losses
 
-                train_state, total_loss = jax.lax.scan(
+                train_state, aux_losses = jax.lax.scan(
                     _update_minibatch,
                     update_state,
                     minibatch,
                 )
-                return train_state, total_loss
+                return train_state, aux_losses
 
             # Prepare batch
             minibatch = (traj_batch, advantages, targets, cost_targets)
@@ -409,10 +409,10 @@ def make_train(
             empirical_var_probability = num_exceedances / num_episodes
 
             metric = dict(
-                value_loss=total_loss[:, :, 1, 0].mean(),
-                cost_value_loss=total_loss[:, :, 1, 1].mean(),
-                policy_loss=total_loss[:, :, 1, 2].mean(),
-                entropy=total_loss[:, :, 1, 3].mean(),
+                value_loss=total_loss[:, :, 0].mean(),
+                cost_value_loss=total_loss[:, :, 1].mean(),
+                policy_loss=total_loss[:, :, 2].mean(),
+                entropy=total_loss[:, :, 3].mean(),
                 nu=cppo_state["nu"],
                 lam=cppo_state["lam"],
                 avg_cost_return=avg_cost,
