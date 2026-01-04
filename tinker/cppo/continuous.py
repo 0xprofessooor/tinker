@@ -287,6 +287,11 @@ def make_train(
                     unroll=16,
                 )
 
+                advantages = (advantages - advantages.mean()) / (
+                    advantages.std() + 1e-8
+                )
+                cost_advantages = cost_advantages - cost_advantages.mean()
+
                 # CPPO Policy Update: Advantage = Reward Adv - Cost Penalty
                 modified_advantages = advantages - val_updates
 
@@ -439,7 +444,7 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 5
 
-    brax_env = EcoAntV2(battery_limit=50.0)
+    brax_env = EcoAntV2(battery_limit=500.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = env.default_params
 
@@ -453,7 +458,10 @@ if __name__ == "__main__":
         train_freq=1000,
         num_envs=5,
         confidence=0.9,
-        cvar_limit=50.0,
+        cvar_limit=500.0,
+        delay=0.0024,
+        cvar_clip_ratio=0.018,
+        nu_delay=0.2,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
@@ -463,14 +471,14 @@ if __name__ == "__main__":
     all_metrics["runtime"] = runtime
 
     log.save_local(
-        algo_name="cppo50",
+        algo_name="cppo",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
 
     log.save_wandb(
         project="EcoAnt",
-        algo_name="cppo50",
+        algo_name="cppo",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
