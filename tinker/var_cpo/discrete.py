@@ -856,7 +856,6 @@ if __name__ == "__main__":
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
     runtime = time.perf_counter() - start_time
     print(f"Runtime: {runtime:.2f}s")
-    all_metrics["runtime"] = runtime
 
     metrics_to_log = [
         "episode_return",
