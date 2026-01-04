@@ -13,6 +13,7 @@ import distrax
 from safenax import EcoAntV2
 from safenax.wrappers import BraxToGymnaxWrapper, LogWrapper
 from tinker import log, norm
+import time
 
 
 class ActorCritic(nn.Module):
@@ -455,7 +456,11 @@ if __name__ == "__main__":
         cvar_limit=50.0,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
+    start_time = time.perf_counter()
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
+    runtime = time.perf_counter() - start_time
+    print(f"Runtime: {runtime:.2f}s")
+    all_metrics["runtime"] = runtime
 
     log.save_local(
         algo_name="cppo50",

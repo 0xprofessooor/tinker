@@ -1,12 +1,11 @@
 """Proximal Policy Optimization (PPO) with Categorical Policy."""
 
-import os
 from typing import NamedTuple, Tuple
 
 import chex
 import distrax
 import flax.linen as nn
-import gymnax
+import time
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -468,7 +467,11 @@ if __name__ == "__main__":
 
     # JIT and vmap the training function for parallel execution
     train_vjit = jax.jit(jax.vmap(train_fn))
+    start_time = time.perf_counter()
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
+    runtime = time.perf_counter() - start_time
+    print(f"Runtime: {runtime:.2f}s")
+    all_metrics["runtime"] = runtime
 
     metrics_to_log = [
         "actor_loss",

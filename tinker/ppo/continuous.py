@@ -18,6 +18,7 @@ from gymnax.environments.environment import Environment, EnvParams
 from safenax import EcoAntV1
 from safenax.wrappers import BraxToGymnaxWrapper, LogWrapper
 from tinker import norm, log
+import time
 
 
 class ActorCritic(nn.Module):
@@ -577,7 +578,11 @@ if __name__ == "__main__":
     )
 
     train_vjit = jax.jit(jax.vmap(train_fn))
+    start_time = time.perf_counter()
     runner_states, all_metrics = jax.block_until_ready(train_vjit(train_rngs))
+    runtime = time.perf_counter() - start_time
+    print(f"Runtime: {runtime:.2f}s")
+    all_metrics["runtime"] = runtime
 
     log.save_local(
         algo_name="ppo",

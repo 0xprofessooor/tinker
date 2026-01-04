@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import optax
 from gymnax.environments import spaces
 from gymnax.environments.environment import Environment, EnvParams, EnvState
+import time
 
 from safenax.wrappers import LogWrapper, BraxToGymnaxWrapper
 from safenax import FrozenLakeV2
@@ -851,7 +852,11 @@ if __name__ == "__main__":
         anneal_lr=True,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
+    start_time = time.perf_counter()
     runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
+    runtime = time.perf_counter() - start_time
+    print(f"Runtime: {runtime:.2f}s")
+    all_metrics["runtime"] = runtime
 
     metrics_to_log = [
         "episode_return",
