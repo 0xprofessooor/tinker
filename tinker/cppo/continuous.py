@@ -79,7 +79,7 @@ class Transition(NamedTuple):
     cost: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
-    raw_obs: jnp.ndarray
+    next_obs: jnp.ndarray
     info: jnp.ndarray
     val_update: jnp.ndarray
     check_val: jnp.ndarray
@@ -207,7 +207,7 @@ def make_train(
                     cost,
                     log_prob,
                     normalized_obs,
-                    last_obs,
+                    obsv,
                     info,
                     val_update,
                     check_val,
@@ -231,8 +231,8 @@ def make_train(
                 runner_state
             )
 
-            batch_raw_obs = traj_batch.raw_obs.reshape(
-                -1, *traj_batch.raw_obs.shape[2:]
+            batch_raw_obs = traj_batch.next_obs.reshape(
+                -1, *traj_batch.next_obs.shape[2:]
             )
             obs_norm_state = norm.welford_update(obs_norm_state, batch_raw_obs)
 
