@@ -107,6 +107,8 @@ def make_train(
     update_epochs: int = 4,
     gamma: float = 0.99,
     gae_lambda: float = 0.97,
+    value_coeff: float = 0.5,
+    cost_value_coeff: float = 0.5,
     clip_eps: float = 0.2,
     max_grad_norm: float = 0.5,
 ):
@@ -327,7 +329,11 @@ def make_train(
                         entropy = pi.entropy().mean()
 
                         # Total Loss
-                        total_loss = loss_actor + value_loss + cost_value_loss
+                        total_loss = (
+                            loss_actor
+                            + value_coeff * value_loss
+                            + cost_value_coeff * cost_value_loss
+                        )
                         return total_loss, (
                             value_loss,
                             cost_value_loss,
@@ -383,7 +389,7 @@ def make_train(
             new_lam = cppo_state["lam"] + lam_lr * (cppo_state["nu"] - cvar_limit)
             new_lam = jnp.maximum(0.0, new_lam)
 
-            # Update Nu: Track Moving Average (Heuristic from original repo)
+            # Update Nu: Track Moving Average
             avg_cost = jnp.mean(all_check_vals)
             new_nu = avg_cost * nu_delay
 
@@ -403,7 +409,10 @@ def make_train(
             empirical_var_probability = num_exceedances / num_episodes
 
             metric = dict(
-                entropy=total_loss[1][3],
+                value_loss=total_loss[:, :, 1, 0].mean(),
+                cost_value_loss=total_loss[:, :, 1, 1].mean(),
+                policy_loss=total_loss[:, :, 1, 2].mean(),
+                entropy=total_loss[:, :, 1, 3].mean(),
                 nu=cppo_state["nu"],
                 lam=cppo_state["lam"],
                 avg_cost_return=avg_cost,
@@ -439,7 +448,7 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 5
 
-    brax_env = EcoAntV2(battery_limit=50.0)
+    brax_env = EcoAntV2(battery_limit=500.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = env.default_params
 
@@ -453,7 +462,7 @@ if __name__ == "__main__":
         train_freq=1000,
         num_envs=5,
         confidence=0.9,
-        cvar_limit=50.0,
+        cvar_limit=500.0,
         delay=0.0024,
         cvar_clip_ratio=0.018,
         nu_delay=0.2,
@@ -465,14 +474,14 @@ if __name__ == "__main__":
     print(f"Runtime: {runtime:.2f}s")
 
     log.save_local(
-        algo_name="cppo50",
+        algo_name="cppo500",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
 
     log.save_wandb(
         project="EcoAnt",
-        algo_name="cppo50",
+        algo_name="cppo500",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
