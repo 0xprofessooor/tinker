@@ -1,4 +1,4 @@
-"""WIP
+"""
 Constrained Policy Optimization (CPO)
 
 Based on the paper: https://arxiv.org/abs/1705.10528
