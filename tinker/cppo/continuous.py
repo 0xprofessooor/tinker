@@ -12,7 +12,7 @@ from flax.training.train_state import TrainState
 import distrax
 from safenax import EcoAntV2
 from safenax.wrappers import BraxToGymnaxWrapper, LogWrapper
-from tinker import log
+from tinker import log, norm
 
 
 class ActorCritic(nn.Module):
@@ -79,6 +79,7 @@ class Transition(NamedTuple):
     cost: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
+    raw_obs: jnp.ndarray
     info: jnp.ndarray
     val_update: jnp.ndarray
     check_val: jnp.ndarray
@@ -104,7 +105,7 @@ def make_train(
     num_minibatches: int = 4,
     update_epochs: int = 4,
     gamma: float = 0.99,
-    gae_lambda: float = 0.95,
+    gae_lambda: float = 0.97,
     clip_eps: float = 0.2,
     max_grad_norm: float = 0.5,
 ):
@@ -132,6 +133,10 @@ def make_train(
         reset_rng = jax.random.split(_rng, num_envs)
         obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
 
+        # INIT OBSERVATION NORMALIZATION
+        obs_norm_state = norm.init(env.observation_space(env_params).shape)
+        obs_norm_state = norm.welford_update(obs_norm_state, obsv)
+
         cppo_state = {
             "nu": jnp.array(nu_start, dtype=jnp.float32),
             "lam": jnp.array(lam_start, dtype=jnp.float32),
@@ -139,14 +144,23 @@ def make_train(
         }
 
         def _update_step(runner_state, unused):
-            train_state, env_state, last_obs, rng, cppo_state = runner_state
+            train_state, env_state, obs_norm_state, last_obs, rng, cppo_state = (
+                runner_state
+            )
 
             # --- 1. COLLECT TRAJECTORIES ---
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, rng, cppo_state = runner_state
+                train_state, env_state, obs_norm_state, last_obs, rng, cppo_state = (
+                    runner_state
+                )
 
                 rng, _rng = jax.random.split(rng)
-                pi, value, cost_value = network.apply(train_state.params, last_obs)
+                normalized_obs = jax.vmap(norm.normalize, in_axes=(None, 0))(
+                    obs_norm_state, last_obs
+                )
+                pi, value, cost_value = network.apply(
+                    train_state.params, normalized_obs
+                )
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
 
@@ -192,21 +206,44 @@ def make_train(
                     reward,
                     cost,
                     log_prob,
+                    normalized_obs,
                     last_obs,
                     info,
                     val_update,
                     check_val,
                 )
-                runner_state = (train_state, env_state, obsv, rng, cppo_state)
+                runner_state = (
+                    train_state,
+                    env_state,
+                    obs_norm_state,
+                    obsv,
+                    rng,
+                    cppo_state,
+                )
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, train_freq
             )
 
+            # UPDATE OBSERVATION NORMALIZATION
+            train_state, env_state, obs_norm_state, last_obs, rng, cppo_state = (
+                runner_state
+            )
+
+            batch_raw_obs = traj_batch.raw_obs.reshape(
+                -1, *traj_batch.raw_obs.shape[2:]
+            )
+            obs_norm_state = norm.welford_update(obs_norm_state, batch_raw_obs)
+
+            normalized_last_obs = jax.vmap(norm.normalize, in_axes=(None, 0))(
+                obs_norm_state, last_obs
+            )
+
             # --- 2. CALCULATE ADVANTAGE ---
-            train_state, env_state, last_obs, rng, cppo_state = runner_state
-            _, last_val, last_cost_val = network.apply(train_state.params, last_obs)
+            _, last_val, last_cost_val = network.apply(
+                train_state.params, normalized_last_obs
+            )
 
             def _calculate_gae(traj_batch, last_val, last_cost_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -376,11 +413,18 @@ def make_train(
                 ].mean(),
                 empirical_var_probability=empirical_var_probability,
             )
-            runner_state = (train_state, env_state, last_obs, rng, cppo_state)
+            runner_state = (
+                train_state,
+                env_state,
+                obs_norm_state,
+                last_obs,
+                rng,
+                cppo_state,
+            )
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, _rng, cppo_state)
+        runner_state = (train_state, env_state, obs_norm_state, obsv, _rng, cppo_state)
 
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, num_updates
@@ -392,7 +436,7 @@ def make_train(
 
 if __name__ == "__main__":
     SEED = 0
-    NUM_SEEDS = 1
+    NUM_SEEDS = 5
 
     brax_env = EcoAntV2(battery_limit=500.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
@@ -405,7 +449,7 @@ if __name__ == "__main__":
         env,
         env_params,
         num_steps=int(2e6),
-        train_freq=500,
+        train_freq=1000,
         num_envs=5,
         confidence=0.9,
         cvar_limit=500.0,

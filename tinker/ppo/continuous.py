@@ -153,6 +153,7 @@ class Transition(NamedTuple):
     reward: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
+    next_obs: jnp.ndarray
     info: jnp.ndarray
 
 
@@ -233,6 +234,7 @@ def make_train(
 
         # INIT OBSERVATION NORMALIZATION
         obs_norm_state = norm.init(env.observation_space(env_params).shape)
+        obs_norm_state = norm.welford_update(obs_norm_state, obsv)
 
         # TRAIN LOOP
         def _update_step(runner_state, _):
@@ -256,7 +258,7 @@ def make_train(
                     env.step, in_axes=(0, 0, 0, None)
                 )(rng_step, env_state, action, env_params)
                 transition = Transition(
-                    done, action, value, reward, log_prob, last_obs, info
+                    done, action, value, reward, log_prob, normalized_obs, obsv, info
                 )
                 runner_state = (train_state, env_state, obs_norm_state, obsv, rng)
                 return runner_state, transition
@@ -269,20 +271,14 @@ def make_train(
             train_state, env_state, obs_norm_state, last_obs, rng = runner_state
 
             # Flatten batch: (train_freq, num_envs, obs_dim) -> (train_freq * num_envs, obs_dim)
-            batch_obs = traj_batch.obs.reshape(-1, *traj_batch.obs.shape[2:])
-            obs_norm_state = norm.welford_update(obs_norm_state, batch_obs)
+            batch_raw_obs = traj_batch.next_obs.reshape(
+                -1, *traj_batch.next_obs.shape[2:]
+            )
+            obs_norm_state = norm.welford_update(obs_norm_state, batch_raw_obs)
 
-            # Normalize all observations in the trajectory batch
-            # Shape: (train_freq, num_envs, obs_dim)
-            normalized_traj_obs = jax.vmap(
-                jax.vmap(norm.normalize, in_axes=(None, 0)), in_axes=(None, 0)
-            )(obs_norm_state, traj_batch.obs)
             normalized_last_obs = jax.vmap(norm.normalize, in_axes=(None, 0))(
                 obs_norm_state, last_obs
             )
-
-            # Replace observations in traj_batch with normalized ones
-            traj_batch = traj_batch._replace(obs=normalized_traj_obs)
 
             # CALCULATE ADVANTAGE
             _, last_val = network.apply(train_state.params, normalized_last_obs)
