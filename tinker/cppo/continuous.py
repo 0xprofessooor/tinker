@@ -409,10 +409,10 @@ def make_train(
             empirical_var_probability = num_exceedances / num_episodes
 
             metric = dict(
-                value_loss=aux_losses[:, :, 0].mean(),
-                cost_value_loss=aux_losses[:, :, 1].mean(),
-                policy_loss=aux_losses[:, :, 2].mean(),
-                entropy=aux_losses[:, :, 3].mean(),
+                value_loss=aux_losses[0].mean(),
+                cost_value_loss=aux_losses[1].mean(),
+                policy_loss=aux_losses[2].mean(),
+                entropy=aux_losses[3].mean(),
                 nu=cppo_state["nu"],
                 lam=cppo_state["lam"],
                 avg_cost_return=avg_cost,
