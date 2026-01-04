@@ -374,7 +374,7 @@ def make_train(
                 minibatch,
             )
 
-            train_state, total_loss = jax.lax.scan(
+            train_state, aux_losses = jax.lax.scan(
                 _update_epoch, train_state, None, update_epochs
             )
 
@@ -409,10 +409,10 @@ def make_train(
             empirical_var_probability = num_exceedances / num_episodes
 
             metric = dict(
-                value_loss=total_loss[:, :, 0].mean(),
-                cost_value_loss=total_loss[:, :, 1].mean(),
-                policy_loss=total_loss[:, :, 2].mean(),
-                entropy=total_loss[:, :, 3].mean(),
+                value_loss=aux_losses[:, :, 0].mean(),
+                cost_value_loss=aux_losses[:, :, 1].mean(),
+                policy_loss=aux_losses[:, :, 2].mean(),
+                entropy=aux_losses[:, :, 3].mean(),
                 nu=cppo_state["nu"],
                 lam=cppo_state["lam"],
                 avg_cost_return=avg_cost,
