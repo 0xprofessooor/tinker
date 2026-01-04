@@ -429,7 +429,7 @@ def make_train(
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, num_updates
         )
-        return {"runner_state": runner_state, "metrics": metrics}
+        return runner_state, metrics
 
     return train
 
