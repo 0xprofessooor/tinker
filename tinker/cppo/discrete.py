@@ -304,7 +304,6 @@ def make_train(
                 jnp.where(traj_batch.info["tile_type"] == 84, 1, 0)
             )
             metrics = {
-                "updates": train_state.step,
                 "actor_loss": loss_info[1][1].mean(),
                 "critic_loss": loss_info[1][0].mean(),
                 "entropy": loss_info[1][2].mean(),
