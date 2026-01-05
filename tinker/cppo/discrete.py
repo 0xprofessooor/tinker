@@ -107,7 +107,7 @@ def make_train(
     max_grad_norm: float = 0.5,
     ratio_clip: float = 0.2,
 ):
-    """Generate a jitted JAX PPO train function.
+    """Generate a jitted JAX CPPO train function.
 
     :param env: Gymnax environment.
     :param env_params: Environment parameters.

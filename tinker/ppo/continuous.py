@@ -271,19 +271,18 @@ def make_train(
             # UPDATE OBSERVATION NORMALIZATION and normalize all collected observations
             train_state, env_state, obs_norm_state, last_obs, rng = runner_state
 
+            normalized_last_obs = jax.vmap(norm.normalize, in_axes=(None, 0))(
+                obs_norm_state, last_obs
+            )
+            _, last_val = network.apply(train_state.params, normalized_last_obs)
+
             # Flatten batch: (train_freq, num_envs, obs_dim) -> (train_freq * num_envs, obs_dim)
             batch_raw_obs = traj_batch.next_obs.reshape(
                 -1, *traj_batch.next_obs.shape[2:]
             )
             obs_norm_state = norm.welford_update(obs_norm_state, batch_raw_obs)
 
-            normalized_last_obs = jax.vmap(norm.normalize, in_axes=(None, 0))(
-                obs_norm_state, last_obs
-            )
-
             # CALCULATE ADVANTAGE
-            _, last_val = network.apply(train_state.params, normalized_last_obs)
-
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
                     gae, next_value = gae_and_next_value
