@@ -438,66 +438,6 @@ def make_train(
     return train
 
 
-def run(
-    env: Environment,
-    env_params: EnvParams,
-    num_steps: int,
-    network: nn.Module,
-    network_params: dict,
-    rng_input: chex.PRNGKey,
-):
-    """Rollout a jitted gymnax episode with lax.scan.
-
-    :param env: Gymnax environment.
-    :param env_params: Environment parameters.
-    :param num_steps: Number of steps to rollout.
-    :param network: Flax network module.
-    :param network_params: Network parameters.
-    :param rng_input: Random number generator key.
-
-    :return state: List of episode rollout states.
-    :return obs: List of episode rollout observations.
-    :return logits: List of episode rollout action distribution (Categorical) logits.
-    :return actions: List of episode rollout actions.
-    :return values: List of episode rollout value estimates.
-    :return rewards: List of episode rollout rewards.
-    :return next_state: List of episode rollout next states.
-    :return next_obs: List of episode rollout next observations.
-    :return dones: List of episode rollout done flags.
-    """
-    # Reset the environment
-    rng_reset, rng_episode = jax.random.split(rng_input)
-    obs, state = env.reset(rng_reset, env_params)
-
-    def policy_step(state_input, tmp):
-        """lax.scan compatible step transition in jax env."""
-        obs, state, rng = state_input
-        rng, rng_step, rng_net = jax.random.split(rng, 3)
-        pi, value = network.apply(network_params, obs)
-        action = pi.sample(seed=rng_net)
-        next_obs, next_state, reward, done, _ = env.step(
-            rng_step, state, action, env_params
-        )
-        carry = [next_obs, next_state, rng]
-        return carry, [
-            state,
-            obs,
-            pi.logits,
-            action,
-            value,
-            reward,
-            next_state,
-            next_obs,
-            done,
-        ]
-
-    # Scan over episode step loop
-    carry, scan_out = jax.lax.scan(
-        policy_step, [obs, state, rng_episode], (), num_steps
-    )
-    return scan_out
-
-
 if __name__ == "__main__":
     config = {
         "ENV_NAME": "FrozenLake-v2",
@@ -543,7 +483,7 @@ if __name__ == "__main__":
         gae_lambda=config["GAE_LAMBDA"],
         entropy_coeff=config["ENT_COEF"],
         value_coeff=config["VF_COEF"],
-        lam_start=0.0,
+        lam_start=2.0,
         cvar_probability=0.05,
         cvar_limit=15.0,
         max_grad_norm=config["MAX_GRAD_NORM"],
