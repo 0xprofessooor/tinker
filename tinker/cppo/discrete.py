@@ -512,6 +512,8 @@ if __name__ == "__main__":
         entropy_coeff=config["ENT_COEF"],
         value_coeff=config["VF_COEF"],
         lam_start=0.0,
+        cvar_probability=0.05,
+        cvar_threshold=15.0,
         max_grad_norm=config["MAX_GRAD_NORM"],
         ratio_clip=config["CLIP_EPS"],
     )
