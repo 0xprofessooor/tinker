@@ -479,7 +479,7 @@ if __name__ == "__main__":
         lam_start=100.0,
         lam_lr=1e-2,
         cvar_probability=0.05,
-        cvar_limit=12.0,
+        cvar_limit=15.0,
         max_grad_norm=config["MAX_GRAD_NORM"],
         ratio_clip=config["CLIP_EPS"],
     )
