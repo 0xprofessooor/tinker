@@ -472,7 +472,7 @@ if __name__ == "__main__":
         env,
         env_params,
         num_steps=int(2e6),
-        train_freq=1000,
+        train_freq=500,
         batch_size=500,
         num_epochs=10,
         num_envs=5,
