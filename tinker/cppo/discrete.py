@@ -94,7 +94,6 @@ def make_train(
     num_epochs: int,
     cvar_limit: float,
     cvar_probability: float,
-    nu_start: float = 0.0,
     lam_start: float = 0.5,
     lam_lr: float = 1e-3,
     activation: callable = nn.tanh,
@@ -182,9 +181,7 @@ def make_train(
         def _update_step(runner_state, _):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, _):
-                train_state, env_state, last_obs, running_cost, nu, lam, rng = (
-                    runner_state
-                )
+                train_state, env_state, last_obs, running_cost, lam, rng = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -221,7 +218,6 @@ def make_train(
                     env_state,
                     obsv,
                     next_running_cost,
-                    nu,
                     lam,
                     rng,
                 )
@@ -232,7 +228,7 @@ def make_train(
             )
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, running_cost, nu, lam, rng = runner_state
+            train_state, env_state, last_obs, running_cost, lam, rng = runner_state
             _, last_val, last_cost_val = network.apply(train_state.params, last_obs)
 
             def _calculate_gae(traj_batch, last_val):
@@ -266,9 +262,13 @@ def make_train(
             )
 
             cost_returns = traj_batch.running_cost + traj_batch.cost_value
+            sorted_costs = jnp.sort(cost_returns.flatten())[::-1]
+            k = int(num_envs * train_freq * cvar_probability)
+            nu = jnp.mean(sorted_costs[:k])
             penalty_mask = jnp.where(cost_returns > nu, 1.0, 0.0)
             penalty = (lam / cvar_probability) * (cost_returns - nu) * penalty_mask
             advantages = advantages - penalty
+            lam += lam_lr * (nu - cvar_limit)
 
             # UPDATE NETWORK
             def _update_epoch(update_state, _):
@@ -383,17 +383,11 @@ def make_train(
             train_state = update_state[0]
             rng = update_state[-1]
 
-            sorted_costs = jnp.sort(cost_returns.flatten())[::-1]
-            k = int(num_envs * train_freq * cvar_probability)
-            nu = jnp.mean(sorted_costs[:k])
-            lam += lam_lr * (nu - cvar_limit)
-
             runner_state = (
                 train_state,
                 env_state,
                 last_obs,
                 running_cost,
-                nu,
                 lam,
                 rng,
             )
@@ -426,7 +420,6 @@ def make_train(
             env_state,
             obsv,
             running_cost,
-            nu_start,
             lam_start,
             _rng,
         )
@@ -444,7 +437,7 @@ if __name__ == "__main__":
         "LR": 3e-4,
         "NUM_ENVS": 5,
         "TRAIN_FREQ": 200,
-        "TOTAL_TIMESTEPS": 1e5,
+        "TOTAL_TIMESTEPS": 2e5,
         "UPDATE_EPOCHS": 4,
         "BATCH_SIZE": 40,
         "GAMMA": 0.99,
@@ -484,6 +477,7 @@ if __name__ == "__main__":
         entropy_coeff=config["ENT_COEF"],
         value_coeff=config["VF_COEF"],
         lam_start=2.0,
+        lam_lr=1e-2,
         cvar_probability=0.05,
         cvar_limit=15.0,
         max_grad_norm=config["MAX_GRAD_NORM"],
