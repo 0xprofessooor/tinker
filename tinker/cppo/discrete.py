@@ -436,7 +436,7 @@ if __name__ == "__main__":
         "ENV_NAME": "FrozenLake-v2",
         "LR": 3e-4,
         "NUM_ENVS": 5,
-        "TRAIN_FREQ": 200,
+        "TRAIN_FREQ": 100,
         "TOTAL_TIMESTEPS": 2e5,
         "UPDATE_EPOCHS": 4,
         "BATCH_SIZE": 40,
