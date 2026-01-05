@@ -476,7 +476,7 @@ if __name__ == "__main__":
         gae_lambda=config["GAE_LAMBDA"],
         entropy_coeff=config["ENT_COEF"],
         value_coeff=config["VF_COEF"],
-        lam_start=2.0,
+        lam_start=100.0,
         lam_lr=1e-2,
         cvar_probability=0.05,
         cvar_limit=15.0,
