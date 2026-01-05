@@ -73,14 +73,15 @@ class ActorCritic(nn.Module):
 
 
 class Transition(NamedTuple):
-    done: jnp.ndarray
-    action: jnp.ndarray
-    value: jnp.ndarray
-    cost_value: jnp.ndarray
-    reward: jnp.ndarray
-    log_prob: jnp.ndarray
-    obs: jnp.ndarray
-    info: jnp.ndarray
+    done: jax.Array
+    action: jax.Array
+    value: jax.Array
+    cost_value: jax.Array
+    reward: jax.Array
+    log_prob: jax.Array
+    running_cost: jax.Array
+    obs: jax.Array
+    info: jax.Array
 
 
 def make_train(
@@ -91,6 +92,10 @@ def make_train(
     train_freq: int,
     batch_size: int,
     num_epochs: int,
+    cvar_threshold: float,
+    cvar_probability: float,
+    nu_start: float = 0.0,
+    lam_start: float = 0.5,
     activation: callable = nn.tanh,
     lr: float = 3e-4,
     anneal_lr: bool = False,
@@ -169,13 +174,16 @@ def make_train(
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, num_envs)
         obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
+        running_cost = jnp.zeros((num_envs,))
         obsv = preprocess_obs(obsv)
+        nu = nu_start
+        lam = lam_start
 
         # TRAIN LOOP
         def _update_step(runner_state, _):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, _):
-                train_state, env_state, last_obs, rng = runner_state
+                train_state, env_state, last_obs, running_cost, rng = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -190,10 +198,24 @@ def make_train(
                     env.step, in_axes=(0, 0, 0, None)
                 )(rng_step, env_state, action, env_params)
                 obsv = preprocess_obs(obsv)
+
+                cost = info.get("cost", jnp.zeros_like(reward))
+
                 transition = Transition(
-                    done, action, value, cost_value, reward, log_prob, last_obs, info
+                    done,
+                    action,
+                    value,
+                    cost_value,
+                    reward,
+                    log_prob,
+                    running_cost,
+                    last_obs,
+                    info,
                 )
-                runner_state = (train_state, env_state, obsv, rng)
+
+                next_running_cost = (1 - done) * (running_cost + cost)
+
+                runner_state = (train_state, env_state, obsv, next_running_cost, rng)
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
@@ -201,7 +223,7 @@ def make_train(
             )
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, rng = runner_state
+            train_state, env_state, last_obs, running_cost, rng = runner_state
             _, last_val, last_cost_val = network.apply(train_state.params, last_obs)
 
             def _calculate_gae(traj_batch, last_val):
@@ -233,6 +255,11 @@ def make_train(
                 ),
                 last_cost_val,
             )
+
+            cost_returns = traj_batch.running_cost + traj_batch.cost_value
+            penalty_mask = jnp.where(cost_returns > nu, 1.0, 0.0)
+            penalty = (lam / cvar_probability) * (cost_returns - nu) * penalty_mask
+            advantages = advantages - penalty
 
             # UPDATE NETWORK
             def _update_epoch(update_state, _):
@@ -347,7 +374,7 @@ def make_train(
             train_state = update_state[0]
             rng = update_state[-1]
 
-            runner_state = (train_state, env_state, last_obs, rng)
+            runner_state = (train_state, env_state, last_obs, running_cost, rng)
             thin_tiles_visited = jnp.sum(
                 jnp.where(traj_batch.info["tile_type"] == 84, 1, 0)
             )
@@ -370,7 +397,7 @@ def make_train(
             return runner_state, metrics
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, _rng)
+        runner_state = (train_state, env_state, obsv, running_cost, _rng)
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, num_updates
         )
@@ -484,6 +511,7 @@ if __name__ == "__main__":
         gae_lambda=config["GAE_LAMBDA"],
         entropy_coeff=config["ENT_COEF"],
         value_coeff=config["VF_COEF"],
+        lam_start=0.0,
         max_grad_norm=config["MAX_GRAD_NORM"],
         ratio_clip=config["CLIP_EPS"],
     )
