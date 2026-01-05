@@ -57,13 +57,26 @@ class ActorCritic(nn.Module):
             critic
         )
 
-        return pi, jnp.squeeze(critic, axis=-1)
+        cost_critic = nn.Dense(
+            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+        )(x)
+        cost_critic = self.activation(cost_critic)
+        cost_critic = nn.Dense(
+            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+        )(cost_critic)
+        cost_critic = self.activation(cost_critic)
+        cost_critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
+            cost_critic
+        )
+
+        return pi, jnp.squeeze(critic, axis=-1), jnp.squeeze(cost_critic, axis=-1)
 
 
 class Transition(NamedTuple):
     done: jnp.ndarray
     action: jnp.ndarray
     value: jnp.ndarray
+    cost_value: jnp.ndarray
     reward: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
@@ -85,6 +98,7 @@ def make_train(
     gae_lambda: float = 0.95,
     entropy_coeff: float = 0.01,
     value_coeff: float = 0.5,
+    cost_value_coeff: float = 0.5,
     max_grad_norm: float = 0.5,
     ratio_clip: float = 0.2,
 ):
@@ -165,7 +179,7 @@ def make_train(
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
-                pi, value = network.apply(train_state.params, last_obs)
+                pi, value, cost_value = network.apply(train_state.params, last_obs)
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
 
@@ -177,7 +191,7 @@ def make_train(
                 )(rng_step, env_state, action, env_params)
                 obsv = preprocess_obs(obsv)
                 transition = Transition(
-                    done, action, value, reward, log_prob, last_obs, info
+                    done, action, value, cost_value, reward, log_prob, last_obs, info
                 )
                 runner_state = (train_state, env_state, obsv, rng)
                 return runner_state, transition
@@ -188,7 +202,7 @@ def make_train(
 
             # CALCULATE ADVANTAGE
             train_state, env_state, last_obs, rng = runner_state
-            _, last_val = network.apply(train_state.params, last_obs)
+            _, last_val, last_cost_val = network.apply(train_state.params, last_obs)
 
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -213,14 +227,23 @@ def make_train(
 
             advantages, targets = _calculate_gae(traj_batch, last_val)
 
+            cost_advantages, cost_targets = _calculate_gae(
+                traj_batch._replace(
+                    reward=traj_batch.info["cost"], value=traj_batch.cost_value
+                ),
+                last_cost_val,
+                gae_gamma,
+                gae_lambda,
+            )
+
             # UPDATE NETWORK
             def _update_epoch(update_state, _):
                 def _update_minbatch(train_state, batch_info):
-                    traj_batch, advantages, targets = batch_info
+                    traj_batch, advantages, targets, cost_targets = batch_info
 
-                    def _loss_fn(params, traj_batch, gae, targets):
+                    def _loss_fn(params, traj_batch, advantages, targets, cost_targets):
                         # RERUN NETWORK
-                        pi, value = network.apply(params, traj_batch.obs)
+                        pi, value, cost_value = network.apply(params, traj_batch.obs)
                         log_prob = pi.log_prob(traj_batch.action)
 
                         # CALCULATE VALUE LOSS
@@ -233,9 +256,26 @@ def make_train(
                             0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
                         )
 
+                        # CALCULATE COST VALUE LOSS
+                        cost_value_pred_clipped = traj_batch.cost_value + (
+                            cost_value - traj_batch.cost_value
+                        ).clip(-ratio_clip, ratio_clip)
+                        cost_value_losses = jnp.square(cost_value - cost_targets)
+                        cost_value_losses_clipped = jnp.square(
+                            cost_value_pred_clipped - cost_targets
+                        )
+                        cost_value_loss = (
+                            0.5
+                            * jnp.maximum(
+                                cost_value_losses, cost_value_losses_clipped
+                            ).mean()
+                        )
+
                         # CALCULATE ACTOR LOSS
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        gae = (advantages - advantages.mean()) / (
+                            advantages.std() + 1e-8
+                        )
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(
@@ -252,18 +292,28 @@ def make_train(
                         total_loss = (
                             loss_actor
                             + value_coeff * value_loss
+                            + cost_value_coeff * cost_value_loss
                             - entropy_coeff * entropy
                         )
-                        return total_loss, (value_loss, loss_actor, entropy)
+                        return total_loss, (
+                            value_loss,
+                            cost_value_loss,
+                            loss_actor,
+                            entropy,
+                        )
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                     total_loss, grads = grad_fn(
-                        train_state.params, traj_batch, advantages, targets
+                        train_state.params,
+                        traj_batch,
+                        advantages,
+                        targets,
+                        cost_targets,
                     )
                     train_state = train_state.apply_gradients(grads=grads)
                     return train_state, total_loss
 
-                train_state, traj_batch, advantages, targets, rng = update_state
+                train_state, rng = update_state
                 rng, _rng = jax.random.split(rng)
                 # Batching and Shuffling
                 total_batch_size = batch_size * num_minibatches
@@ -271,7 +321,7 @@ def make_train(
                     "total batch size must be equal to number of steps * number of envs"
                 )
                 permutation = jax.random.permutation(_rng, total_batch_size)
-                batch = (traj_batch, advantages, targets)
+                batch = (traj_batch, advantages, targets, cost_targets)
                 batch = jax.tree_util.tree_map(
                     lambda x: x.reshape((total_batch_size,) + x.shape[2:]), batch
                 )
@@ -288,11 +338,11 @@ def make_train(
                 train_state, total_loss = jax.lax.scan(
                     _update_minbatch, train_state, minibatches
                 )
-                update_state = (train_state, traj_batch, advantages, targets, rng)
+                update_state = (train_state, rng)
                 return update_state, total_loss
 
             # Updating Training State and Metrics:
-            update_state = (train_state, traj_batch, advantages, targets, rng)
+            update_state = (train_state, rng)
             update_state, loss_info = jax.lax.scan(
                 _update_epoch, update_state, None, num_epochs
             )
@@ -304,9 +354,10 @@ def make_train(
                 jnp.where(traj_batch.info["tile_type"] == 84, 1, 0)
             )
             metrics = {
-                "actor_loss": loss_info[1][1].mean(),
+                "actor_loss": loss_info[1][2].mean(),
                 "critic_loss": loss_info[1][0].mean(),
-                "entropy": loss_info[1][2].mean(),
+                "cost_critic_loss": loss_info[1][1].mean(),
+                "entropy": loss_info[1][3].mean(),
                 "cost_dist": traj_batch.info["returned_episode_cost_returns"],
                 "episode_cost_return": traj_batch.info[
                     "returned_episode_cost_returns"
