@@ -439,7 +439,7 @@ if __name__ == "__main__":
         "TRAIN_FREQ": 100,
         "TOTAL_TIMESTEPS": 2e5,
         "UPDATE_EPOCHS": 4,
-        "BATCH_SIZE": 40,
+        "BATCH_SIZE": 50,
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
