@@ -177,14 +177,14 @@ def make_train(
         obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
         running_cost = jnp.zeros((num_envs,))
         obsv = preprocess_obs(obsv)
-        nu = nu_start
-        lam = lam_start
 
         # TRAIN LOOP
         def _update_step(runner_state, _):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, _):
-                train_state, env_state, last_obs, running_cost, rng = runner_state
+                train_state, env_state, last_obs, running_cost, nu, lam, rng = (
+                    runner_state
+                )
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -216,7 +216,15 @@ def make_train(
 
                 next_running_cost = (1 - done) * (running_cost + cost)
 
-                runner_state = (train_state, env_state, obsv, next_running_cost, rng)
+                runner_state = (
+                    train_state,
+                    env_state,
+                    obsv,
+                    next_running_cost,
+                    nu,
+                    lam,
+                    rng,
+                )
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
@@ -224,7 +232,7 @@ def make_train(
             )
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, running_cost, rng = runner_state
+            train_state, env_state, last_obs, running_cost, nu, lam, rng = runner_state
             _, last_val, last_cost_val = network.apply(train_state.params, last_obs)
 
             def _calculate_gae(traj_batch, last_val):
@@ -380,7 +388,15 @@ def make_train(
             k = int(num_envs * train_freq * cvar_probability)
             nu = jnp.mean(sorted_costs[:k])
 
-            runner_state = (train_state, env_state, last_obs, running_cost, rng)
+            runner_state = (
+                train_state,
+                env_state,
+                last_obs,
+                running_cost,
+                nu,
+                lam,
+                rng,
+            )
             thin_tiles_visited = jnp.sum(
                 jnp.where(traj_batch.info["tile_type"] == 84, 1, 0)
             )
@@ -405,7 +421,15 @@ def make_train(
             return runner_state, metrics
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, running_cost, _rng)
+        runner_state = (
+            train_state,
+            env_state,
+            obsv,
+            running_cost,
+            nu_start,
+            lam_start,
+            _rng,
+        )
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, num_updates
         )
