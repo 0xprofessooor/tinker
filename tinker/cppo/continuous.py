@@ -137,7 +137,9 @@ def make_train(
 
     def train(rng: chex.PRNGKey) -> Tuple[TrainState, dict]:
         # INIT NETWORK
-        network = ActorCritic(env.action_space(env_params).n, activation=activation)
+        network = ActorCritic(
+            env.action_space(env_params).shape[0], activation=activation
+        )
         rng, _rng = jax.random.split(rng)
         obs_space = env.observation_space(env_params)
         init_x = jnp.zeros(obs_space.shape)
