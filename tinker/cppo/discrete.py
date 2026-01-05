@@ -92,10 +92,11 @@ def make_train(
     train_freq: int,
     batch_size: int,
     num_epochs: int,
-    cvar_threshold: float,
+    cvar_limit: float,
     cvar_probability: float,
     nu_start: float = 0.0,
     lam_start: float = 0.5,
+    lam_lr: float = 1e-3,
     activation: callable = nn.tanh,
     lr: float = 3e-4,
     anneal_lr: bool = False,
@@ -374,6 +375,11 @@ def make_train(
             train_state = update_state[0]
             rng = update_state[-1]
 
+            lam += lam_lr * (nu - cvar_limit)
+            sorted_costs = jnp.sort(cost_returns)[::-1]
+            k = int(num_envs * train_freq * cvar_probability)
+            nu = jnp.mean(sorted_costs[:k])
+
             runner_state = (train_state, env_state, last_obs, running_cost, rng)
             thin_tiles_visited = jnp.sum(
                 jnp.where(traj_batch.info["tile_type"] == 84, 1, 0)
@@ -383,6 +389,8 @@ def make_train(
                 "critic_loss": loss_info[1][0].mean(),
                 "cost_critic_loss": loss_info[1][1].mean(),
                 "entropy": loss_info[1][3].mean(),
+                "lam": lam,
+                "nu": nu,
                 "cost_dist": traj_batch.info["returned_episode_cost_returns"],
                 "episode_cost_return": traj_batch.info[
                     "returned_episode_cost_returns"
@@ -513,7 +521,7 @@ if __name__ == "__main__":
         value_coeff=config["VF_COEF"],
         lam_start=0.0,
         cvar_probability=0.05,
-        cvar_threshold=15.0,
+        cvar_limit=15.0,
         max_grad_norm=config["MAX_GRAD_NORM"],
         ratio_clip=config["CLIP_EPS"],
     )
