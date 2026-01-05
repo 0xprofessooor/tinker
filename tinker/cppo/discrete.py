@@ -269,6 +269,7 @@ def make_train(
             penalty = (lam / cvar_probability) * (cost_returns - nu) * penalty_mask
             advantages = advantages - penalty
             lam += lam_lr * (nu - cvar_limit)
+            lam = jnp.maximum(0.0, lam)
 
             # UPDATE NETWORK
             def _update_epoch(update_state, _):

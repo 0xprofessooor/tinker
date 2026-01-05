@@ -18,52 +18,45 @@ import time
 
 class ActorCritic(nn.Module):
     action_dim: int
-    activation: str = "tanh"
+    activation: callable = nn.tanh
 
     @nn.compact
     def __call__(self, x):
-        if self.activation == "relu":
-            activation = nn.relu
-        else:
-            activation = nn.tanh
-
-        # Actor
         actor_mean = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
-        actor_mean = activation(actor_mean)
+        actor_mean = self.activation(actor_mean)
         actor_mean = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(actor_mean)
-        actor_mean = activation(actor_mean)
+        actor_mean = self.activation(actor_mean)
         actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_mean)
-        actor_logtstd = self.param("log_std", constant(-0.5), (self.action_dim,))
+        actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
 
-        # Reward Critic
         critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
-        critic = activation(critic)
+        critic = self.activation(critic)
         critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(critic)
-        critic = activation(critic)
+        critic = self.activation(critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
             critic
         )
 
         # Cost Critic
         cost_critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
-        cost_critic = activation(cost_critic)
+        cost_critic = self.activation(cost_critic)
         cost_critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(cost_critic)
-        cost_critic = activation(cost_critic)
+        cost_critic = self.activation(cost_critic)
         cost_critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
             cost_critic
         )
@@ -143,7 +136,6 @@ def make_train(
         rng, _rng = jax.random.split(rng)
         obs_space = env.observation_space(env_params)
         init_x = jnp.zeros(obs_space.shape)
-
         network_params = network.init(_rng, init_x)
         if anneal_lr:
             tx = optax.chain(
@@ -289,6 +281,7 @@ def make_train(
             penalty = (lam / cvar_probability) * (cost_returns - nu) * penalty_mask
             advantages = advantages - penalty
             lam += lam_lr * (nu - cvar_limit)
+            lam = jnp.maximum(0.0, lam)
 
             # UPDATE NETWORK
             def _update_epoch(update_state, _):
@@ -468,7 +461,7 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 5
 
-    brax_env = EcoAntV2(battery_limit=50.0)
+    brax_env = EcoAntV2(battery_limit=500.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = env.default_params
 
@@ -484,8 +477,8 @@ if __name__ == "__main__":
         num_epochs=10,
         num_envs=5,
         cvar_probability=0.1,
-        cvar_limit=50.0,
-        lam_start=10.0,
+        cvar_limit=500.0,
+        lam_start=0.0,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
@@ -494,14 +487,14 @@ if __name__ == "__main__":
     print(f"Runtime: {runtime:.2f}s")
 
     log.save_local(
-        algo_name="cppo50",
+        algo_name="cppo500",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
 
     log.save_wandb(
         project="EcoAnt",
-        algo_name="cppo50",
+        algo_name="cppo500",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
