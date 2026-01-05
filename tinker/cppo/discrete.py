@@ -383,10 +383,10 @@ def make_train(
             train_state = update_state[0]
             rng = update_state[-1]
 
-            lam += lam_lr * (nu - cvar_limit)
-            sorted_costs = jnp.sort(cost_returns)[::-1]
+            sorted_costs = jnp.sort(cost_returns.flatten())[::-1]
             k = int(num_envs * train_freq * cvar_probability)
             nu = jnp.mean(sorted_costs[:k])
+            lam += lam_lr * (nu - cvar_limit)
 
             runner_state = (
                 train_state,
