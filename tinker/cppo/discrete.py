@@ -232,8 +232,6 @@ def make_train(
                     reward=traj_batch.info["cost"], value=traj_batch.cost_value
                 ),
                 last_cost_val,
-                gae_gamma,
-                gae_lambda,
             )
 
             # UPDATE NETWORK
