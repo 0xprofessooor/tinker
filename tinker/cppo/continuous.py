@@ -283,7 +283,9 @@ def make_train(
             raw_cvar_num_episodes = (num_episodes * cvar_probability).astype(jnp.int32)
             cvar_num_episodes = jnp.maximum(raw_cvar_num_episodes, 1)
             sorted_terminal_costs = jnp.sort(sparse_costs.flatten())[::-1]
-            traj_cvar = jnp.mean(sorted_terminal_costs[:cvar_num_episodes])
+            batch_indices = jnp.arange(sorted_terminal_costs.shape[0])
+            mask = batch_indices < cvar_num_episodes
+            traj_cvar = jnp.sum(sorted_terminal_costs * mask) / cvar_num_episodes
 
             cost_returns = traj_batch.running_cost + traj_batch.cost_value
             sorted_costs = jnp.sort(cost_returns.flatten())[::-1]
