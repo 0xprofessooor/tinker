@@ -273,6 +273,18 @@ def make_train(
                 last_cost_val,
             )
 
+            is_terminal = traj_batch.done
+            num_episodes = jnp.maximum(is_terminal.sum(), 1.0)
+            terminal_costs = traj_batch.running_cost + traj_batch.info["cost"]
+            sparse_costs = jnp.where(is_terminal, terminal_costs, 0.0)
+            exceeds_threshold = (sparse_costs > cvar_limit) & is_terminal
+            num_exceedances = exceeds_threshold.sum()
+            empirical_var_probability = num_exceedances / num_episodes
+            raw_cvar_num_episodes = (num_episodes * cvar_probability).astype(jnp.int32)
+            cvar_num_episodes = jnp.maximum(raw_cvar_num_episodes, 1)
+            sorted_terminal_costs = jnp.sort(sparse_costs.flatten())[::-1]
+            traj_cvar = jnp.mean(sorted_terminal_costs[:cvar_num_episodes])
+
             cost_returns = traj_batch.running_cost + traj_batch.cost_value
             sorted_costs = jnp.sort(cost_returns.flatten())[::-1]
             k = int(num_envs * train_freq * cvar_probability)
@@ -280,7 +292,8 @@ def make_train(
             penalty_mask = jnp.where(cost_returns > nu, 1.0, 0.0)
             penalty = (lam / cvar_probability) * (cost_returns - nu) * penalty_mask
             advantages = advantages - penalty
-            lam += lam_lr * (nu - cvar_limit)
+            cvar_estimate = jnp.where(raw_cvar_num_episodes > 0, traj_cvar, nu)
+            lam += lam_lr * (cvar_estimate - cvar_limit)
             lam = jnp.maximum(0.0, lam)
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -412,13 +425,6 @@ def make_train(
                 rng,
             )
 
-            is_terminal = traj_batch.done
-            num_episodes = jnp.maximum(is_terminal.sum(), 1.0)
-            terminal_costs = traj_batch.running_cost + traj_batch.info["cost"]
-            sparse_costs = jnp.where(is_terminal, terminal_costs, 0.0)
-            exceeds_threshold = (sparse_costs > cvar_limit) & is_terminal
-            num_exceedances = exceeds_threshold.sum()
-            empirical_var_probability = num_exceedances / num_episodes
             metrics = {
                 "actor_loss": loss_info[1][2].mean(),
                 "critic_loss": loss_info[1][0].mean(),
@@ -433,6 +439,7 @@ def make_train(
                 "episode_return": traj_batch.info["returned_episode_returns"].mean(),
                 "episode_length": traj_batch.info["returned_episode_lengths"].mean(),
                 "empirical_var_probability": empirical_var_probability,
+                "traj_cvar": traj_cvar,
             }
 
             return runner_state, metrics
@@ -459,7 +466,7 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 5
 
-    brax_env = EcoAntV2(battery_limit=50.0)
+    brax_env = EcoAntV2(battery_limit=500.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = env.default_params
 
@@ -470,13 +477,13 @@ if __name__ == "__main__":
         env,
         env_params,
         num_steps=int(2e6),
-        train_freq=500,
+        train_freq=1000,
         batch_size=500,
         num_epochs=10,
         num_envs=5,
         cvar_probability=0.1,
-        cvar_limit=50.0,
-        lam_start=1.0,
+        cvar_limit=500.0,
+        lam_start=0.0,
         anneal_lr=True,
         entropy_coeff=0.0075,
     )
@@ -487,14 +494,14 @@ if __name__ == "__main__":
     print(f"Runtime: {runtime:.2f}s")
 
     log.save_local(
-        algo_name="cppo50",
+        algo_name="cppo500",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
 
     log.save_wandb(
         project="EcoAnt",
-        algo_name="cppo50",
+        algo_name="cppo500",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
