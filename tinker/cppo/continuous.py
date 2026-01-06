@@ -469,7 +469,7 @@ if __name__ == "__main__":
     train_fn = make_train(
         env,
         env_params,
-        num_steps=int(1e6),
+        num_steps=int(2e6),
         train_freq=500,
         batch_size=500,
         num_epochs=10,
@@ -477,8 +477,8 @@ if __name__ == "__main__":
         cvar_probability=0.1,
         cvar_limit=500.0,
         lam_start=0.0,
-        lam_lr=0.0,
         anneal_lr=True,
+        entropy_coeff=0.0075,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
