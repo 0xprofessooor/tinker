@@ -283,6 +283,8 @@ def make_train(
             lam += lam_lr * (nu - cvar_limit)
             lam = jnp.maximum(0.0, lam)
 
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
             # UPDATE NETWORK
             def _update_epoch(update_state, _):
                 def _update_minbatch(train_state, batch_info):
@@ -328,17 +330,14 @@ def make_train(
 
                         # CALCULATE ACTOR LOSS
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
-                        gae = (advantages - advantages.mean()) / (
-                            advantages.std() + 1e-8
-                        )
-                        loss_actor1 = ratio * gae
+                        loss_actor1 = ratio * advantages
                         loss_actor2 = (
                             jnp.clip(
                                 ratio,
                                 1.0 - ratio_clip,
                                 1.0 + ratio_clip,
                             )
-                            * gae
+                            * advantages
                         )
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                         loss_actor = loss_actor.mean()
@@ -461,7 +460,7 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 5
 
-    brax_env = EcoAntV2(battery_limit=50.0)
+    brax_env = EcoAntV2(battery_limit=500.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = env.default_params
 
@@ -477,8 +476,9 @@ if __name__ == "__main__":
         num_epochs=10,
         num_envs=5,
         cvar_probability=0.1,
-        cvar_limit=50.0,
-        lam_start=10.0,
+        cvar_limit=500.0,
+        lam_start=0.0,
+        lam_lr=1e-4,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
@@ -487,14 +487,14 @@ if __name__ == "__main__":
     print(f"Runtime: {runtime:.2f}s")
 
     log.save_local(
-        algo_name="cppo50",
+        algo_name="cppo500",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
 
     log.save_wandb(
         project="EcoAnt",
-        algo_name="cppo50",
+        algo_name="cppo500",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
