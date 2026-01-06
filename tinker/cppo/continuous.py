@@ -460,7 +460,7 @@ if __name__ == "__main__":
     SEED = 0
     NUM_SEEDS = 5
 
-    brax_env = EcoAntV2(battery_limit=50.0)
+    brax_env = EcoAntV2(battery_limit=500.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = env.default_params
 
@@ -476,9 +476,9 @@ if __name__ == "__main__":
         num_epochs=10,
         num_envs=5,
         cvar_probability=0.1,
-        cvar_limit=50.0,
+        cvar_limit=500.0,
         lam_start=0.0,
-        lam_lr=1e-4,
+        lam_lr=0.0,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
@@ -487,14 +487,14 @@ if __name__ == "__main__":
     print(f"Runtime: {runtime:.2f}s")
 
     log.save_local(
-        algo_name="cppo50",
+        algo_name="cppo500",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
 
     log.save_wandb(
         project="EcoAnt",
-        algo_name="cppo50",
+        algo_name="cppo500",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
