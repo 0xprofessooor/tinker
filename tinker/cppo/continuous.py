@@ -265,7 +265,6 @@ def make_train(
                 return advantages, advantages + traj_batch.value
 
             advantages, targets = _calculate_gae(traj_batch, last_val)
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             cost_advantages, cost_targets = _calculate_gae(
                 traj_batch._replace(
@@ -283,6 +282,7 @@ def make_train(
             advantages = advantages - penalty
             lam += lam_lr * (nu - cvar_limit)
             lam = jnp.maximum(0.0, lam)
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             # UPDATE NETWORK
             def _update_epoch(update_state, _):
@@ -469,7 +469,7 @@ if __name__ == "__main__":
     train_fn = make_train(
         env,
         env_params,
-        num_steps=int(2e6),
+        num_steps=int(1e6),
         train_freq=500,
         batch_size=500,
         num_epochs=10,
@@ -477,7 +477,8 @@ if __name__ == "__main__":
         cvar_probability=0.1,
         cvar_limit=500.0,
         lam_start=0.0,
-        lam_lr=1e-4,
+        lam_lr=0.0,
+        anneal_lr=True,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
