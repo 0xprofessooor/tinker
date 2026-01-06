@@ -486,6 +486,7 @@ if __name__ == "__main__":
         cvar_probability=0.1,
         cvar_limit=500.0,
         lam_start=0.0,
+        lam_lr=1e-2,
         anneal_lr=True,
         entropy_coeff=0.0075,
     )
