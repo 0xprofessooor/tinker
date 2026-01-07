@@ -4,6 +4,7 @@ from typing import Optional
 import jax
 import numpy as np
 import polars as pl
+import json
 import wandb
 
 
@@ -13,6 +14,7 @@ def save_wandb(
     env_name: str,
     metrics: dict,
     metrics_to_log: Optional[list] = None,
+    config: Optional[dict] = None,
 ):
     """Log metrics to Weights and Biases."""
     if metrics_to_log is None:
@@ -21,6 +23,7 @@ def save_wandb(
     wandb.login(os.environ.get("WANDB_KEY"))
     wandb.init(
         project=project,
+        config=config,
         tags=[algo_name.upper(), f"{env_name.upper()}", f"jax_{jax.__version__}"],
         name=f"{algo_name}_{env_name}",
         mode="online",
@@ -49,6 +52,7 @@ def save_local(
     metrics: dict,
     root_dir: str = "results",
     metrics_to_log: Optional[list] = None,
+    config: Optional[dict] = None,
 ):
     """Save metrics locally in NPZ and Parquet formats."""
     if metrics_to_log is None:
@@ -84,6 +88,10 @@ def save_local(
     # Create and save Polars DataFrame
     df = pl.DataFrame(data)
     df.write_parquet(output_dir / "metrics.parquet")
+
+    if config is not None:
+        with open(output_dir / "config.json", "w") as f:
+            json.dump(config, f, indent=2)
 
     # Print summary
     print(f"\n✓ Results saved to: {output_dir}")
