@@ -468,30 +468,45 @@ def make_train(
 
 
 if __name__ == "__main__":
-    SEED = 0
-    NUM_SEEDS = 5
+    config = {
+        "seed": 0,
+        "num_seeds": 5,
+        "num_steps": int(1e6),
+        "train_freq": 1000,
+        "batch_size": 500,
+        "num_epochs": 10,
+        "num_envs": 5,
+        "cvar_limit": 50.0,
+        "cvar_probability": 0.1,
+        "lam_lr": 1e-2,
+        "lam_start": 10.0,
+        "entropy_coeff": 0.0075,
+        "cvar_clip_ratio": 100.0,
+        "anneal_lr": True,
+    }
 
-    brax_env = EcoAntV2(battery_limit=50.0)
+    brax_env = EcoAntV2(battery_limit=config["cvar_limit"])
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = env.default_params
 
-    rng = jax.random.PRNGKey(SEED)
-    rngs = jax.random.split(rng, NUM_SEEDS)
+    rng = jax.random.PRNGKey(config["seed"])
+    rngs = jax.random.split(rng, config["num_seeds"])
 
     train_fn = make_train(
         env,
         env_params,
-        num_steps=int(1e6),
-        train_freq=1000,
-        batch_size=500,
-        num_epochs=10,
-        num_envs=5,
-        cvar_probability=0.1,
-        cvar_limit=50.0,
-        lam_start=0.0,
-        lam_lr=1e-2,
-        anneal_lr=True,
-        entropy_coeff=0.0075,
+        num_steps=config["num_steps"],
+        train_freq=config["train_freq"],
+        batch_size=config["batch_size"],
+        num_epochs=config["num_epochs"],
+        num_envs=config["num_envs"],
+        cvar_probability=config["cvar_probability"],
+        cvar_limit=config["cvar_limit"],
+        lam_start=config["lam_start"],
+        lam_lr=config["lam_lr"],
+        anneal_lr=config["anneal_lr"],
+        entropy_coeff=config["entropy_coeff"],
+        cvar_clip_ratio=config["cvar_clip_ratio"],
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
@@ -500,14 +515,16 @@ if __name__ == "__main__":
     print(f"Runtime: {runtime:.2f}s")
 
     log.save_local(
-        algo_name="cppo50",
+        algo_name="cppo",
         env_name=brax_env.name,
         metrics=all_metrics,
+        config=config,
     )
 
     log.save_wandb(
         project="EcoAnt",
-        algo_name="cppo50",
+        algo_name="cppo",
         env_name=brax_env.name,
         metrics=all_metrics,
+        config=config,
     )
