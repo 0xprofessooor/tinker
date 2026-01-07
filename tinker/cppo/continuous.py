@@ -99,6 +99,7 @@ def make_train(
     cost_value_coeff: float = 0.5,
     max_grad_norm: float = 0.5,
     ratio_clip: float = 0.2,
+    cvar_clip_ratio: float = 0.05,
 ):
     """Generate a jitted JAX CPPO train function.
 
@@ -293,6 +294,8 @@ def make_train(
             nu = jnp.mean(sorted_costs[:k])
             penalty_mask = jnp.where(cost_returns > nu, 1.0, 0.0)
             penalty = (lam / cvar_probability) * (cost_returns - nu) * penalty_mask
+            limit = jnp.abs(traj_batch.cost_value) * cvar_clip_ratio
+            penalty = jnp.clip(penalty, -limit, limit)
             advantages = advantages - penalty
             cvar_estimate = jnp.where(raw_cvar_num_episodes > 0, traj_cvar, nu)
             lam += lam_lr * (cvar_estimate - cvar_limit)
@@ -485,7 +488,7 @@ if __name__ == "__main__":
         num_envs=5,
         cvar_probability=0.1,
         cvar_limit=50.0,
-        lam_start=5.0,
+        lam_start=0.0,
         lam_lr=1e-2,
         anneal_lr=True,
         entropy_coeff=0.0075,
