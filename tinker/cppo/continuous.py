@@ -294,7 +294,7 @@ def make_train(
             nu = jnp.mean(sorted_costs[:k])
             penalty_mask = jnp.where(cost_returns > nu, 1.0, 0.0)
             penalty = (lam / cvar_probability) * (cost_returns - nu) * penalty_mask
-            limit = jnp.abs(traj_batch.cost_value) * cvar_clip_ratio
+            limit = jnp.abs(traj_batch.value) * cvar_clip_ratio
             penalty = jnp.clip(penalty, -limit, limit)
             advantages = advantages - penalty
             cvar_estimate = jnp.where(raw_cvar_num_episodes > 0, traj_cvar, nu)
