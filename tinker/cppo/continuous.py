@@ -485,8 +485,8 @@ if __name__ == "__main__":
         num_envs=5,
         cvar_probability=0.1,
         cvar_limit=500.0,
-        lam_start=0.0,
-        lam_lr=1e-2,
+        lam_start=8.0,
+        lam_lr=1e-3,
         anneal_lr=True,
         entropy_coeff=0.0075,
     )
@@ -497,14 +497,14 @@ if __name__ == "__main__":
     print(f"Runtime: {runtime:.2f}s")
 
     log.save_local(
-        algo_name="cppo500",
+        algo_name="cppo",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
 
     log.save_wandb(
         project="EcoAnt",
-        algo_name="cppo500",
+        algo_name="cppo",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
