@@ -1,6 +1,6 @@
 """Proximal Policy Optimization (PPO) with Categorical Policy."""
 
-from typing import NamedTuple, Tuple
+from typing import Tuple
 
 import chex
 import distrax
@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax.linen.initializers import constant, orthogonal
+from flax import struct
 from flax.training.train_state import TrainState
 from gymnax.environments.environment import Environment, EnvParams
 from gymnax.environments import spaces
@@ -60,7 +61,8 @@ class ActorCritic(nn.Module):
         return pi, jnp.squeeze(critic, axis=-1)
 
 
-class Transition(NamedTuple):
+@struct.dataclass
+class Transition:
     done: jnp.ndarray
     action: jnp.ndarray
     value: jnp.ndarray
@@ -70,80 +72,93 @@ class Transition(NamedTuple):
     info: jnp.ndarray
 
 
+@struct.dataclass
+class DynamicConfig:
+    """Holds dynamic configuration parameters for PPO training.
+
+    :param rng: Random number generator key.
+    :param env_params: Environment parameters.
+    :param lr: Learning rate.
+    :param gae_gamma: Discount factor for GAE.
+    :param gae_lambda: Lambda parameter for GAE.
+    :param entropy_coeff: Coefficient for entropy bonus.
+    :param value_coeff: Coefficient for value loss.
+    :param max_grad_norm: Maximum gradient norm for clipping.
+    :param ratio_clip: Clipping factor for PPO objective.
+    """
+
+    rng: jax.Array
+    env_params: EnvParams
+    lr: jax.Array
+    gae_gamma: jax.Array
+    gae_lambda: jax.Array
+    entropy_coeff: jax.Array
+    value_coeff: jax.Array
+    max_grad_norm: jax.Array
+    ratio_clip: jax.Array
+
+
 def make_train(
     env: Environment,
-    env_params: EnvParams,
     num_steps: int,
     num_envs: int,
     train_freq: int,
     batch_size: int,
     num_epochs: int,
     activation: callable = nn.tanh,
-    lr: float = 3e-4,
     anneal_lr: bool = False,
-    gae_gamma: float = 0.99,
-    gae_lambda: float = 0.95,
-    entropy_coeff: float = 0.01,
-    value_coeff: float = 0.5,
-    max_grad_norm: float = 0.5,
-    ratio_clip: float = 0.2,
 ):
     """Generate a jitted JAX PPO train function.
 
     :param env: Gymnax environment.
-    :param env_params: Environment parameters.
     :param num_steps: Number of steps to train per environment.
     :param num_envs: Number of parallel environments to run.
     :param train_freq: Number of steps to run between training updates.
     :param batch_size: Minibatch size to make a single gradient descent step on.
     :param num_epochs: Number of epochs to train per update step.
     :param activation: Activation function for the network hidden layers.
-    :param lr: Learning rate for the optimizer.
     :param anneal_lr: Whether to anneal the learning rate over time.
-    :param gae_gamma: Discount factor for the returns.
-    :param gae_lambda: Lambda for the Generalized Advantage Estimation.
-    :param entropy_coeff: Coefficient for the entropy loss.
-    :param value_coeff: Coefficient for the value loss.
-    :param max_grad_norm: Maximum gradient norm for clipping.
-    :param ratio_clip: The clipping factor for the clipped loss
     """
 
     num_updates = num_steps // train_freq
     num_minibatches = (num_envs * train_freq) // batch_size
     env = LogWrapper(env)
 
-    def linear_schedule(count):
-        frac = 1.0 - (count // (num_minibatches * num_epochs)) / num_updates
-        return lr * frac
+    obs_space = env.observation_space(env.default_params)
+    if isinstance(obs_space, spaces.Discrete):
+        init_x = jnp.zeros((obs_space.n,))
 
-    def train(rng: chex.PRNGKey) -> Tuple[TrainState, dict]:
+        def preprocess_obs(obs: jax.Array) -> jax.Array:
+            """One-hot encode discrete observations."""
+            return jax.nn.one_hot(obs, obs_space.n)
+    else:
+        init_x = jnp.zeros(obs_space.shape)
+
+        def preprocess_obs(obs: jax.Array) -> jax.Array:
+            """Pass-through for continuous observations."""
+            return obs
+
+    def train(config: DynamicConfig) -> Tuple[TrainState, dict]:
+        def linear_schedule(count):
+            frac = 1.0 - (count // (num_minibatches * num_epochs)) / num_updates
+            return config.lr * frac
+
         # INIT NETWORK
-        network = ActorCritic(env.action_space(env_params).n, activation=activation)
-        rng, _rng = jax.random.split(rng)
-        obs_space = env.observation_space(env_params)
-        if isinstance(obs_space, spaces.Discrete):
-            init_x = jnp.zeros((obs_space.n,))
-
-            def preprocess_obs(obs: jax.Array) -> jax.Array:
-                """One-hot encode discrete observations."""
-                return jax.nn.one_hot(obs, obs_space.n)
-        else:
-            init_x = jnp.zeros(obs_space.shape)
-
-            def preprocess_obs(obs: jax.Array) -> jax.Array:
-                """Pass-through for continuous observations."""
-                return obs
+        network = ActorCritic(
+            env.action_space(config.env_params).n, activation=activation
+        )
+        rng, _rng = jax.random.split(config.rng)
 
         network_params = network.init(_rng, init_x)
         if anneal_lr:
             tx = optax.chain(
-                optax.clip_by_global_norm(max_grad_norm),
+                optax.clip_by_global_norm(config.max_grad_norm),
                 optax.adam(learning_rate=linear_schedule, eps=1e-5),
             )
         else:
             tx = optax.chain(
-                optax.clip_by_global_norm(max_grad_norm),
-                optax.adam(lr, eps=1e-5),
+                optax.clip_by_global_norm(config.max_grad_norm),
+                optax.adam(config.lr, eps=1e-5),
             )
         train_state = TrainState.create(
             apply_fn=network.apply,
@@ -154,7 +169,9 @@ def make_train(
         # INIT ENV
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, num_envs)
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
+        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(
+            reset_rng, config.env_params
+        )
         obsv = preprocess_obs(obsv)
 
         # TRAIN LOOP
@@ -174,7 +191,7 @@ def make_train(
                 rng_step = jax.random.split(_rng, num_envs)
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0, None)
-                )(rng_step, env_state, action, env_params)
+                )(rng_step, env_state, action, config.env_params)
                 obsv = preprocess_obs(obsv)
                 transition = Transition(
                     done, action, value, reward, log_prob, last_obs, info
@@ -198,8 +215,10 @@ def make_train(
                         transition.value,
                         transition.reward,
                     )
-                    delta = reward + gae_gamma * next_value * (1 - done) - value
-                    gae = delta + gae_gamma * gae_lambda * (1 - done) * gae
+                    delta = reward + config.gae_gamma * next_value * (1 - done) - value
+                    gae = (
+                        delta + config.gae_gamma * config.gae_lambda * (1 - done) * gae
+                    )
                     return (gae, value), gae
 
                 _, advantages = jax.lax.scan(
@@ -226,7 +245,7 @@ def make_train(
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
                             value - traj_batch.value
-                        ).clip(-ratio_clip, ratio_clip)
+                        ).clip(-config.ratio_clip, config.ratio_clip)
                         value_losses = jnp.square(value - targets)
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
                         value_loss = (
@@ -240,8 +259,8 @@ def make_train(
                         loss_actor2 = (
                             jnp.clip(
                                 ratio,
-                                1.0 - ratio_clip,
-                                1.0 + ratio_clip,
+                                1.0 - config.ratio_clip,
+                                1.0 + config.ratio_clip,
                             )
                             * gae
                         )
@@ -251,8 +270,8 @@ def make_train(
 
                         total_loss = (
                             loss_actor
-                            + value_coeff * value_loss
-                            - entropy_coeff * entropy
+                            + config.value_coeff * value_loss
+                            - config.entropy_coeff * entropy
                         )
                         return total_loss, (value_loss, loss_actor, entropy)
 
@@ -430,7 +449,7 @@ if __name__ == "__main__":
         "ACTIVATION": "tanh",
         "ANNEAL_LR": True,
         "WANDB_MODE": "online",  # set to online to activate wandb
-        "NUM_SEEDS": 5,
+        "NUM_RUNS": 5,
         "SEED": 0,
     }
 
@@ -441,59 +460,51 @@ if __name__ == "__main__":
         thin_shock_prob=0.1,
         thin_shock_val=10.0,
     )
-    env_params = env.default_params
+    env_params = [env.default_params] * config["NUM_RUNS"]
+    rng = jax.random.PRNGKey(config["SEED"])
+    rngs = jax.random.split(rng, config["NUM_RUNS"])
+
+    dynamic_config = DynamicConfig(
+        rng=rngs,
+        env_params=jax.tree.map(lambda *xs: jnp.stack(xs), *env_params),
+        lr=jnp.ones(config["NUM_RUNS"]) * config["LR"],
+        gae_gamma=jnp.ones(config["NUM_RUNS"]) * config["GAMMA"],
+        gae_lambda=jnp.ones(config["NUM_RUNS"]) * config["GAE_LAMBDA"],
+        entropy_coeff=jnp.ones(config["NUM_RUNS"]) * config["ENT_COEF"],
+        value_coeff=jnp.ones(config["NUM_RUNS"]) * config["VF_COEF"],
+        max_grad_norm=jnp.ones(config["NUM_RUNS"]) * config["MAX_GRAD_NORM"],
+        ratio_clip=jnp.ones(config["NUM_RUNS"]) * config["CLIP_EPS"],
+    )
 
     train_fn = make_train(
         env=env,
-        env_params=env_params,
         num_steps=config["TOTAL_TIMESTEPS"],
         num_envs=config["NUM_ENVS"],
         train_freq=config["TRAIN_FREQ"],
         batch_size=config["BATCH_SIZE"],
         num_epochs=config["UPDATE_EPOCHS"],
         activation=nn.tanh if config["ACTIVATION"] == "tanh" else nn.relu,
-        lr=config["LR"],
         anneal_lr=config["ANNEAL_LR"],
-        gae_gamma=config["GAMMA"],
-        gae_lambda=config["GAE_LAMBDA"],
-        entropy_coeff=config["ENT_COEF"],
-        value_coeff=config["VF_COEF"],
-        max_grad_norm=config["MAX_GRAD_NORM"],
-        ratio_clip=config["CLIP_EPS"],
     )
-
-    rng = jax.random.PRNGKey(config["SEED"])
-    rngs = jax.random.split(rng, config["NUM_SEEDS"])
 
     # JIT and vmap the training function for parallel execution
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
-    runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
+    runner_states, all_metrics = jax.block_until_ready(train_vjit(dynamic_config))
     runtime = time.perf_counter() - start_time
     print(f"Runtime: {runtime:.2f}s")
-
-    metrics_to_log = [
-        "actor_loss",
-        "critic_loss",
-        "entropy",
-        "episode_return",
-        "episode_cost_return",
-        "episode_length",
-        "thin_tiles_visited",
-        "cost_dist",
-    ]
 
     log.save_wandb(
         project="FrozenLake",
         algo_name="ppo",
         env_name=env.name,
         metrics=all_metrics,
-        metrics_to_log=metrics_to_log,
+        config=config,
     )
 
     log.save_local(
         algo_name="ppo",
         env_name=env.name,
         metrics=all_metrics,
-        metrics_to_log=metrics_to_log,
+        config=config,
     )
