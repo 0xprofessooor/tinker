@@ -4,10 +4,10 @@ import flax.linen as nn
 import numpy as np
 import optax
 from flax.linen.initializers import constant, orthogonal
-from typing import NamedTuple, Tuple
+from flax import struct
+from typing import Tuple
 from gymnax.environments import EnvParams
 from gymnax.environments.environment import Environment
-import chex
 from flax.training.train_state import TrainState
 import distrax
 from safenax import EcoAntV2
@@ -64,7 +64,8 @@ class ActorCritic(nn.Module):
         return pi, jnp.squeeze(critic, axis=-1), jnp.squeeze(cost_critic, axis=-1)
 
 
-class Transition(NamedTuple):
+@struct.dataclass
+class Transition:
     done: jax.Array
     action: jax.Array
     value: jax.Array
@@ -77,76 +78,92 @@ class Transition(NamedTuple):
     info: jax.Array
 
 
+@struct.dataclass
+class DynamicConfig:
+    """Configuration for dynamic parameters during CPPO training.
+
+    :param rng: Random number generator key.
+    :param env_params: Environment parameters.
+    :param cvar_limit: CVaR limit for cost constraint.
+    :param cvar_probability: CVaR probability level.
+    :param lam_start: Initial value for the Lagrange multiplier.
+    :param lam_lr: Learning rate for updating the Lagrange multiplier.
+    :param lr: Learning rate for the optimizer.
+    :param gae_gamma: Discount factor for the returns.
+    :param gae_lambda: Lambda for the Generalized Advantage Estimation.
+    :param entropy_coeff: Coefficient for the entropy loss.
+    :param value_coeff: Coefficient for the value loss.
+    :param cost_value_coeff: Coefficient for the cost value loss.
+    :param max_grad_norm: Maximum gradient norm for clipping.
+    :param ratio_clip: The clipping factor for the clipped loss.
+    :param cvar_clip_ratio: Clipping ratio for CVaR penalty.
+    """
+
+    rng: jax.Array
+    env_params: EnvParams
+    cvar_limit: float
+    cvar_probability: float
+    lam_start: float = 0.5
+    lam_lr: float = 1e-3
+    lr: float = 3e-4
+    gae_gamma: float = 0.99
+    gae_lambda: float = 0.95
+    entropy_coeff: float = 0.01
+    value_coeff: float = 0.5
+    cost_value_coeff: float = 0.5
+    max_grad_norm: float = 0.5
+    ratio_clip: float = 0.2
+    cvar_clip_ratio: float = 0.05
+
+
 def make_train(
     env: Environment,
-    env_params: EnvParams,
     num_steps: int,
     num_envs: int,
     train_freq: int,
     batch_size: int,
     num_epochs: int,
-    cvar_limit: float,
-    cvar_probability: float,
-    lam_start: float = 0.5,
-    lam_lr: float = 1e-3,
     activation: callable = nn.tanh,
-    lr: float = 3e-4,
-    anneal_lr: bool = False,
-    gae_gamma: float = 0.99,
-    gae_lambda: float = 0.95,
-    entropy_coeff: float = 0.01,
-    value_coeff: float = 0.5,
-    cost_value_coeff: float = 0.5,
-    max_grad_norm: float = 0.5,
-    ratio_clip: float = 0.2,
-    cvar_clip_ratio: float = 0.05,
+    anneal_lr: bool = True,
 ):
     """Generate a jitted JAX CPPO train function.
 
     :param env: Gymnax environment.
-    :param env_params: Environment parameters.
     :param num_steps: Number of steps to train per environment.
     :param num_envs: Number of parallel environments to run.
     :param train_freq: Number of steps to run between training updates.
     :param batch_size: Minibatch size to make a single gradient descent step on.
     :param num_epochs: Number of epochs to train per update step.
     :param activation: Activation function for the network hidden layers.
-    :param lr: Learning rate for the optimizer.
     :param anneal_lr: Whether to anneal the learning rate over time.
-    :param gae_gamma: Discount factor for the returns.
-    :param gae_lambda: Lambda for the Generalized Advantage Estimation.
-    :param entropy_coeff: Coefficient for the entropy loss.
-    :param value_coeff: Coefficient for the value loss.
-    :param max_grad_norm: Maximum gradient norm for clipping.
-    :param ratio_clip: The clipping factor for the clipped loss
     """
 
     num_updates = num_steps // train_freq
     num_minibatches = (num_envs * train_freq) // batch_size
     env = LogWrapper(env)
 
-    def linear_schedule(count):
-        frac = 1.0 - (count // (num_minibatches * num_epochs)) / num_updates
-        return lr * frac
+    def train(config: DynamicConfig) -> Tuple[TrainState, dict]:
+        def linear_schedule(count):
+            frac = 1.0 - (count // (num_minibatches * num_epochs)) / num_updates
+            return config.lr * frac
 
-    def train(rng: chex.PRNGKey) -> Tuple[TrainState, dict]:
         # INIT NETWORK
         network = ActorCritic(
-            env.action_space(env_params).shape[0], activation=activation
+            env.action_space(config.env_params).shape[0], activation=activation
         )
-        rng, _rng = jax.random.split(rng)
-        obs_space = env.observation_space(env_params)
+        rng, _rng = jax.random.split(config.rng)
+        obs_space = env.observation_space(config.env_params)
         init_x = jnp.zeros(obs_space.shape)
         network_params = network.init(_rng, init_x)
         if anneal_lr:
             tx = optax.chain(
-                optax.clip_by_global_norm(max_grad_norm),
+                optax.clip_by_global_norm(config.max_grad_norm),
                 optax.adam(learning_rate=linear_schedule, eps=1e-5),
             )
         else:
             tx = optax.chain(
-                optax.clip_by_global_norm(max_grad_norm),
-                optax.adam(lr, eps=1e-5),
+                optax.clip_by_global_norm(config.max_grad_norm),
+                optax.adam(config.lr, eps=1e-5),
             )
         train_state = TrainState.create(
             apply_fn=network.apply,
@@ -157,11 +174,13 @@ def make_train(
         # INIT ENV
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, num_envs)
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
+        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(
+            reset_rng, config.env_params
+        )
         running_cost = jnp.zeros((num_envs,))
 
         # INIT OBSERVATION NORMALIZATION
-        obs_norm_state = norm.init(env.observation_space(env_params).shape)
+        obs_norm_state = norm.init(env.observation_space(config.env_params).shape)
         obs_norm_state = norm.welford_update(obs_norm_state, obsv)
 
         # TRAIN LOOP
@@ -194,7 +213,7 @@ def make_train(
                 rng_step = jax.random.split(_rng, num_envs)
                 next_obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0, None)
-                )(rng_step, env_state, action, env_params)
+                )(rng_step, env_state, action, config.env_params)
 
                 cost = info.get("cost", jnp.zeros_like(reward))
 
@@ -252,8 +271,10 @@ def make_train(
                         transition.value,
                         transition.reward,
                     )
-                    delta = reward + gae_gamma * next_value * (1 - done) - value
-                    gae = delta + gae_gamma * gae_lambda * (1 - done) * gae
+                    delta = reward + config.gae_gamma * next_value * (1 - done) - value
+                    gae = (
+                        delta + config.gae_gamma * config.gae_lambda * (1 - done) * gae
+                    )
                     return (gae, value), gae
 
                 _, advantages = jax.lax.scan(
@@ -268,7 +289,7 @@ def make_train(
             advantages, targets = _calculate_gae(traj_batch, last_val)
 
             cost_advantages, cost_targets = _calculate_gae(
-                traj_batch._replace(
+                traj_batch.replace(
                     reward=traj_batch.info["cost"], value=traj_batch.cost_value
                 ),
                 last_cost_val,
@@ -278,10 +299,12 @@ def make_train(
             num_episodes = jnp.maximum(is_terminal.sum(), 1.0)
             terminal_costs = traj_batch.running_cost + traj_batch.info["cost"]
             sparse_costs = jnp.where(is_terminal, terminal_costs, 0.0)
-            exceeds_threshold = (sparse_costs > cvar_limit) & is_terminal
+            exceeds_threshold = (sparse_costs > config.cvar_limit) & is_terminal
             num_exceedances = exceeds_threshold.sum()
             empirical_var_probability = num_exceedances / num_episodes
-            raw_cvar_num_episodes = (num_episodes * cvar_probability).astype(jnp.int32)
+            raw_cvar_num_episodes = (num_episodes * config.cvar_probability).astype(
+                jnp.int32
+            )
             cvar_num_episodes = jnp.maximum(raw_cvar_num_episodes, 1)
             sorted_terminal_costs = jnp.sort(sparse_costs.flatten())[::-1]
             batch_indices = jnp.arange(sorted_terminal_costs.shape[0])
@@ -290,15 +313,20 @@ def make_train(
 
             cost_returns = traj_batch.running_cost + traj_batch.cost_value
             sorted_costs = jnp.sort(cost_returns.flatten())[::-1]
-            k = int(num_envs * train_freq * cvar_probability)
-            nu = jnp.mean(sorted_costs[:k])
+            total_elements = sorted_costs.shape[0]
+            k = (num_envs * train_freq * config.cvar_probability).astype(jnp.int32)
+            k = jnp.maximum(1, k)
+            mask = jnp.arange(total_elements) < k
+            nu = jnp.sum(sorted_costs * mask) / k
             penalty_mask = jnp.where(cost_returns > nu, 1.0, 0.0)
-            penalty = (lam / cvar_probability) * (cost_returns - nu) * penalty_mask
-            limit = jnp.abs(traj_batch.value) * cvar_clip_ratio
+            penalty = (
+                (lam / config.cvar_probability) * (cost_returns - nu) * penalty_mask
+            )
+            limit = jnp.abs(traj_batch.value) * config.cvar_clip_ratio
             penalty = jnp.clip(penalty, -limit, limit)
             advantages = advantages - penalty
             cvar_estimate = jnp.where(raw_cvar_num_episodes > 0, traj_cvar, nu)
-            lam += lam_lr * (cvar_estimate - cvar_limit)
+            lam += config.lam_lr * (cvar_estimate - config.cvar_limit)
             lam = jnp.maximum(0.0, lam)
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -323,7 +351,7 @@ def make_train(
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
                             value - traj_batch.value
-                        ).clip(-ratio_clip, ratio_clip)
+                        ).clip(-config.ratio_clip, config.ratio_clip)
                         value_losses = jnp.square(value - targets)
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
                         value_loss = (
@@ -333,7 +361,7 @@ def make_train(
                         # CALCULATE COST VALUE LOSS
                         cost_value_pred_clipped = traj_batch.cost_value + (
                             cost_value - traj_batch.cost_value
-                        ).clip(-ratio_clip, ratio_clip)
+                        ).clip(-config.ratio_clip, config.ratio_clip)
                         cost_value_losses = jnp.square(cost_value - cost_targets)
                         cost_value_losses_clipped = jnp.square(
                             cost_value_pred_clipped - cost_targets
@@ -351,8 +379,8 @@ def make_train(
                         loss_actor2 = (
                             jnp.clip(
                                 ratio,
-                                1.0 - ratio_clip,
-                                1.0 + ratio_clip,
+                                1.0 - config.ratio_clip,
+                                1.0 + config.ratio_clip,
                             )
                             * advantages
                         )
@@ -362,9 +390,9 @@ def make_train(
 
                         total_loss = (
                             loss_actor
-                            + value_coeff * value_loss
-                            + cost_value_coeff * cost_value_loss
-                            - entropy_coeff * entropy
+                            + config.value_coeff * value_loss
+                            + config.cost_value_coeff * cost_value_loss
+                            - config.entropy_coeff * entropy
                         )
                         return total_loss, (
                             value_loss,
@@ -456,7 +484,7 @@ def make_train(
             obs_norm_state,
             obsv,
             running_cost,
-            lam_start,
+            config.lam_start,
             _rng,
         )
         runner_state, metrics = jax.lax.scan(
@@ -470,7 +498,7 @@ def make_train(
 if __name__ == "__main__":
     config = {
         "seed": 0,
-        "num_seeds": 5,
+        "num_runs": 5,
         "num_steps": int(1e6),
         "train_freq": 1000,
         "batch_size": 500,
@@ -487,30 +515,41 @@ if __name__ == "__main__":
 
     brax_env = EcoAntV2(battery_limit=config["cvar_limit"])
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
-    env_params = env.default_params
+    env_params = [env.default_params] * config["num_runs"]
 
     rng = jax.random.PRNGKey(config["seed"])
-    rngs = jax.random.split(rng, config["num_seeds"])
+    rngs = jax.random.split(rng, config["num_runs"])
+
+    dynamic_config = DynamicConfig(
+        rng=rngs,
+        env_params=jax.tree.map(lambda *xs: jnp.stack(xs), *env_params),
+        cvar_limit=jnp.ones(config["num_runs"]) * config["cvar_limit"],
+        cvar_probability=jnp.ones(config["num_runs"]) * config["cvar_probability"],
+        lam_start=jnp.ones(config["num_runs"]) * config["lam_start"],
+        lam_lr=jnp.ones(config["num_runs"]) * config["lam_lr"],
+        lr=jnp.ones(config["num_runs"]) * 3e-4,
+        gae_gamma=jnp.ones(config["num_runs"]) * 0.99,
+        gae_lambda=jnp.ones(config["num_runs"]) * 0.95,
+        entropy_coeff=jnp.ones(config["num_runs"]) * config["entropy_coeff"],
+        value_coeff=jnp.ones(config["num_runs"]) * 0.5,
+        cost_value_coeff=jnp.ones(config["num_runs"]) * 0.5,
+        max_grad_norm=jnp.ones(config["num_runs"]) * 0.5,
+        ratio_clip=jnp.ones(config["num_runs"]) * 0.2,
+        cvar_clip_ratio=jnp.ones(config["num_runs"]) * config["cvar_clip_ratio"],
+    )
 
     train_fn = make_train(
         env,
-        env_params,
         num_steps=config["num_steps"],
         train_freq=config["train_freq"],
         batch_size=config["batch_size"],
         num_epochs=config["num_epochs"],
         num_envs=config["num_envs"],
-        cvar_probability=config["cvar_probability"],
-        cvar_limit=config["cvar_limit"],
-        lam_start=config["lam_start"],
-        lam_lr=config["lam_lr"],
         anneal_lr=config["anneal_lr"],
-        entropy_coeff=config["entropy_coeff"],
-        cvar_clip_ratio=config["cvar_clip_ratio"],
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
-    runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
+    runner_states, all_metrics = jax.block_until_ready(train_vjit(dynamic_config))
     runtime = time.perf_counter() - start_time
     print(f"Runtime: {runtime:.2f}s")
 
