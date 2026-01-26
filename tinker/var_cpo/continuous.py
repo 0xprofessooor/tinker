@@ -3,7 +3,7 @@
 Implements a VaR constrained CPO for safe reinforcement learning with chance constraints.
 """
 
-from typing import NamedTuple, Tuple, Callable
+from typing import Tuple, Callable
 import chex
 import distrax
 from flax import nnx, struct
@@ -79,7 +79,8 @@ class ActorCritic(nnx.Module):
         return pi, value, cost_value, aug_cost_value
 
 
-class Transition(NamedTuple):
+@struct.dataclass
+class Transition:
     """Transition tuple including cost information."""
 
     done: jax.Array
@@ -101,12 +102,50 @@ class Transition(NamedTuple):
 
 @struct.dataclass
 class CPOState:
-    """Extended state for CPO including constraint tracking."""
+    """Extended state for VaR-CPO including constraint tracking."""
 
     model_state: nnx.State
     opt_state: optax.OptState
     margin: float
     num_updates: int
+
+
+@struct.dataclass
+class DynamicConfig:
+    """Dynamic hyperparams for VaR-CPO.
+
+    :param rng: JAX random key.
+    :param env_params: Environment parameters.
+    :param var_threshold: Value-at-Risk threshold.
+    :param var_probability: Acceptable probability of exceeding the VaR threshold.
+    :param lr: Learning rate for the critic optimizer.
+    :param gae_gamma: Discount factor.
+    :param gae_lambda: Lambda for the Generalized Advantage Estimation.
+    :param cost_gamma: Discount factor for cost returns.
+    :param max_grad_norm: Maximum gradient norm for clipping.
+    :param target_kl: Target KL divergence threshold.
+    :param entropy_coeff: Entropy regularization coefficient.
+    :param backtrack_coeff: Coefficient for line search backtracking.
+    :param backtrack_iters: Maximum number of backtracking iterations.
+    :param damping_coeff: Damping coefficient for conjugate gradient.
+    :param margin_lr: Learning rate for the constraint margin.
+    """
+
+    rng: jax.Array
+    env_params: EnvParams
+    var_threshold: float
+    var_probability: float
+    lr: float = 3e-4
+    gae_gamma: float = 0.99
+    gae_lambda: float = 0.95
+    cost_gamma: float = 0.999
+    max_grad_norm: float = 0.5
+    target_kl: float = 0.01
+    entropy_coeff: float = 0.0
+    backtrack_coeff: float = 0.8
+    backtrack_iters: int = 10
+    damping_coeff: float = 0.1
+    margin_lr: float = 0.0
 
 
 def hvp(f: Callable, primals: Tuple, tangents: Tuple) -> jnp.ndarray:
@@ -251,61 +290,38 @@ def compute_cpo_step(
 
 def make_train(
     env: Environment,
-    env_params: EnvParams,
     num_steps: int,
     num_envs: int,
-    var_threshold: float,
-    var_probability: float,
     train_freq: int,
     critic_epochs: int = 80,
     activation: Callable = jax.nn.tanh,
-    lr: float = 3e-4,
-    anneal_lr: bool = False,
-    gae_gamma: float = 0.99,
-    gae_lambda: float = 0.95,
-    cost_gamma: float = 0.999,
-    max_grad_norm: float = 0.5,
-    target_kl: float = 0.01,
-    entropy_coeff: float = 0.0,
-    backtrack_coeff: float = 0.8,
-    backtrack_iters: int = 10,
-    damping_coeff: float = 0.1,
-    margin_lr: float = 0.05,
+    anneal_lr: bool = True,
     use_constraint: bool = True,
 ):
-    """Generate a jitted JAX CPO train function.
+    """Generate a jitted JAX VaR-CPO train function.
+
+    The arguments here are static and define the computational graph.
 
     :param env: Gymnax environment (must provide cost signals).
-    :param env_params: Environment parameters.
     :param num_steps: Number of steps to train per environment.
     :param num_envs: Number of parallel environments to run.
     :param train_freq: Number of steps to run between training updates.
     :param critic_epochs: Number of critic update iterations per rollout.
     :param activation: Activation function for the network hidden layers.
-    :param lr: Learning rate for the critic optimizer.
     :param anneal_lr: Whether to anneal the learning rate over time.
-    :param gae_gamma: Discount factor.
-    :param gae_lambda: Lambda for the Generalized Advantage Estimation.
-    :param cost_gamma: Discount factor for cost returns.
-    :param max_grad_norm: Maximum gradient norm for clipping.
-    :param target_kl: Target KL divergence threshold.
-    :param cost_limit: Constraint threshold for cumulative cost.
-    :param backtrack_coeff: Coefficient for line search backtracking.
-    :param backtrack_iters: Maximum number of backtracking iterations.
-    :param damping_coeff: Damping coefficient for conjugate gradient.
-    :param margin_lr: Learning rate for the constraint margin.
     :param use_constraint: Whether to use safety constraints.
     """
 
     num_updates = num_steps // train_freq
     env = LogWrapper(env)
 
-    def train(rng: chex.PRNGKey) -> Tuple[CPOState, dict]:
+    def train(config: DynamicConfig) -> Tuple[CPOState, dict]:
+        """Train the VaR-CPO agent. The arguments here are dynamic."""
         # INIT NETWORK
-        rng, model_rng = jax.random.split(rng)
+        rng, model_rng = jax.random.split(config.rng)
         model = ActorCritic(
-            obs_dim=env.observation_space(env_params).shape[0],
-            action_dim=env.action_space(env_params).shape[0],
+            obs_dim=env.observation_space(config.env_params).shape[0],
+            action_dim=env.action_space(config.env_params).shape[0],
             activation=activation,
             rngs=nnx.Rngs(model_rng),
         )
@@ -314,18 +330,18 @@ def make_train(
         # INIT OPTIMIZER
         if anneal_lr:
             schedule = optax.linear_schedule(
-                init_value=lr,
+                init_value=config.lr,
                 end_value=0.0,
                 transition_steps=num_updates * critic_epochs,
             )
             tx = optax.chain(
-                optax.clip_by_global_norm(max_grad_norm),
+                optax.clip_by_global_norm(config.max_grad_norm),
                 optax.adam(learning_rate=schedule, eps=1e-5),
             )
         else:
             tx = optax.chain(
-                optax.clip_by_global_norm(max_grad_norm),
-                optax.adam(lr, eps=1e-5),
+                optax.clip_by_global_norm(config.max_grad_norm),
+                optax.adam(config.lr, eps=1e-5),
             )
         opt_state = tx.init(params)
 
@@ -336,8 +352,10 @@ def make_train(
         # INIT ENV
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, num_envs)
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
-        obs_norm_state = norm.init(env.observation_space(env_params).shape)
+        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(
+            reset_rng, config.env_params
+        )
+        obs_norm_state = norm.init(env.observation_space(config.env_params).shape)
         obs_norm_state = norm.welford_update(obs_norm_state, obsv)
         norm_obsv = jax.vmap(norm.normalize, in_axes=(None, 0))(obs_norm_state, obsv)
         running_cost = jnp.zeros((num_envs,))
@@ -348,7 +366,7 @@ def make_train(
         )
 
         # pre-compute constant parameters
-        beta = (1 / var_probability) - 1
+        beta = (1 / config.var_probability) - 1
 
         # TRAIN LOOP
         def _update_step(
@@ -396,14 +414,14 @@ def make_train(
                 rng_step = jax.random.split(step_rng, num_envs)
                 next_obs, next_env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0, None)
-                )(rng_step, env_state, action, env_params)
+                )(rng_step, env_state, action, config.env_params)
 
                 # Extract cost from info (environment-dependent)
                 # For environments without explicit costs, cost = 0
                 cost = info.get("cost", jnp.zeros_like(reward))
                 aug_cost = (
                     beta * cost_discount * (cost**2)
-                    + 2.0 * (beta * running_cost + var_threshold) * cost
+                    + 2.0 * (beta * running_cost + config.var_threshold) * cost
                 )
 
                 transition = Transition(
@@ -437,13 +455,13 @@ def make_train(
                 next_cost_discount = jax.lax.select(
                     done,
                     jnp.ones_like(cost_discount),
-                    cost_discount * cost_gamma,
+                    cost_discount * config.cost_gamma,
                 )
 
                 next_norm_obs = jax.vmap(norm.normalize, in_axes=(None, 0))(
                     obs_norm_state, next_obs
                 )
-                next_norm_budget = next_running_cost / (var_threshold + 1e-8)
+                next_norm_budget = next_running_cost / (config.var_threshold + 1e-8)
                 next_aug_obs = jnp.concatenate(
                     [
                         next_norm_obs,
@@ -511,26 +529,24 @@ def make_train(
 
             # Reward advantages
             advantages, return_targets = _calculate_gae(
-                traj_batch, last_val, gae_gamma, gae_lambda
+                traj_batch, last_val, config.gae_gamma, config.gae_lambda
             )
 
             # Cost advantages
             cost_advantages, cost_targets = _calculate_gae(
-                traj_batch._replace(
-                    reward=traj_batch.cost, value=traj_batch.cost_value
-                ),
+                traj_batch.replace(reward=traj_batch.cost, value=traj_batch.cost_value),
                 last_cost_val,
-                cost_gamma,
-                gae_lambda,
+                config.cost_gamma,
+                config.gae_lambda,
             )
 
             aug_cost_advantages, aug_cost_targets = _calculate_gae(
-                traj_batch._replace(
+                traj_batch.replace(
                     reward=traj_batch.aug_cost, value=traj_batch.aug_cost_value
                 ),
                 last_aug_cost_val,
-                cost_gamma,
-                gae_lambda,
+                config.cost_gamma,
+                config.gae_lambda,
             )
 
             # Normalize reward advantages
@@ -549,7 +565,7 @@ def make_train(
                 ratio = jnp.exp(log_prob - traj_batch.log_prob)
 
                 policy_loss = -(ratio * advantages).mean() - (
-                    entropy_coeff * pi.entropy().mean()
+                    config.entropy_coeff * pi.entropy().mean()
                 )
 
                 return policy_loss
@@ -609,22 +625,22 @@ def make_train(
             traj_aug_cost_return = sparse_aug_costs.sum() / num_episodes
 
             # Compute empirical probability of exceeding VaR threshold
-            exceeds_threshold = (sparse_costs > var_threshold) & is_terminal
+            exceeds_threshold = (sparse_costs > config.var_threshold) & is_terminal
             num_exceedances = exceeds_threshold.sum()
             empirical_var_probability = num_exceedances / num_episodes
 
             # Compute constraint limit
             td_cost_return = (traj_batch.running_cost + cost_targets).mean()
-            is_mean_unsafe = td_cost_return > var_threshold
-            aug_cost_limit = (1 / var_probability) * (td_cost_return**2) + (
-                var_threshold**2
+            is_mean_unsafe = td_cost_return > config.var_threshold
+            aug_cost_limit = (1 / config.var_probability) * (td_cost_return**2) + (
+                config.var_threshold**2
             )
             # Compute constraint violation
             td_aug_cost_return = (traj_batch.running_aug_cost + aug_cost_targets).mean()
             c_cheb = td_aug_cost_return - aug_cost_limit
-            c_linear = td_cost_return - var_threshold
+            c_linear = td_cost_return - config.var_threshold
             c_raw = jax.lax.select(is_mean_unsafe, c_linear, c_cheb)
-            new_margin = jnp.maximum(0.0, cpo_state.margin + margin_lr * c_raw)
+            new_margin = jnp.maximum(0.0, cpo_state.margin + config.margin_lr * c_raw)
             c = c_raw + new_margin
 
             # Clone current model for reference in KL and line search
@@ -647,7 +663,8 @@ def make_train(
             flat_aug_cost_grads, _ = jax.flatten_util.ravel_pytree(aug_cost_grads)
             b_cheb = (
                 flat_aug_cost_grads
-                - (2 * td_cost_return / (var_probability + 1e-8)) * flat_cost_grads
+                - (2 * td_cost_return / (config.var_probability + 1e-8))
+                * flat_cost_grads
             )
             b = jax.lax.select(is_mean_unsafe, flat_cost_grads, b_cheb)
 
@@ -662,14 +679,14 @@ def make_train(
 
             # Compute CPO step direction
             direction, optim_case = compute_cpo_step(
-                g, b, c, hvp_fn, target_kl, use_constraint, damping_coeff
+                g, b, c, hvp_fn, config.target_kl, use_constraint, config.damping_coeff
             )
 
             # Backtracking line search
             def line_search_body(search_state):
                 i, current_params, accepted = search_state
 
-                step_size = backtrack_coeff**i
+                step_size = config.backtrack_coeff**i
                 new_flat_params = flat_params - step_size * direction
                 new_params = unravel_fn(new_flat_params)
 
@@ -688,7 +705,7 @@ def make_train(
                     if use_constraint
                     else True
                 )
-                kl_ok = kl <= target_kl
+                kl_ok = kl <= config.target_kl
 
                 accept = loss_improve & cost_improve & kl_ok
 
@@ -702,7 +719,7 @@ def make_train(
 
             def line_search_cond(search_state):
                 i, _, accepted = search_state
-                return (i < backtrack_iters) & (~accepted)
+                return (i < config.backtrack_iters) & (~accepted)
 
             # Line search (start with critic-updated params)
             _, final_params, accepted = jax.lax.while_loop(
@@ -810,30 +827,69 @@ def make_train(
 
 if __name__ == "__main__":
     SEED = 0
-    NUM_SEEDS = 5
+    NUM_RUNS = 30
     PROJECT_NAME = "EcoAnt"
 
     brax_env = EcoAntV2(battery_limit=500.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
-    env_params = env.default_params
+    env_params = [env.default_params] * NUM_RUNS
 
     rng = jax.random.PRNGKey(SEED)
-    rngs = jax.random.split(rng, NUM_SEEDS)
+    rng, *rng_params = jax.random.split(rng, 10)
+    lrs = jax.random.uniform(rng_params[0], (NUM_RUNS,), minval=1e-4, maxval=1e-3)
+    gae_gammas = jax.random.uniform(
+        rng_params[1], (NUM_RUNS,), minval=0.9, maxval=0.999
+    )
+    gae_lambdas = jax.random.uniform(
+        rng_params[2], (NUM_RUNS,), minval=0.9, maxval=0.999
+    )
+    max_grad_norms = jax.random.uniform(
+        rng_params[3], (NUM_RUNS,), minval=0.1, maxval=0.9
+    )
+    target_kls = jax.random.uniform(
+        rng_params[4], (NUM_RUNS,), minval=0.001, maxval=0.025
+    )
+    entropy_coeffs = jax.random.uniform(
+        rng_params[5], (NUM_RUNS,), minval=0.0, maxval=0.01
+    )
+    backtrack_coeffs = jax.random.uniform(
+        rng_params[6], (NUM_RUNS,), minval=0.5, maxval=0.95
+    )
+    backtrack_iters = jax.random.randint(
+        rng_params[7], (NUM_RUNS,), minval=5, maxval=15
+    )
+    damping_coeffs = jax.random.uniform(
+        rng_params[8], (NUM_RUNS,), minval=0.05, maxval=0.2
+    )
+    rngs = jax.random.split(rng, NUM_RUNS)
+
+    dynamic_config = DynamicConfig(
+        rng=rngs,
+        env_params=jax.tree.map(lambda *xs: jnp.stack(xs), *env_params),
+        var_threshold=jnp.ones(NUM_RUNS) * 500.0,
+        var_probability=jnp.ones(NUM_RUNS) * 0.1,
+        lr=lrs,
+        gae_gamma=gae_gammas,
+        gae_lambda=gae_lambdas,
+        cost_gamma=jnp.ones(NUM_RUNS) * 0.999,
+        max_grad_norm=max_grad_norms,
+        target_kl=target_kls,
+        entropy_coeff=entropy_coeffs,
+        backtrack_coeff=backtrack_coeffs,
+        backtrack_iters=backtrack_iters,
+        damping_coeff=damping_coeffs,
+        margin_lr=jnp.ones(NUM_RUNS) * 0.0,
+    )
 
     train_fn = make_train(
         env,
-        env_params,
         num_steps=int(2e6),
         num_envs=5,
         train_freq=100,
-        var_probability=0.1,
-        var_threshold=500.0,
-        margin_lr=0.0,
-        anneal_lr=True,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
-    runner_states, all_metrics = jax.block_until_ready(train_vjit(rngs))
+    runner_states, all_metrics = jax.block_until_ready(train_vjit(dynamic_config))
     runtime = time.perf_counter() - start_time
     print(f"Runtime: {runtime:.2f}s")
 
