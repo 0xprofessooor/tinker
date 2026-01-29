@@ -17,8 +17,4 @@ You'll also need to add your Weights and Biases key in a `.env` file as shown in
 WANDB_KEY="YOUR_WANDB_API_KEY"
 ```
 
-Each algorithm file is a script that can be run with:
-
-```bash
-uv run -m tinker.<YOUR_ALGORITHM_FILENAME>
-```
+There is a `README.md` file in each algorithm folder with more details on how to run.
