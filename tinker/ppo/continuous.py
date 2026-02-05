@@ -157,7 +157,7 @@ class Transition:
     log_prob: jax.Array
     obs: jax.Array
     next_obs: jax.Array
-    info: jax.Array
+    info: dict
 
 
 @struct.dataclass

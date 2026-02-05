@@ -69,7 +69,7 @@ class Transition:
     reward: jax.Array
     log_prob: jax.Array
     obs: jax.Array
-    info: jax.Array
+    info: dict
 
 
 @struct.dataclass
