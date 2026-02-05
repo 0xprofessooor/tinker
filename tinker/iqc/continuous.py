@@ -152,8 +152,8 @@ def make_train(
 
         runner_state = (env_state, model_state, opt_state, buffer_state, obsv, rng)
 
-        def _update_step(runner_state, update_idx):
-            def _env_step(runner_state, _):
+        def _update_step(runner_state: tuple, update_idx: int):
+            def _env_step(runner_state: tuple, _):
                 env_state, model_state, opt_state, buffer_state, obsv, rng = (
                     runner_state
                 )
@@ -172,6 +172,7 @@ def make_train(
                 )(rng_step, env_state, action, config.env_params)
 
                 transition = Transition(
+                    state=env_state,
                     obs=obsv,
                     action=action,
                     reward=reward,
@@ -196,8 +197,7 @@ def make_train(
                 _env_step, runner_state, None, length=train_freq
             )
 
-            @nnx.jit
-            def _update_epoch(runner_state, _):
+            def _update_epoch(runner_state: tuple, _):
                 env_state, model_state, opt_state, buffer_state, obsv, rng = (
                     runner_state
                 )
@@ -205,10 +205,8 @@ def make_train(
                 batch = buffer.sample(buffer_state, rng_sample).experience
                 tau = jax.random.uniform(rng_tau, shape=(batch_size, obs_dim))
 
-                model = nnx.merge(model_graphdef, model_state)
-                optimizer = nnx.merge(opt_graphdef, opt_state)
-
-                def loss_fn(model):
+                def loss_fn(model: StateModel) -> jax.Array:
+                    """Multivariate pinball loss"""
                     obs = batch.first.obs
                     target_obs = batch.second.obs
                     action = batch.first.action
@@ -222,6 +220,8 @@ def make_train(
                     )
                     return loss
 
+                model = nnx.merge(model_graphdef, model_state)
+                optimizer = nnx.merge(opt_graphdef, opt_state)
                 loss, grads = nnx.value_and_grad(loss_fn)(model)
                 optimizer.update(model, grads)
 
@@ -236,12 +236,17 @@ def make_train(
                     obsv,
                     rng,
                 )
-                metrics = {"loss": loss}
-                return runner_state, metrics
+                return runner_state, loss
 
-            runner_state, metrics = jax.lax.scan(
+            runner_state, loss = jax.lax.scan(
                 _update_epoch, runner_state, None, length=num_epochs
             )
+            metrics = {
+                "num_updates": update_idx,
+                "loss": loss.mean(),
+                "episode_return": traj_batch.info["returned_episode_returns"].mean(),
+                "episode_length": traj_batch.info["returned_episode_lengths"].mean(),
+            }
             return runner_state, metrics
 
         runner_state, metrics = jax.lax.scan(
