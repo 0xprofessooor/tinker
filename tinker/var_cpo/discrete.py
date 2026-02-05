@@ -1,4 +1,4 @@
-"""Value-at-Risk Constrained Policy Optimization (CPO)
+"""Value-at-Risk Constrained Policy Optimization (VaR-CPO)
 
 Implements a VaR constrained CPO for safe reinforcement learning with chance constraints.
 """
