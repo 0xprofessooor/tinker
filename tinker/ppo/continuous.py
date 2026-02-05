@@ -150,14 +150,14 @@ def load_policy(
 
 @struct.dataclass
 class Transition:
-    done: jnp.ndarray
-    action: jnp.ndarray
-    value: jnp.ndarray
-    reward: jnp.ndarray
-    log_prob: jnp.ndarray
-    obs: jnp.ndarray
-    next_obs: jnp.ndarray
-    info: jnp.ndarray
+    done: jax.Array
+    action: jax.Array
+    value: jax.Array
+    reward: jax.Array
+    log_prob: jax.Array
+    obs: jax.Array
+    next_obs: jax.Array
+    info: jax.Array
 
 
 @struct.dataclass
