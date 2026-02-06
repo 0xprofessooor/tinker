@@ -29,7 +29,7 @@ class StateModel(nnx.Module):
 
         self.encoder = nnx.Sequential(
             nnx.Linear(obs_dim + action_dim, 256, rngs=rngs),
-            nnx.LayerNorm(256, epsilon=1e-5, rngs=rngs),
+            nnx.LayerNorm(256, rngs=rngs),
             nnx.silu,
             nnx.Linear(256, obs_dim * embedding_dim, rngs=rngs),
         )
