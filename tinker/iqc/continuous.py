@@ -1,5 +1,6 @@
 """Implicit Quantile Control (IQC) continuous state space algorithm."""
 
+import time
 import flashbax as fbx
 import jax
 from jax import numpy as jnp
@@ -11,6 +12,7 @@ from safenax.portfolio_optimization.po_garch import (
     PortfolioOptimizationGARCH,
     GARCHParams,
 )
+from tinker import log
 
 
 class StateModel(nnx.Module):
@@ -27,7 +29,7 @@ class StateModel(nnx.Module):
 
         self.encoder = nnx.Sequential(
             nnx.Linear(obs_dim + action_dim, 256, rngs=rngs),
-            nnx.LayerNorm(256, rngs=rngs),
+            nnx.LayerNorm(256, epsilon=1e-5, rngs=rngs),
             nnx.silu,
             nnx.Linear(256, obs_dim * embedding_dim, rngs=rngs),
         )
@@ -97,8 +99,13 @@ def make_train(
     def train(config: DynamicConfig):
         obs_dim = env.observation_space(config.env_params).shape[0]
         action_dim = env.action_space(config.env_params).shape[0]
+        rng, model_rng, dummy_key = jax.random.split(config.rng, 3)
+
         model = StateModel(
-            obs_dim=obs_dim, action_dim=action_dim, embedding_dim=embedding_dim
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            embedding_dim=embedding_dim,
+            rngs=nnx.Rngs(model_rng),
         )
 
         # INIT OPTIMIZER
@@ -117,7 +124,7 @@ def make_train(
                 optax.clip_by_global_norm(config.max_grad_norm),
                 optax.adam(config.lr, eps=config.adam_eps),
             )
-        optimizer = nnx.Optimizer(model, tx)
+        optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         model_graphdef, model_state = nnx.split(model)
         opt_graphdef, opt_state = nnx.split(optimizer)
 
@@ -126,6 +133,7 @@ def make_train(
             max_length=buffer_size,
             min_length=batch_size,
             sample_batch_size=batch_size,
+            add_batch_size=num_envs,
         )
         buffer = buffer.replace(
             init=jax.jit(buffer.init),
@@ -134,21 +142,29 @@ def make_train(
             can_sample=jax.jit(buffer.can_sample),
         )
 
-        rngs = jax.random.split(config.rng, num_envs + 1)
-        rng = rngs[0]
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(
-            rngs[1:], config.env_params
+        # Create dummy transition for buffer init
+        _, dummy_state = env.reset(dummy_key, config.env_params)
+        dummy_action = env.action_space(config.env_params).sample(dummy_key)
+        dummy_obs, dummy_next_state, dummy_reward, dummy_done, dummy_info = env.step(
+            dummy_key, dummy_state, dummy_action, config.env_params
         )
 
-        # Create dummy transition for buffer init
         dummy_transition = Transition(
-            state=jax.tree.map(lambda x: x[0], env_state),
-            obs=jnp.zeros(obs_dim),
-            action=jnp.zeros(action_dim),
-            reward=jnp.zeros(()),
-            done=jnp.zeros(()),
+            state=dummy_next_state,
+            obs=dummy_obs,
+            action=dummy_action,
+            reward=dummy_reward,
+            done=dummy_done,
+            info=dummy_info,
         )
         buffer_state = buffer.init(dummy_transition)
+
+        # INIT ENV
+        init_rngs = jax.random.split(rng, num_envs + 1)
+        rng = init_rngs[0]
+        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(
+            init_rngs[1:], config.env_params
+        )
 
         runner_state = (env_state, model_state, opt_state, buffer_state, obsv, rng)
 
@@ -258,6 +274,7 @@ def make_train(
 
 
 if __name__ == "__main__":
+    NUM_SEEDS = 1
     SEED = 0
 
     rng = jax.random.PRNGKey(SEED)
@@ -286,5 +303,39 @@ if __name__ == "__main__":
         num_trajectories=10_000,
     )
     env_params = env.default_params.replace(max_steps=episode_length)
-    train_fn = make_train()
-    train_fn()
+    train_fn = make_train(
+        env=env,
+        num_steps=100_000,
+        num_envs=1,
+        train_freq=1000,
+        buffer_size=10_000,
+        batch_size=64,
+        num_epochs=10,
+    )
+
+    rngs = jax.random.split(rng_train, NUM_SEEDS)
+    dynamic_config = DynamicConfig(
+        rng=rngs,
+        env_params=jax.tree.map(lambda x: jnp.stack([x] * NUM_SEEDS), env_params),
+        lr=jnp.ones(NUM_SEEDS) * 3e-4,
+        adam_eps=jnp.ones(NUM_SEEDS) * 1e-12,
+        max_grad_norm=jnp.ones(NUM_SEEDS) * 1.0,
+    )
+    train_vjit = jax.jit(jax.vmap(train_fn))
+    start_time = time.perf_counter()
+    runner_states, all_metrics = jax.block_until_ready(train_vjit(dynamic_config))
+    runtime = time.perf_counter() - start_time
+    print(f"Runtime: {runtime:.2f}s")
+
+    log.save_local(
+        algo_name="iqc",
+        env_name=env.name,
+        metrics=all_metrics,
+    )
+
+    log.save_wandb(
+        project="test",
+        algo_name="iqc",
+        env_name=env.name,
+        metrics=all_metrics,
+    )
