@@ -1,4 +1,4 @@
-"""Implicit Quantile Control (IQC) continuous state space algorithm."""
+"""Thinker continuous state space algorithm."""
 
 import time
 import flashbax as fbx
