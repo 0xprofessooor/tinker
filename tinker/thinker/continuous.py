@@ -3,6 +3,7 @@
 import time
 import flashbax as fbx
 import jax
+from jax.nn import initializers
 from jax import numpy as jnp
 from flax import struct, nnx
 from gymnax.environments.environment import Environment, EnvParams, EnvState
@@ -21,46 +22,92 @@ class StateModel(nnx.Module):
         obs_dim: int,
         action_dim: int,
         embedding_dim: int = 64,
+        rnn_hidden_dim: int = 128,
         rngs: nnx.Rngs = None,
     ):
         super().__init__()
         self.obs_dim = obs_dim
+        self.action_dim = action_dim
         self.embedding_dim = embedding_dim
+        self.rnn_hidden_dim = rnn_hidden_dim
+
+        hidden_init = initializers.orthogonal(jnp.sqrt(2.0))
+        output_init = initializers.orthogonal(1.0)
+        zero_bias = initializers.constant(0.0)
+
+        self.gru_cell = nnx.GRUCell(
+            in_features=obs_dim + action_dim, hidden_features=rnn_hidden_dim, rngs=rngs
+        )
 
         self.encoder = nnx.Sequential(
-            nnx.Linear(obs_dim + action_dim, 256, rngs=rngs),
+            nnx.Linear(
+                rnn_hidden_dim + action_dim,
+                256,
+                kernel_init=hidden_init,
+                bias_init=zero_bias,
+                rngs=rngs,
+            ),
             nnx.LayerNorm(256, rngs=rngs),
             nnx.silu,
-            nnx.Linear(256, obs_dim * embedding_dim, rngs=rngs),
+            nnx.Linear(
+                256,
+                obs_dim * embedding_dim,
+                kernel_init=hidden_init,
+                bias_init=zero_bias,
+                rngs=rngs,
+            ),
         )
 
         self.cosine_net = nnx.Sequential(
-            nnx.Linear(embedding_dim, embedding_dim, rngs=rngs),
+            nnx.Linear(
+                embedding_dim,
+                embedding_dim,
+                kernel_init=hidden_init,
+                bias_init=zero_bias,
+                rngs=rngs,
+            ),
             nnx.relu,
         )
 
         self.decoder = nnx.Sequential(
-            nnx.Linear(embedding_dim, 256, rngs=rngs),
+            nnx.Linear(
+                embedding_dim,
+                256,
+                kernel_init=hidden_init,
+                bias_init=zero_bias,
+                rngs=rngs,
+            ),
             nnx.silu,
-            nnx.Linear(256, 1, rngs=rngs),
+            nnx.Linear(256, 1, kernel_init=output_init, bias_init=zero_bias, rngs=rngs),
         )
 
-    def __call__(self, obs: jax.Array, action: jax.Array, tau: jax.Array) -> jax.Array:
+    def get_h(self, h: jax.Array, obs: jax.Array, action: jax.Array) -> jax.Array:
+        gru_input = jnp.concatenate([obs, action], axis=-1)
+        h_next, _ = self.gru_cell(h, gru_input)
+        return h_next
+
+    def __call__(
+        self, h: jax.Array, obs: jax.Array, action: jax.Array, tau: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
         batch_size = obs.shape[0]
-        inputs = jnp.concatenate([obs, action], axis=-1)
-        psi = self.encoder(inputs)  # (batch_size, obs_dim * embedding_dim)
+
+        gru_input = jnp.concatenate([obs, action], axis=-1)
+        h_next, _ = self.gru_cell(h, gru_input)
+
+        enc_input = jnp.concatenate([h_next, action], axis=-1)
+        psi = self.encoder(enc_input)
         psi = psi.reshape(batch_size, self.obs_dim, self.embedding_dim)
 
-        tau_expanded = tau[..., None]  # (batch_size, obs_dim, 1)
-        i = jnp.arange(self.embedding_dim)[None, None, :]  # (1, 1, embedding_dim)
-        cosine_input = jnp.cos(
-            jnp.pi * i * tau_expanded
-        )  # (batch_size, obs_dim, embedding_dim)
-        phi = self.cosine_net(cosine_input)  # (batch_size, obs_dim, embedding_dim)
+        tau_expanded = tau[..., None]
+        i = jnp.arange(self.embedding_dim)[None, None, :]
+        cosine_input = jnp.cos(jnp.pi * i * tau_expanded)
+        phi = self.cosine_net(cosine_input)
 
-        h = psi * phi  # (batch_size, obs_dim, embedding_dim)
-        out = self.decoder(h)  # (batch_size, obs_dim, 1)
-        return out.squeeze(-1)  # (batch_size, obs_dim)
+        h_modulated = psi * phi
+        out = self.decoder(h_modulated)
+        next_obs_quantiles = out.squeeze(-1)
+
+        return h_next, next_obs_quantiles
 
 
 @struct.dataclass
@@ -71,6 +118,7 @@ class Transition:
     reward: jax.Array
     done: jax.Array
     info: dict
+    h: jax.Array
 
 
 @struct.dataclass
@@ -91,6 +139,7 @@ def make_train(
     batch_size: int,
     num_epochs: int,
     embedding_dim: int = 64,
+    rnn_hidden_dim: int = 128,
     anneal_lr: bool = False,
 ):
     num_updates = num_steps // train_freq
@@ -105,6 +154,7 @@ def make_train(
             obs_dim=obs_dim,
             action_dim=action_dim,
             embedding_dim=embedding_dim,
+            rnn_hidden_dim=rnn_hidden_dim,
             rngs=nnx.Rngs(model_rng),
         )
 
@@ -124,6 +174,7 @@ def make_train(
                 optax.clip_by_global_norm(config.max_grad_norm),
                 optax.adam(config.lr, eps=config.adam_eps),
             )
+
         optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         model_graphdef, model_state = nnx.split(model)
         opt_graphdef, opt_state = nnx.split(optimizer)
@@ -156,6 +207,7 @@ def make_train(
             reward=dummy_reward,
             done=dummy_done,
             info=dummy_info,
+            h=jnp.zeros((rnn_hidden_dim,)),
         )
         buffer_state = buffer.init(dummy_transition)
 
@@ -166,26 +218,37 @@ def make_train(
             init_rngs[1:], config.env_params
         )
 
-        runner_state = (env_state, model_state, opt_state, buffer_state, obsv, rng)
+        # Initialize GRU hidden state
+        h = jnp.zeros((num_envs, rnn_hidden_dim))
+
+        runner_state = (env_state, model_state, opt_state, buffer_state, obsv, h, rng)
 
         def _update_step(runner_state: tuple, update_idx: int):
             def _env_step(runner_state: tuple, _):
-                env_state, model_state, opt_state, buffer_state, obsv, rng = (
+                env_state, model_state, opt_state, buffer_state, obsv, h, rng = (
                     runner_state
                 )
-                rngs = jax.random.split(rng, num_envs + 1)
-                rng = rngs[0]
-                action_rngs = rngs[1:]
+
+                rng, action_rng = jax.random.split(rng)
+                action_rngs = jax.random.split(action_rng, num_envs)
                 action = jax.vmap(
                     env.action_space(config.env_params).sample, in_axes=0
                 )(action_rngs)
 
-                rng_step = jax.random.split(rng, num_envs + 1)
-                rng = rng_step[0]
-                rng_step = rng_step[1:]
+                rng, step_rng = jax.random.split(rng)
+                step_rngs = jax.random.split(step_rng, num_envs)
                 next_obsv, next_env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0, None)
-                )(rng_step, env_state, action, config.env_params)
+                )(step_rngs, env_state, action, config.env_params)
+
+                # UPDATE RNN STATE:
+                # Reconstruct model purely to advance the GRU state (stateless call)
+                model = nnx.merge(model_graphdef, model_state)
+                h_next = model.get_h(h, obsv, action)
+                _, model_state = nnx.split(model)
+
+                # Reset the RNN hidden state if the episode is done
+                h_next = jnp.where(done[:, None], jnp.zeros_like(h_next), h_next)
 
                 transition = Transition(
                     state=env_state,
@@ -194,16 +257,17 @@ def make_train(
                     reward=reward,
                     done=done,
                     info=info,
+                    h=h,  # Store the state that *caused* this transition
                 )
 
                 buffer_state = buffer.add(buffer_state, transition)
-
                 runner_state = (
                     next_env_state,
                     model_state,
                     opt_state,
                     buffer_state,
                     next_obsv,
+                    h_next,
                     rng,
                 )
 
@@ -214,20 +278,24 @@ def make_train(
             )
 
             def _update_epoch(runner_state: tuple, _):
-                env_state, model_state, opt_state, buffer_state, obsv, rng = (
+                env_state, model_state, opt_state, buffer_state, obsv, h, rng = (
                     runner_state
                 )
+
                 rng, rng_sample, rng_tau = jax.random.split(rng, 3)
                 batch = buffer.sample(buffer_state, rng_sample).experience
                 tau = jax.random.uniform(rng_tau, shape=(batch_size, obs_dim))
 
                 def loss_fn(model: StateModel) -> jax.Array:
-                    """Multivariate pinball loss"""
-                    obs = batch.first.obs
+                    # Flashbax provides pairs of sequential transitions
+                    batch_h = batch.first.h
+                    batch_obs = batch.first.obs
+                    batch_action = batch.first.action
                     target_obs = batch.second.obs
-                    action = batch.first.action
 
-                    pred_obs = model(obs, action, tau)
+                    # Feed the stored hidden state into the model
+                    _, pred_obs = model(batch_h, batch_obs, batch_action, tau)
+
                     delta = target_obs - pred_obs
                     loss = jnp.mean(
                         jnp.sum(
@@ -238,6 +306,7 @@ def make_train(
 
                 model = nnx.merge(model_graphdef, model_state)
                 optimizer = nnx.merge(opt_graphdef, opt_state)
+
                 loss, grads = nnx.value_and_grad(loss_fn)(model)
                 optimizer.update(model, grads)
 
@@ -250,6 +319,7 @@ def make_train(
                     opt_state,
                     buffer_state,
                     obsv,
+                    h,
                     rng,
                 )
                 return runner_state, loss
@@ -257,6 +327,7 @@ def make_train(
             runner_state, loss = jax.lax.scan(
                 _update_epoch, runner_state, None, length=num_epochs
             )
+
             metrics = {
                 "num_updates": update_idx,
                 "loss": loss.mean(),
@@ -328,14 +399,14 @@ if __name__ == "__main__":
     print(f"Runtime: {runtime:.2f}s")
 
     log.save_local(
-        algo_name="iqc",
+        algo_name="thinker",
         env_name=env.name,
         metrics=all_metrics,
     )
 
     log.save_wandb(
         project="test",
-        algo_name="iqc",
+        algo_name="thinker",
         env_name=env.name,
         metrics=all_metrics,
     )
