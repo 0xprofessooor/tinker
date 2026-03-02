@@ -1,6 +1,8 @@
-"""Thinker continuous state space algorithm."""
+"""ACPO continuous state space algorithm."""
 
 import time
+from typing import Callable
+import distrax
 import flashbax as fbx
 import jax
 from jax.nn import initializers
@@ -108,6 +110,78 @@ class StateModel(nnx.Module):
         next_obs_quantiles = out.squeeze(-1)
 
         return h_next, next_obs_quantiles
+
+
+class ActorCritic(nnx.Module):
+    """Combined actor-critic network with separate value and cost-value heads."""
+
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        activation: Callable = jax.nn.tanh,
+        rngs: nnx.Rngs = None,
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.activation = activation
+
+        hidden_init = initializers.orthogonal(jnp.sqrt(2.0))
+        output_init = initializers.orthogonal(1.0)
+        zero_bias = initializers.constant(0.0)
+
+        # Actor network
+        self.actor_fc1 = nnx.Linear(
+            obs_dim, 256, kernel_init=hidden_init, bias_init=zero_bias, rngs=rngs
+        )
+        self.actor_fc2 = nnx.Linear(
+            256, 256, kernel_init=hidden_init, bias_init=zero_bias, rngs=rngs
+        )
+        self.actor_mean = nnx.Linear(
+            256, action_dim, kernel_init=output_init, bias_init=zero_bias, rngs=rngs
+        )
+        self.log_std = nnx.Param(jnp.zeros(action_dim))
+
+        # Value critic (for rewards)
+        self.value_fc1 = nnx.Linear(
+            obs_dim, 256, kernel_init=hidden_init, bias_init=zero_bias, rngs=rngs
+        )
+        self.value_fc2 = nnx.Linear(
+            256, 256, kernel_init=hidden_init, bias_init=zero_bias, rngs=rngs
+        )
+        self.value_out = nnx.Linear(
+            256, 1, kernel_init=output_init, bias_init=zero_bias, rngs=rngs
+        )
+
+        # Cost-value critic (for costs)
+        self.cost_value_fc1 = nnx.Linear(
+            obs_dim, 256, kernel_init=hidden_init, bias_init=zero_bias, rngs=rngs
+        )
+        self.cost_value_fc2 = nnx.Linear(
+            256, 256, kernel_init=hidden_init, bias_init=zero_bias, rngs=rngs
+        )
+        self.cost_value_out = nnx.Linear(
+            256, 1, kernel_init=output_init, bias_init=zero_bias, rngs=rngs
+        )
+
+    def __call__(self, x):
+        # Actor network
+        actor_x = self.activation(self.actor_fc1(x))
+        actor_x = self.activation(self.actor_fc2(actor_x))
+        actor_mean = self.actor_mean(actor_x)
+        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(self.log_std[...]))
+
+        # Value critic
+        value_x = self.activation(self.value_fc1(x))
+        value_x = self.activation(self.value_fc2(value_x))
+        value = jnp.squeeze(self.value_out(value_x), axis=-1)
+
+        # Cost-value critic
+        cost_value_x = self.activation(self.cost_value_fc1(x))
+        cost_value_x = self.activation(self.cost_value_fc2(cost_value_x))
+        cost_value = jnp.squeeze(self.cost_value_out(cost_value_x), axis=-1)
+
+        return pi, value, cost_value
 
 
 @struct.dataclass
