@@ -201,7 +201,7 @@ class Transition:
 
 
 @struct.dataclass
-class CPOState:
+class TrainState:
     """Extended state for CPO including constraint tracking."""
 
     actor_params: nnx.State
@@ -210,6 +210,19 @@ class CPOState:
     critic_opt_params: optax.OptState
     state_opt_params: optax.OptState
     margin: float
+
+
+@struct.dataclass
+class RunnerState:
+    """State for the environment runner."""
+
+    train_state: TrainState
+    env_state: EnvState
+    obs: jax.Array
+    running_cost: jax.Array
+    cost_discount: jax.Array
+    h: jax.Array
+    rng: jax.Array
 
 
 @struct.dataclass
@@ -234,20 +247,20 @@ class DynamicConfig:
     rng: jax.Array
     env_params: EnvParams
     cost_limit: float
-    critic_lr: float = (3e-4,)
-    state_model_lr: float = (3e-4,)
-    gae_gamma: float = (0.99,)
-    cost_gamma: float = (0.999,)
-    gae_lambda: float = (0.95,)
-    max_grad_norm: float = (0.5,)
-    target_kl: float = (0.01,)
-    entropy_coeff: float = (0.0,)
-    backtrack_coeff: float = (0.8,)
-    backtrack_iters: int = (10,)
-    damping_coeff: float = (0.1,)
-    margin_lr: float = (0.05,)
-    adam_eps: float = (1e-5,)
-    gumbell_temperature: float = (1.0,)
+    critic_lr: float = 3e-4
+    state_model_lr: float = 3e-4
+    gae_gamma: float = 0.99
+    cost_gamma: float = 0.999
+    gae_lambda: float = 0.95
+    max_grad_norm: float = 0.5
+    target_kl: float = 0.01
+    entropy_coeff: float = 0.0
+    backtrack_coeff: float = 0.8
+    backtrack_iters: int = 10
+    damping_coeff: float = 0.1
+    margin_lr: float = 0.05
+    adam_eps: float = 1e-5
+    gumbell_temperature: float = 1.0
 
 
 def hvp(f: Callable, primals: Tuple, tangents: Tuple) -> jnp.ndarray:
@@ -477,33 +490,33 @@ def make_train(
             """Pass-through for continuous observations."""
             return obs
 
-    def train(config: DynamicConfig) -> Tuple[CPOState, dict]:
+    def train(config: DynamicConfig) -> Tuple[TrainState, dict]:
         # INIT NETWORK
         rng, actor_rng, critic_rng, state_model_rng = jax.random.split(config.rng, 4)
 
-        actor = Actor(
+        _actor = Actor(
             obs_dim=obs_dim,
             action_dim=action_dim,
             activation=activation,
             rngs=nnx.Rngs(actor_rng),
         )
-        actor_graph, actor_params = nnx.split(actor)
+        actor_graph, _actor_params = nnx.split(_actor)
 
-        critic = Critic(
+        _critic = Critic(
             obs_dim=obs_dim,
             activation=activation,
             rngs=nnx.Rngs(critic_rng),
         )
-        critic_graph, critic_params = nnx.split(critic)
+        critic_graph, _critic_params = nnx.split(_critic)
 
-        state_model = StateModel(
+        _state_model = StateModel(
             obs_dim=obs_dim,
             action_dim=action_dim,
             embedding_dim=embedding_dim,
             rnn_hidden_dim=rnn_hidden_dim,
             rngs=nnx.Rngs(state_model_rng),
         )
-        state_graph, state_model_params = nnx.split(state_model)
+        state_graph, _state_model_params = nnx.split(_state_model)
 
         # INIT OPTIMIZER
         if anneal_critic_lr:
@@ -521,7 +534,7 @@ def make_train(
                 optax.clip_by_global_norm(config.max_grad_norm),
                 optax.adam(config.critic_lr, eps=config.adam_eps),
             )
-        critic_opt_params = critic_tx.init(critic_params)
+        _critic_opt_params = critic_tx.init(_critic_params)
 
         if anneal_state_lr:
             schedule = optax.linear_schedule(
@@ -538,14 +551,14 @@ def make_train(
                 optax.clip_by_global_norm(config.max_grad_norm),
                 optax.adam(config.state_model_lr, eps=config.adam_eps),
             )
-        state_opt_params = state_model_tx.init(state_model_params)
+        _state_opt_params = state_model_tx.init(_state_model_params)
 
-        cpo_state = CPOState(
-            actor_params=actor_params,
-            critic_params=critic_params,
-            state_model_params=state_model_params,
-            critic_opt_params=critic_opt_params,
-            state_opt_params=state_opt_params,
+        train_state = TrainState(
+            actor_params=_actor_params,
+            critic_params=_critic_params,
+            state_model_params=_state_model_params,
+            critic_opt_params=_critic_opt_params,
+            state_opt_params=_state_opt_params,
             margin=0.0,
         )
 
@@ -563,32 +576,28 @@ def make_train(
 
         # TRAIN LOOP
         def _update_step(
-            runner_state: Tuple[CPOState, EnvState, jax.Array, chex.PRNGKey],
-            update_idx: jax.Array,
-        ):
-            actor_params = runner_state[0].actor_params
+            runner_state: RunnerState,
+            update_idx: int,
+        ) -> Tuple[RunnerState, dict]:
+            actor_params = runner_state.train_state.actor_params
             actor: Actor = nnx.merge(actor_graph, actor_params)
-            critic_params = runner_state[0].critic_params
+            critic_params = runner_state.train_state.critic_params
             critic: Critic = nnx.merge(critic_graph, critic_params)
-            state_model_params = runner_state[0].state_model_params
+            state_model_params = runner_state.train_state.state_model_params
             state_model: StateModel = nnx.merge(state_graph, state_model_params)
 
             # COLLECT TRAJECTORIES
             def _env_step(
-                runner_state: Tuple[
-                    CPOState,
-                    EnvState,
-                    jax.Array,
-                    jax.Array,
-                    jax.Array,
-                    jax.Array,
-                    jax.Array,
-                ],
+                runner_state: RunnerState,
                 _,
-            ):
-                cpo_state, env_state, obs, running_cost, cost_discount, h, rng = (
-                    runner_state
-                )
+            ) -> Tuple[RunnerState, Transition]:
+                train_state = runner_state.train_state
+                env_state = runner_state.env_state
+                obs = runner_state.obs
+                running_cost = runner_state.running_cost
+                cost_discount = runner_state.cost_discount
+                h = runner_state.h
+                rng = runner_state.rng
 
                 # SELECT ACTION
                 rng, action_rng = jax.random.split(rng)
@@ -640,26 +649,24 @@ def make_train(
                     cost_discount * config.cost_gamma,
                 )
 
-                runner_state = (
-                    cpo_state,
-                    next_env_state,
-                    next_obs,
-                    next_running_cost,
-                    next_cost_discount,
-                    h_next,
-                    rng,
+                runner_state = RunnerState(
+                    train_state=train_state,
+                    env_state=next_env_state,
+                    obs=next_obs,
+                    running_cost=next_running_cost,
+                    cost_discount=next_cost_discount,
+                    h=h_next,
+                    rng=rng,
                 )
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, train_freq
             )
+            train_state = runner_state.train_state
 
             # CALCULATE ADVANTAGE AND COST ADVANTAGE
-            cpo_state, env_state, last_obs, running_cost, cost_discount, h, rng = (
-                runner_state
-            )
-            last_val, last_cost_val = critic(last_obs)
+            last_val, last_cost_val = critic(runner_state.obs)
 
             # Reward advantages
             advantages, return_targets = calculate_gae(
@@ -693,13 +700,13 @@ def make_train(
 
             # Compute constraint violation
             c_raw = episode_cost_return - config.cost_limit
-            new_margin = jnp.maximum(0.0, cpo_state.margin + config.margin_lr * c_raw)
+            new_margin = jnp.maximum(0.0, train_state.margin + config.margin_lr * c_raw)
             c = c_raw + new_margin
             # c = c / (train_freq + 1e-8)
 
             # UPDATE POLICY (CPO STEP)
             # Clone current model for reference in KL and line search
-            (pi_old,) = actor(traj_batch.obs)
+            pi_old = actor(traj_batch.obs)
             flat_params, unravel_fn = jax.flatten_util.ravel_pytree(actor_params)
 
             rng, action_rng, state_rng = jax.random.split(rng, 3)
@@ -840,13 +847,15 @@ def make_train(
 
             # Update model parameters in place with final params from line search
             nnx.update(actor, final_params)
-            cpo_state = cpo_state.replace(
+            train_state = train_state.replace(
                 actor_params=final_params,
                 margin=new_margin,
             )
 
             # UPDATE VALUE CRITICS
-            def critic_loss_fn(params):
+            def critic_loss_fn(
+                params: nnx.State,
+            ) -> Tuple[jax.Array, Tuple[jax.Array, jax.Array]]:
                 """Compute critic loss (for both value and cost-value heads)."""
                 critic = nnx.merge(critic_graph, params)
                 value, cost_value = critic(traj_batch.obs)
@@ -855,70 +864,74 @@ def make_train(
                 total_loss = value_loss + cost_value_loss
                 return total_loss, (value_loss, cost_value_loss)
 
-            def _update_critic(cpo_state: CPOState, _):
+            def _update_critic(train_state: TrainState, _):
                 """Update value and cost critic parameters."""
-                params = cpo_state.critic_params
+                params = train_state.critic_params
 
                 (_, (value_loss, cost_value_loss)), grads = jax.value_and_grad(
                     critic_loss_fn, has_aux=True
                 )(params)
 
                 updates, new_opt_state = critic_tx.update(
-                    grads, cpo_state.critic_opt_params, params
+                    grads, train_state.critic_opt_params, params
                 )
                 new_params = optax.apply_updates(params, updates)
 
-                cpo_state = cpo_state.replace(
+                train_state = train_state.replace(
                     critic_params=new_params, critic_opt_params=new_opt_state
                 )
-                return cpo_state, (value_loss, cost_value_loss)
+                return train_state, (value_loss, cost_value_loss)
 
-            cpo_state, (value_losses, cost_value_losses) = jax.lax.scan(
-                _update_critic, cpo_state, None, critic_epochs
+            train_state, (value_losses, cost_value_losses) = jax.lax.scan(
+                _update_critic, train_state, None, critic_epochs
             )
 
-            def state_loss_fn(params):
+            def state_model_loss_fn(params: nnx.State) -> jax.Array:
                 """Compute state model loss."""
                 state_model: StateModel = nnx.merge(state_graph, params)
 
+                # 1. Forward Pass
                 embedded_obs = state_model.obs_embed(traj_batch.obs)
-                gru_input = jnp.concatenate(
-                    [embedded_obs, jax.nn.one_hot(traj_batch.action, action_dim)],
-                    axis=-1,
-                )
+                action_one_hot = jax.nn.one_hot(traj_batch.action, action_dim)
+
+                gru_input = jnp.concatenate([embedded_obs, action_one_hot], axis=-1)
                 h_next_pred, _ = state_model.gru_cell(traj_batch.h, gru_input)
-                dec_input = jnp.concatenate(
-                    [h_next_pred, jax.nn.one_hot(traj_batch.action, action_dim)],
-                    axis=-1,
-                )
+
+                dec_input = jnp.concatenate([h_next_pred, action_one_hot], axis=-1)
                 state_logits_pred = state_model.decoder(dec_input)
 
-                recon_loss = optax.softmax_cross_entropy_with_integer_labels(
-                    state_logits_pred, jnp.argmax(traj_batch.next_obs, axis=-1)
-                ).mean()
-
-                return recon_loss
-
-            def _update_state_model(cpo_state: CPOState, _):
-                """Update value and cost critic parameters."""
-                params = cpo_state.state_model_params
-
-                recon_loss, grads = jax.value_and_grad(state_loss_fn, has_aux=True)(
-                    params
+                # 2. Efficient Cross-Entropy (next_obs is already one-hot!)
+                recon_loss = optax.softmax_cross_entropy(
+                    logits=state_logits_pred, labels=traj_batch.next_obs
                 )
 
+                # 3. The Auto-Reset Mask
+                # 1.0 - done evaluates to 0.0 on terminal states, ignoring the teleportation
+                mask = 1.0 - traj_batch.done
+
+                # Compute the mean loss strictly over the valid physics transitions
+                masked_loss = (recon_loss * mask).sum() / (mask.sum() + 1e-8)
+
+                return masked_loss
+
+            def _update_state_model(train_state: TrainState, _):
+                """Update value and cost critic parameters."""
+                params = train_state.state_model_params
+
+                loss, grads = jax.value_and_grad(state_model_loss_fn)(params)
+
                 updates, new_opt_state = state_model_tx.update(
-                    grads, cpo_state.state_opt_params, params
+                    grads, train_state.state_opt_params, params
                 )
                 new_params = optax.apply_updates(params, updates)
 
-                cpo_state = cpo_state.replace(
+                train_state = train_state.replace(
                     state_model_params=new_params, state_opt_params=new_opt_state
                 )
-                return cpo_state, recon_loss
+                return train_state, loss
 
-            cpo_state, state_model_loss = jax.lax.scan(
-                _update_state_model, cpo_state, None, state_model_epochs
+            train_state, state_model_loss = jax.lax.scan(
+                _update_state_model, train_state, None, state_model_epochs
             )
 
             thin_tiles_visited = jnp.sum(
@@ -942,36 +955,27 @@ def make_train(
                 "accepted": accepted,
                 "thin_tiles_visited": thin_tiles_visited,
             }
-
-            runner_state = (
-                cpo_state,
-                env_state,
-                last_obs,
-                running_cost,
-                cost_discount,
-                h,
-                rng,
-            )
+            runner_state = runner_state.replace(train_state=train_state, rng=rng)
 
             return runner_state, metrics
 
         # RUN TRAINING LOOP
         rng, _rng = jax.random.split(rng)
-        runner_state = (
-            cpo_state,
-            env_state,
-            obsv,
-            running_cost,
-            cost_discount,
-            h,
-            _rng,
+        runner_state = RunnerState(
+            train_state=train_state,
+            env_state=env_state,
+            obs=obsv,
+            running_cost=running_cost,
+            cost_discount=cost_discount,
+            h=h,
+            rng=_rng,
         )
 
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, xs=jnp.arange(num_updates)
         )
 
-        return runner_state[0], metrics
+        return runner_state.train_state, metrics
 
     return train
 
