@@ -232,7 +232,8 @@ class DynamicConfig:
     :param rng: Random number generator key.
     :param env_params: Environment parameters.
     :param cost_limit: Maximum expected cost.
-    :param lr: Learning rate.
+    :param critic_lr: Critic learning rate.
+    :param state_model_lr: State model learning rate.
     :param gae_gamma: Discount factor for GAE.
     :param gae_lambda: Lambda parameter for GAE.
     :param max_grad_norm: Maximum gradient norm for clipping.
@@ -242,6 +243,8 @@ class DynamicConfig:
     :param backtrack_iters: Maximum backtracking line search iterations.
     :param damping_coeff: Damping coefficient for Hessian-vector product.
     :param margin_lr: Learning rate for constraint margin updates.
+    :param adam_eps: Epsilon parameter for Adam optimizer.
+    :param gumbel_temperature: Temperature for Gumbel-Softmax reparameterization.
     """
 
     rng: jax.Array
@@ -260,20 +263,20 @@ class DynamicConfig:
     damping_coeff: float = 0.1
     margin_lr: float = 0.05
     adam_eps: float = 1e-5
-    gumbell_temperature: float = 1.0
+    gumbel_temperature: float = 1.0
 
 
-def hvp(f: Callable, primals: Tuple, tangents: Tuple) -> jnp.ndarray:
+def hvp(f: Callable, primals: Tuple, tangents: Tuple) -> jax.Array:
     """Hessian-vector product using JAX autodiff."""
     return jax.jvp(jax.grad(f), primals, tangents)[1]
 
 
 def cg_solve(
     hvp_fn: Callable,
-    b: jnp.ndarray,
+    b: jax.Array,
     max_iter: int = 10,
     residual_tol: float = 1e-10,
-) -> jnp.ndarray:
+) -> jax.Array:
     """Conjugate gradient solver for Hx = b."""
 
     def cg_body(state):
@@ -301,14 +304,14 @@ def cg_solve(
 
 
 def compute_cpo_step(
-    g: jnp.ndarray,
-    b: jnp.ndarray,
-    c: jnp.ndarray,  # scalar array
+    g: jax.Array,
+    b: jax.Array,
+    c: jax.Array,  # scalar array
     hvp_fn: Callable,
     target_kl: float,
     use_constraint: bool,
     damping_coeff: float,
-) -> Tuple[jnp.ndarray, int]:
+) -> Tuple[jax.Array, int]:
     """
     Compute CPO step direction using constrained optimization.
 
@@ -664,6 +667,7 @@ def make_train(
                 _env_step, runner_state, None, train_freq
             )
             train_state = runner_state.train_state
+            rng = runner_state.rng
 
             # CALCULATE ADVANTAGE AND COST ADVANTAGE
             last_val, last_cost_val = critic(runner_state.obs)
@@ -734,7 +738,7 @@ def make_train(
                 # B. Differentiable Action Reparameterization (Gumbel-Softmax)
                 # Gradient flows from soft_action -> pi.logits -> params
                 soft_action = jax.nn.softmax(
-                    (pi.logits + action_noise) / config.gumbell_temperature, axis=-1
+                    (pi.logits + action_noise) / config.gumbel_temperature, axis=-1
                 )
 
                 # C. Differentiable Next State Prediction
@@ -743,7 +747,7 @@ def make_train(
                     traj_batch.h, traj_batch.obs, soft_action
                 )[1]
                 soft_next_obs = jax.nn.softmax(
-                    (next_obs_logits + state_noise) / config.gumbell_temperature,
+                    (next_obs_logits + state_noise) / config.gumbel_temperature,
                     axis=-1,
                 )
 
@@ -845,8 +849,6 @@ def make_train(
             final_params_flat, _ = jax.flatten_util.ravel_pytree(final_params)
             final_kl = kl_fn(final_params_flat)
 
-            # Update model parameters in place with final params from line search
-            nnx.update(actor, final_params)
             train_state = train_state.replace(
                 actor_params=final_params,
                 margin=new_margin,
@@ -891,14 +893,9 @@ def make_train(
                 state_model: StateModel = nnx.merge(state_graph, params)
 
                 # 1. Forward Pass
-                embedded_obs = state_model.obs_embed(traj_batch.obs)
-                action_one_hot = jax.nn.one_hot(traj_batch.action, action_dim)
-
-                gru_input = jnp.concatenate([embedded_obs, action_one_hot], axis=-1)
-                h_next_pred, _ = state_model.gru_cell(traj_batch.h, gru_input)
-
-                dec_input = jnp.concatenate([h_next_pred, action_one_hot], axis=-1)
-                state_logits_pred = state_model.decoder(dec_input)
+                state_logits_pred = state_model(
+                    traj_batch.h, traj_batch.obs, action_one_hot
+                )[1]
 
                 # 2. Efficient Cross-Entropy (next_obs is already one-hot!)
                 recon_loss = optax.softmax_cross_entropy(
@@ -1013,7 +1010,7 @@ if __name__ == "__main__":
         damping_coeff=jnp.ones(NUM_RUNS) * 0.1,
         margin_lr=jnp.ones(NUM_RUNS) * 0.0,
         adam_eps=jnp.ones(NUM_RUNS) * 1e-5,
-        gumbell_temperature=jnp.ones(NUM_RUNS) * 1.0,
+        gumbel_temperature=jnp.ones(NUM_RUNS) * 1.0,
     )
 
     train_fn = make_train(
