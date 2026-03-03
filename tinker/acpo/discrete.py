@@ -6,7 +6,6 @@ Implements CPO for safe reinforcement learning with cost constraints.
 
 from typing import Tuple, Callable
 import time
-import chex
 import distrax
 from flax import nnx, struct
 import jax
