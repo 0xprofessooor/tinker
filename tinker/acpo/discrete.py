@@ -1000,7 +1000,8 @@ if __name__ == "__main__":
         rng=rngs,
         env_params=jax.tree.map(lambda *xs: jnp.stack(xs), *env_params),
         cost_limit=jnp.ones(NUM_RUNS) * 20.0,
-        lr=jnp.ones(NUM_RUNS) * 3e-4,
+        critic_lr=jnp.ones(NUM_RUNS) * 3e-4,
+        state_model_lr=jnp.ones(NUM_RUNS) * 3e-4,
         gae_gamma=jnp.ones(NUM_RUNS) * 0.99,
         gae_lambda=jnp.ones(NUM_RUNS) * 0.95,
         cost_gamma=jnp.ones(NUM_RUNS) * 0.999,
@@ -1011,6 +1012,8 @@ if __name__ == "__main__":
         backtrack_iters=jnp.ones(NUM_RUNS) * 10,
         damping_coeff=jnp.ones(NUM_RUNS) * 0.1,
         margin_lr=jnp.ones(NUM_RUNS) * 0.0,
+        adam_eps=jnp.ones(NUM_RUNS) * 1e-5,
+        gumbell_temperature=jnp.ones(NUM_RUNS) * 1.0,
     )
 
     train_fn = make_train(
@@ -1018,7 +1021,6 @@ if __name__ == "__main__":
         num_steps=int(2e5),
         num_envs=5,
         train_freq=200,
-        anneal_lr=True,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
