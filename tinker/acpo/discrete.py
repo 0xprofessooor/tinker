@@ -757,7 +757,10 @@ def make_train(
                 # E. Differentiable Reward Calculation
                 # Gradient flows from reward -> soft_action -> pi.logits -> params
                 soft_reward = env.reward_fn(
-                    traj_batch.obs, soft_action, config.env_params
+                    jnp.argmax(traj_batch.obs, axis=-1),
+                    soft_action,
+                    soft_next_obs,
+                    config.env_params,
                 )
                 value_path = soft_reward + config.gae_gamma * next_value * (
                     1.0 - traj_batch.done
