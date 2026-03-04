@@ -458,6 +458,7 @@ def make_train(
     train_freq: int,
     critic_epochs: int = 80,
     state_model_epochs: int = 80,
+    num_taus: int = 8,
     embedding_dim: int = 64,
     rnn_hidden_dim: int = 128,
     activation: Callable = jax.nn.tanh,
@@ -877,21 +878,31 @@ def make_train(
 
             # UPDATE STATE MODEL
             def state_loss_fn(params: nnx.State, tau: jax.Array) -> jax.Array:
-                """Pinball loss"""
+                """Pinball loss averaged over multiple tau samples."""
                 state_model = nnx.merge(state_graph, params)
 
-                # Predict normalized next state
-                _, pred_norm_next_obs = state_model(
+                # 1. Vectorize the model over the tau dimension (axis 0)
+                # in_axes: (h: None, obs: None, action: None, tau: 0)
+                batched_forward = jax.vmap(state_model, in_axes=(None, None, None, 0))
+
+                # pred_norm_next_obs shape: (num_taus, *batch_shape, obs_dim)
+                _, pred_norm_next_obs = batched_forward(
                     traj_batch.h, traj_batch.norm_obs, traj_batch.action, tau
                 )
 
-                # Pinball Loss: delta * (tau - I(delta < 0))
-                delta = traj_batch.norm_next_obs - pred_norm_next_obs
+                # 2. Broadcast the target to match the new num_taus dimension
+                # target shape becomes: (1, *batch_shape, obs_dim)
+                target = traj_batch.norm_next_obs[None, ...]
+
+                # delta shape: (num_taus, *batch_shape, obs_dim)
+                delta = target - pred_norm_next_obs
                 indicator = (delta < 0.0).astype(delta.dtype)
 
+                # 3. Calculate pinball loss
                 pinball_loss = delta * (tau - indicator)
 
-                # Sum over independent dimensions (k=1 to d), mean over batch
+                # 4. Sum over independent features (axis=-1)
+                # Then take the mean over both the batch AND the num_taus dimensions
                 loss = pinball_loss.sum(axis=-1).mean()
 
                 return loss
@@ -910,7 +921,7 @@ def make_train(
                 return train_state, loss
 
             rng, tau_rng = jax.random.split(rng)
-            tau_shape = (state_model_epochs, *traj_batch.norm_obs.shape)
+            tau_shape = (state_model_epochs, num_taus, *traj_batch.norm_obs.shape)
             tau_epochs = jax.random.uniform(tau_rng, tau_shape)
             train_state, state_model_losses = jax.lax.scan(
                 _update_state_model, train_state, xs=tau_epochs
