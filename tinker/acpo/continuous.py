@@ -9,11 +9,8 @@ from jax import numpy as jnp
 from flax import struct, nnx
 from gymnax.environments.environment import Environment, EnvParams, EnvState
 import optax
-from safenax.wrappers import LogWrapper
-from safenax.portfolio_optimization.po_garch import (
-    PortfolioOptimizationGARCH,
-    GARCHParams,
-)
+from safenax import EcoAntV2
+from safenax.wrappers import BraxToGymnaxWrapper, LogWrapper
 from tinker import log, norm
 
 
@@ -266,7 +263,6 @@ class DynamicConfig:
     :param damping_coeff: Damping coefficient for Hessian-vector product.
     :param margin_lr: Learning rate for constraint margin updates.
     :param adam_eps: Epsilon parameter for Adam optimizer.
-    :param gumbel_temperature: Temperature for Gumbel-Softmax reparameterization.
     """
 
     rng: jax.Array
@@ -285,7 +281,6 @@ class DynamicConfig:
     damping_coeff: float = 0.1
     margin_lr: float = 0.05
     adam_eps: float = 1e-5
-    gumbel_temperature: float = 1.0
 
 
 def hvp(f: Callable, primals: tuple, tangents: tuple) -> jax.Array:
@@ -962,52 +957,40 @@ def make_train(
 
 
 if __name__ == "__main__":
-    NUM_SEEDS = 1
     SEED = 0
+    NUM_RUNS = 5
+
+    brax_env = EcoAntV2(battery_limit=1000.0)
+    env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
+    env_params = [env.default_params] * NUM_RUNS
 
     rng = jax.random.PRNGKey(SEED)
-    rng_train, rng_env = jax.random.split(rng)
-    garch_params = {
-        "APPL": GARCHParams(
-            mu=5e-4,
-            omega=1e-5,
-            alpha=jnp.array([0.05]),
-            beta=jnp.array([0.9]),
-            initial_price=1.0,
-        ),
-        "BTC": GARCHParams(
-            mu=1.5e-3,
-            omega=1e-4,
-            alpha=jnp.array([0.15]),
-            beta=jnp.array([0.8]),
-            initial_price=1.0,
-        ),
-    }
-    episode_length = 1000
-    env = PortfolioOptimizationGARCH(
-        rng=rng_env,
-        garch_params=garch_params,
-        num_samples=episode_length,
-        num_trajectories=10_000,
-    )
-    env_params = env.default_params.replace(max_steps=episode_length)
-    train_fn = make_train(
-        env=env,
-        num_steps=100_000,
-        num_envs=1,
-        train_freq=1000,
-        buffer_size=10_000,
-        batch_size=64,
-        num_epochs=10,
-    )
+    rngs = jax.random.split(rng, NUM_RUNS)
 
-    rngs = jax.random.split(rng_train, NUM_SEEDS)
     dynamic_config = DynamicConfig(
         rng=rngs,
-        env_params=jax.tree.map(lambda x: jnp.stack([x] * NUM_SEEDS), env_params),
-        lr=jnp.ones(NUM_SEEDS) * 3e-4,
-        adam_eps=jnp.ones(NUM_SEEDS) * 1e-12,
-        max_grad_norm=jnp.ones(NUM_SEEDS) * 1.0,
+        env_params=jax.tree.map(lambda *xs: jnp.stack(xs), *env_params),
+        cost_limit=jnp.ones(NUM_RUNS) * 500.0,
+        critic_lr=jnp.ones(NUM_RUNS) * 3e-4,
+        state_model_lr=jnp.ones(NUM_RUNS) * 3e-4,
+        gae_gamma=jnp.ones(NUM_RUNS) * 0.99,
+        gae_lambda=jnp.ones(NUM_RUNS) * 0.95,
+        cost_gamma=jnp.ones(NUM_RUNS) * 0.999,
+        max_grad_norm=jnp.ones(NUM_RUNS) * 0.5,
+        target_kl=jnp.ones(NUM_RUNS) * 0.01,
+        entropy_coeff=jnp.ones(NUM_RUNS) * 0.0,
+        backtrack_coeff=jnp.ones(NUM_RUNS) * 0.8,
+        backtrack_iters=jnp.ones(NUM_RUNS) * 10,
+        damping_coeff=jnp.ones(NUM_RUNS) * 0.1,
+        margin_lr=jnp.ones(NUM_RUNS) * 0.0,
+        adam_eps=jnp.ones(NUM_RUNS) * 1e-5,
+    )
+
+    train_fn = make_train(
+        env,
+        num_steps=int(2e6),
+        num_envs=5,
+        train_freq=500,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
@@ -1016,14 +999,14 @@ if __name__ == "__main__":
     print(f"Runtime: {runtime:.2f}s")
 
     log.save_local(
-        algo_name="thinker",
-        env_name=env.name,
+        algo_name="acpo",
+        env_name=brax_env.name,
         metrics=all_metrics,
     )
 
     log.save_wandb(
-        project="test",
-        algo_name="thinker",
-        env_name=env.name,
+        project="EcoAnt",
+        algo_name="acpo",
+        env_name=brax_env.name,
         metrics=all_metrics,
     )
