@@ -11,7 +11,7 @@ class RunningMeanStdState(NamedTuple):
 
 
 @functools.partial(jax.jit, static_argnames=["shape"])
-def init(shape: tuple):
+def init(shape: tuple) -> RunningMeanStdState:
     """Initialize running mean/std state."""
     return RunningMeanStdState(
         mean=jnp.zeros(shape),
@@ -21,7 +21,9 @@ def init(shape: tuple):
 
 
 @jax.jit
-def welford_update(state: RunningMeanStdState, batch_x: jax.Array):
+def welford_update(
+    state: RunningMeanStdState, batch_x: jax.Array
+) -> RunningMeanStdState:
     """
     Updates the running statistics using the parallel Welford algorithm.
 
@@ -57,7 +59,9 @@ def welford_update(state: RunningMeanStdState, batch_x: jax.Array):
 
 
 @jax.jit
-def ema_update(state: RunningMeanStdState, batch_x: jax.Array, momentum: float = 0.95):
+def ema_update(
+    state: RunningMeanStdState, batch_x: jax.Array, momentum: float = 0.95
+) -> RunningMeanStdState:
     """
     Updates the running statistics using exponential moving average.
     Suitable for non-stationary data.
@@ -84,7 +88,7 @@ def ema_update(state: RunningMeanStdState, batch_x: jax.Array, momentum: float =
 
 
 @jax.jit
-def normalize(state: RunningMeanStdState, x: jax.Array):
+def normalize(state: RunningMeanStdState, x: jax.Array) -> jax.Array:
     """
     Normalizes x to be roughly N(0, 1) and clips huge outliers.
     """
