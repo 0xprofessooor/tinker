@@ -236,6 +236,7 @@ class RunnerState:
 
     train_state: TrainState
     env_state: EnvState
+    obs_norm_state: norm.RunningMeanStdState
     obs: jax.Array
     norm_obs: jax.Array
     running_cost: jax.Array
@@ -552,6 +553,7 @@ def make_train(
         runner_state = RunnerState(
             train_state=train_state,
             env_state=env_state,
+            obs_norm_state=obs_norm_state,
             norm_obs=norm_obsv,
             obs=obsv,
             running_cost=running_cost,
@@ -576,6 +578,7 @@ def make_train(
             ) -> tuple[RunnerState, Transition]:
                 train_state = runner_state.train_state
                 env_state = runner_state.env_state
+                obs_norm_state = runner_state.obs_norm_state
                 obs = runner_state.obs
                 norm_obs = runner_state.norm_obs
                 running_cost = runner_state.running_cost
@@ -638,6 +641,7 @@ def make_train(
                 runner_state = RunnerState(
                     train_state=train_state,
                     env_state=next_env_state,
+                    obs_norm_state=obs_norm_state,
                     obs=next_obs,
                     norm_obs=next_norm_obs,
                     running_cost=next_running_cost,
@@ -652,6 +656,7 @@ def make_train(
             )
             train_state = runner_state.train_state
             rng = runner_state.rng
+            obs_norm_state = runner_state.obs_norm_state
 
             # CALCULATE ADVANTAGE AND COST ADVANTAGE
             last_val, last_cost_val = critic(runner_state.norm_obs)
@@ -704,7 +709,7 @@ def make_train(
             rng, tau_rng = jax.random.split(rng)
             tau = jax.random.uniform(tau_rng, traj_batch.norm_obs.shape)
 
-            action_noise = (traj_batch.action - pi_old.loc) / (pi_old.scale + 1e-8)
+            action_noise = (traj_batch.action - pi_old.loc) / (pi_old.scale_diag + 1e-8)
 
             _, pred_next_obs = state_model(
                 traj_batch.h, traj_batch.norm_obs, traj_batch.action, tau
@@ -721,7 +726,9 @@ def make_train(
                 ratio = jax.lax.stop_gradient(jnp.exp(log_prob - traj_batch.log_prob))
 
                 # B. Continuous Action Reparameterization (Gaussian Trick)
-                soft_action = pi.loc + pi.scale * jax.lax.stop_gradient(action_noise)
+                soft_action = pi.loc + pi.scale_diag * jax.lax.stop_gradient(
+                    action_noise
+                )
 
                 # C. Continuous State Reparameterization (Applying inferred state noise)
                 _, pred_next_obs_soft = state_model(
@@ -944,7 +951,9 @@ def make_train(
                 "cost_value_loss": cost_value_losses.mean(),
                 "state_model_loss": state_model_losses.mean(),
             }
-            runner_state = runner_state.replace(train_state=train_state, rng=rng)
+            runner_state = runner_state.replace(
+                train_state=train_state, obs_norm_state=obs_norm_state, rng=rng
+            )
 
             return runner_state, metrics
 
@@ -958,7 +967,7 @@ def make_train(
 
 if __name__ == "__main__":
     SEED = 0
-    NUM_RUNS = 5
+    NUM_RUNS = 1
 
     brax_env = EcoAntV2(battery_limit=1000.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
@@ -972,7 +981,7 @@ if __name__ == "__main__":
         env_params=jax.tree.map(lambda *xs: jnp.stack(xs), *env_params),
         cost_limit=jnp.ones(NUM_RUNS) * 500.0,
         critic_lr=jnp.ones(NUM_RUNS) * 3e-4,
-        state_model_lr=jnp.ones(NUM_RUNS) * 3e-4,
+        state_model_lr=jnp.ones(NUM_RUNS) * 5e-4,
         gae_gamma=jnp.ones(NUM_RUNS) * 0.99,
         gae_lambda=jnp.ones(NUM_RUNS) * 0.95,
         cost_gamma=jnp.ones(NUM_RUNS) * 0.999,
