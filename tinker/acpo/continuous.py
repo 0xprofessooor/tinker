@@ -10,7 +10,7 @@ from jax import numpy as jnp
 from flax import struct, nnx
 from gymnax.environments.environment import Environment, EnvParams, EnvState
 import optax
-from safenax import EcoAntV2
+from safenax import EcoAntV2, FragileAnt
 from safenax.wrappers import BraxToGymnaxWrapper, LogWrapper
 from tinker import log, norm
 
@@ -289,6 +289,15 @@ class DynamicConfig:
     damping_coeff: float = 0.1
     margin_lr: float = 0.05
     adam_eps: float = 1e-5
+
+
+def cosine_similarity(vec1: jax.Array, vec2: jax.Array) -> jax.Array:
+    """Compute cosine similarity between two vectors."""
+    dot_prod = jnp.dot(vec1, vec2)
+    norm_vec1 = jnp.linalg.norm(vec1) + 1e-8
+    norm_vec2 = jnp.linalg.norm(vec2) + 1e-8
+    cos_sim = dot_prod / (norm_vec1 * norm_vec2)
+    return jnp.clip(cos_sim, -1.0, 1.0)
 
 
 def hvp(f: Callable, primals: tuple, tangents: tuple) -> jax.Array:
@@ -726,135 +735,152 @@ def make_train(
             )
             state_noise = traj_batch.norm_next_obs - pred_next_obs
 
+            def policy_loss_model_based(params) -> jax.Array:
+                """Compute surrogate policy loss using Model-Based Pathwise gradients (SVG)."""
+                model: Actor = nnx.merge(actor_graph, params)
+                pi = model(traj_batch.norm_obs)
+
+                # A. Importance sampling weight (STRICTLY STOPPED GRADIENT)
+                log_prob = pi.log_prob(traj_batch.action)
+                ratio = jax.lax.stop_gradient(jnp.exp(log_prob - traj_batch.log_prob))
+
+                # B. Continuous Action Reparameterization (Gaussian Trick)
+                soft_action = pi.loc + pi.scale_diag * jax.lax.stop_gradient(
+                    action_noise
+                )
+
+                # C. Continuous State Reparameterization (Applying inferred state noise)
+                _, pred_next_obs_soft = state_model(
+                    traj_batch.h, traj_batch.norm_obs, soft_action, tau
+                )
+                soft_next_norm_obs = pred_next_obs_soft + jax.lax.stop_gradient(
+                    state_noise
+                )
+
+                # D. Pathwise Target Evaluation
+                next_value, _ = critic(soft_next_norm_obs)
+
+                # E. Pathwise Reward Evaluation
+                mean = obs_norm_state.mean
+                std = jnp.sqrt(obs_norm_state.var + 1e-8)
+                soft_next_obs = (soft_next_norm_obs * std) + mean
+                soft_reward = env.reward_fn(
+                    traj_batch.obs, soft_action, soft_next_obs, config.env_params
+                )
+
+                # The fully differentiable continuous pathway
+                value_path = soft_reward + config.gae_gamma * next_value * (
+                    1.0 - traj_batch.done
+                )
+
+                # F. Final Objective
+                policy_loss = -(ratio * value_path).mean() - (
+                    config.entropy_coeff * pi.entropy().mean()
+                )
+
+                return policy_loss
+
+            def policy_loss_model_free(params):
+                """Compute surrogate model-free policy loss."""
+                model: Actor = nnx.merge(actor_graph, params)
+                pi = model(traj_batch.norm_obs)
+                log_prob = pi.log_prob(traj_batch.action)
+                ratio = jnp.exp(log_prob - traj_batch.log_prob)
+
+                policy_loss = -(ratio * advantages).mean() - (
+                    config.entropy_coeff * pi.entropy().mean()
+                )
+
+                return policy_loss
+
+            def cost_loss_model_based(params) -> jax.Array:
+                """Compute surrogate cost constraint loss using Model-Based Pathwise gradients (SVG)."""
+                model: Actor = nnx.merge(actor_graph, params)
+                pi = model(traj_batch.norm_obs)
+
+                # A. Importance sampling weight (STRICTLY STOPPED GRADIENT)
+                log_prob = pi.log_prob(traj_batch.action)
+                ratio = jax.lax.stop_gradient(jnp.exp(log_prob - traj_batch.log_prob))
+
+                # B. Continuous Action Reparameterization (Gaussian Trick)
+                soft_action = pi.loc + pi.scale_diag * jax.lax.stop_gradient(
+                    action_noise
+                )
+
+                # C. Continuous State Reparameterization (Applying inferred state noise)
+                _, pred_next_obs_soft = state_model(
+                    traj_batch.h, traj_batch.norm_obs, soft_action, tau
+                )
+                soft_next_norm_obs = pred_next_obs_soft + jax.lax.stop_gradient(
+                    state_noise
+                )
+
+                # D. Pathwise Target Evaluation
+                _, next_value = critic(soft_next_norm_obs)
+
+                # E. Pathwise Reward Evaluation
+                mean = obs_norm_state.mean
+                std = jnp.sqrt(obs_norm_state.var + 1e-8)
+                soft_next_obs = (soft_next_norm_obs * std) + mean
+                soft_cost = env.cost_fn(
+                    traj_batch.obs, soft_action, soft_next_obs, config.env_params
+                )
+
+                # The fully differentiable continuous pathway
+                cost_value_path = soft_cost + config.cost_gamma * next_value * (
+                    1.0 - traj_batch.done
+                )
+
+                # F. Final Objective
+                cost_loss = (ratio * cost_value_path).mean()
+
+                return cost_loss
+
+            def cost_loss_model_free(params) -> jax.Array:
+                """Compute surrogate model-free cost constraint loss."""
+                model: Actor = nnx.merge(actor_graph, params)
+                pi = model(traj_batch.norm_obs)
+                log_prob = pi.log_prob(traj_batch.action)
+                ratio = jnp.exp(log_prob - traj_batch.log_prob)
+
+                cost_loss = (ratio * cost_advantages).mean()
+
+                return cost_loss
+
             if use_model_policy:
-
-                def policy_loss_fn(params) -> jax.Array:
-                    """Compute surrogate policy loss using Model-Based Pathwise gradients (SVG)."""
-                    model: Actor = nnx.merge(actor_graph, params)
-                    pi = model(traj_batch.norm_obs)
-
-                    # A. Importance sampling weight (STRICTLY STOPPED GRADIENT)
-                    log_prob = pi.log_prob(traj_batch.action)
-                    ratio = jax.lax.stop_gradient(
-                        jnp.exp(log_prob - traj_batch.log_prob)
-                    )
-
-                    # B. Continuous Action Reparameterization (Gaussian Trick)
-                    soft_action = pi.loc + pi.scale_diag * jax.lax.stop_gradient(
-                        action_noise
-                    )
-
-                    # C. Continuous State Reparameterization (Applying inferred state noise)
-                    _, pred_next_obs_soft = state_model(
-                        traj_batch.h, traj_batch.norm_obs, soft_action, tau
-                    )
-                    soft_next_norm_obs = pred_next_obs_soft + jax.lax.stop_gradient(
-                        state_noise
-                    )
-
-                    # D. Pathwise Target Evaluation
-                    next_value, _ = critic(soft_next_norm_obs)
-
-                    # E. Pathwise Reward Evaluation
-                    mean = obs_norm_state.mean
-                    std = jnp.sqrt(obs_norm_state.var + 1e-8)
-                    soft_next_obs = (soft_next_norm_obs * std) + mean
-                    soft_reward = env.reward_fn(
-                        traj_batch.obs, soft_action, soft_next_obs, config.env_params
-                    )
-
-                    # The fully differentiable continuous pathway
-                    value_path = soft_reward + config.gae_gamma * next_value * (
-                        1.0 - traj_batch.done
-                    )
-
-                    # F. Final Objective
-                    policy_loss = -(ratio * value_path).mean() - (
-                        config.entropy_coeff * pi.entropy().mean()
-                    )
-
-                    return policy_loss
+                policy_loss_fn = policy_loss_model_based
+                other_policy_loss_fn = policy_loss_model_free
             else:
-
-                def policy_loss_fn(params):
-                    """Compute surrogate model-free policy loss."""
-                    model: Actor = nnx.merge(actor_graph, params)
-                    pi = model(traj_batch.norm_obs)
-                    log_prob = pi.log_prob(traj_batch.action)
-                    ratio = jnp.exp(log_prob - traj_batch.log_prob)
-
-                    policy_loss = -(ratio * advantages).mean() - (
-                        config.entropy_coeff * pi.entropy().mean()
-                    )
-
-                    return policy_loss
-
+                policy_loss_fn = policy_loss_model_free
+                other_policy_loss_fn = policy_loss_model_based
             if use_model_cost:
-
-                def cost_loss_fn(params) -> jax.Array:
-                    """Compute surrogate cost constraint loss using Model-Based Pathwise gradients (SVG)."""
-                    model: Actor = nnx.merge(actor_graph, params)
-                    pi = model(traj_batch.norm_obs)
-
-                    # A. Importance sampling weight (STRICTLY STOPPED GRADIENT)
-                    log_prob = pi.log_prob(traj_batch.action)
-                    ratio = jax.lax.stop_gradient(
-                        jnp.exp(log_prob - traj_batch.log_prob)
-                    )
-
-                    # B. Continuous Action Reparameterization (Gaussian Trick)
-                    soft_action = pi.loc + pi.scale_diag * jax.lax.stop_gradient(
-                        action_noise
-                    )
-
-                    # C. Continuous State Reparameterization (Applying inferred state noise)
-                    _, pred_next_obs_soft = state_model(
-                        traj_batch.h, traj_batch.norm_obs, soft_action, tau
-                    )
-                    soft_next_norm_obs = pred_next_obs_soft + jax.lax.stop_gradient(
-                        state_noise
-                    )
-
-                    # D. Pathwise Target Evaluation
-                    _, next_value = critic(soft_next_norm_obs)
-
-                    # E. Pathwise Reward Evaluation
-                    mean = obs_norm_state.mean
-                    std = jnp.sqrt(obs_norm_state.var + 1e-8)
-                    soft_next_obs = (soft_next_norm_obs * std) + mean
-                    soft_cost = env.cost_fn(
-                        traj_batch.obs, soft_action, soft_next_obs, config.env_params
-                    )
-
-                    # The fully differentiable continuous pathway
-                    cost_value_path = soft_cost + config.cost_gamma * next_value * (
-                        1.0 - traj_batch.done
-                    )
-
-                    # F. Final Objective
-                    cost_loss = (ratio * cost_value_path).mean()
-
-                    return cost_loss
+                cost_loss_fn = cost_loss_model_based
+                other_cost_loss_fn = cost_loss_model_free
             else:
-
-                def cost_loss_fn(params) -> jax.Array:
-                    """Compute surrogate model-free cost constraint loss."""
-                    model: Actor = nnx.merge(actor_graph, params)
-                    pi = model(traj_batch.norm_obs)
-                    log_prob = pi.log_prob(traj_batch.action)
-                    ratio = jnp.exp(log_prob - traj_batch.log_prob)
-
-                    cost_loss = (ratio * cost_advantages).mean()
-
-                    return cost_loss
+                cost_loss_fn = cost_loss_model_free
+                other_cost_loss_fn = cost_loss_model_based
 
             # Get gradients of policy and cost losses
             old_policy_loss, g_tree = jax.value_and_grad(policy_loss_fn)(actor_params)
             old_cost_loss, b_tree = jax.value_and_grad(cost_loss_fn)(actor_params)
+            _, other_g_tree = jax.value_and_grad(other_policy_loss_fn)(actor_params)
+            _, other_b_tree = jax.value_and_grad(other_cost_loss_fn)(actor_params)
 
             # Flatten gradients
             g, _ = jax.flatten_util.ravel_pytree(g_tree)
             b, _ = jax.flatten_util.ravel_pytree(b_tree)
+            other_g, _ = jax.flatten_util.ravel_pytree(other_g_tree)
+            other_b, _ = jax.flatten_util.ravel_pytree(other_b_tree)
+
+            # Measure difference between model-based and model-free gradients
+            policy_grad_cos_sim = cosine_similarity(g, other_g)
+            cost_grad_cos_sim = cosine_similarity(b, other_b)
+            g_norm = jnp.linalg.norm(g)
+            other_g_norm = jnp.linalg.norm(other_g)
+            b_norm = jnp.linalg.norm(b)
+            other_b_norm = jnp.linalg.norm(other_b)
+            policy_grad_norm_ratio = g_norm / (other_g_norm + 1e-8)
+            cost_grad_norm_ratio = b_norm / (other_b_norm + 1e-8)
 
             def kl_fn(new_params_flat):
                 """Compute KL divergence between old and new policy."""
@@ -1006,7 +1032,7 @@ def make_train(
             )
 
             sparse_battery_used = jnp.where(
-                is_terminal, 500 - traj_batch.info["battery"], 0
+                is_terminal, 100 - traj_batch.info["battery"], 0
             )
             episode_battery_used = sparse_battery_used.sum() / num_episodes
             metrics = {
@@ -1021,11 +1047,15 @@ def make_train(
                     "returned_episode_cost_returns"
                 ].mean(),
                 "episode_length": traj_batch.info["returned_episode_lengths"].mean(),
-                "episode_battery_used": episode_battery_used,
+                "episode_budget_used": episode_battery_used,
                 "accepted": accepted,
                 "value_loss": value_losses.mean(),
                 "cost_value_loss": cost_value_losses.mean(),
                 "state_model_loss": state_model_losses.mean(),
+                "policy_grad_cos_sim": policy_grad_cos_sim,
+                "cost_grad_cos_sim": cost_grad_cos_sim,
+                "policy_grad_norm_ratio": policy_grad_norm_ratio,
+                "cost_grad_norm_ratio": cost_grad_norm_ratio,
             }
             runner_state = runner_state.replace(
                 train_state=train_state, obs_norm_state=obs_norm_state, rng=rng
@@ -1045,7 +1075,7 @@ if __name__ == "__main__":
     SEED = 0
     NUM_RUNS = 1
 
-    brax_env = EcoAntV2(battery_limit=1000.0)
+    brax_env = EcoAntV2(battery_limit=100.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = [env.default_params] * NUM_RUNS
 
@@ -1055,7 +1085,7 @@ if __name__ == "__main__":
     dynamic_config = DynamicConfig(
         rng=rngs,
         env_params=jax.tree.map(lambda *xs: jnp.stack(xs), *env_params),
-        cost_limit=jnp.ones(NUM_RUNS) * 500.0,
+        cost_limit=jnp.ones(NUM_RUNS) * 50.0,
         critic_lr=jnp.ones(NUM_RUNS) * 3e-4,
         state_model_lr=jnp.ones(NUM_RUNS) * 5e-4,
         gae_gamma=jnp.ones(NUM_RUNS) * 0.99,
@@ -1073,9 +1103,12 @@ if __name__ == "__main__":
 
     train_fn = make_train(
         env,
-        num_steps=int(2e6),
-        num_envs=5,
-        train_freq=500,
+        num_steps=int(200000),
+        num_envs=128,
+        train_freq=100,
+        critic_epochs=10,
+        state_model_epochs=10,
+        model_objective=ModelObjective.REWARD,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
@@ -1084,14 +1117,14 @@ if __name__ == "__main__":
     print(f"Runtime: {runtime:.2f}s")
 
     log.save_local(
-        algo_name="acpo",
+        algo_name="acpo_reward",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
 
     log.save_wandb(
         project="EcoAnt",
-        algo_name="acpo",
+        algo_name="acpo_reward",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
