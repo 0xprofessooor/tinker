@@ -16,7 +16,7 @@ from gymnax.environments.environment import Environment, EnvParams, EnvState
 import time
 
 from safenax.wrappers import BraxToGymnaxWrapper, LogWrapper
-from safenax import EcoAntV1
+from safenax import EcoAntV2, FragileAnt
 from tinker import norm, log
 
 
@@ -662,7 +662,7 @@ def make_train(
             )
 
             sparse_battery_used = jnp.where(
-                is_terminal, 500 - traj_batch.info["battery"], 0
+                is_terminal, 50 - traj_batch.info["battery"], 0
             )
             episode_battery_used = sparse_battery_used.sum() / num_episodes
 
@@ -678,7 +678,7 @@ def make_train(
                     "returned_episode_cost_returns"
                 ].mean(),
                 "episode_length": traj_batch.info["returned_episode_lengths"].mean(),
-                "episode_battery_used": episode_battery_used,
+                "episode_budget_used": episode_battery_used,
                 "accepted": accepted,
             }
 
@@ -717,9 +717,9 @@ def make_train(
 
 if __name__ == "__main__":
     SEED = 0
-    NUM_RUNS = 5
+    NUM_RUNS = 1
 
-    brax_env = EcoAntV1(battery_limit=500.0)
+    brax_env = EcoAntV2(battery_limit=100.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
     env_params = [env.default_params] * NUM_RUNS
 
@@ -729,7 +729,7 @@ if __name__ == "__main__":
     dynamic_config = DynamicConfig(
         rng=rngs,
         env_params=jax.tree.map(lambda *xs: jnp.stack(xs), *env_params),
-        cost_limit=jnp.ones(NUM_RUNS) * 0.1,
+        cost_limit=jnp.ones(NUM_RUNS) * 50.0,
         lr=jnp.ones(NUM_RUNS) * 3e-4,
         gae_gamma=jnp.ones(NUM_RUNS) * 0.99,
         gae_lambda=jnp.ones(NUM_RUNS) * 0.95,
@@ -745,9 +745,10 @@ if __name__ == "__main__":
 
     train_fn = make_train(
         env,
-        num_steps=int(2e6),
-        num_envs=5,
-        train_freq=500,
+        num_steps=int(200000),
+        num_envs=256,
+        train_freq=100,
+        critic_epochs=10,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
