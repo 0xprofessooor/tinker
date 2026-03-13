@@ -103,17 +103,17 @@ def gumbel_softmax(rng, logits, hard=True):
     return y_soft
 
 
-def lambda_return(last, term, reward, value, boot, disc, lamb):
-    live = (1 - term[:, 1:]) * disc
-    cont = (1 - last[:, 1:]) * lamb
-    interm = reward[:, 1:] + (1 - cont) * live * boot[:, 1:]
+def lambda_return(last, term, reward, value, bootstrap, discount, gae_lambda):
+    live = (1 - term[:, 1:]) * discount
+    cont = (1 - last[:, 1:]) * gae_lambda
+    interm = reward[:, 1:] + (1 - cont) * live * bootstrap[:, 1:]
 
     def _scan_fn(carry, i):
         out = interm[:, i] + live[:, i] * cont[:, i] * carry
         return out, out
 
     T = live.shape[1]
-    _, outs = jax.lax.scan(_scan_fn, boot[:, -1], jnp.arange(T - 1, -1, -1))
+    _, outs = jax.lax.scan(_scan_fn, bootstrap[:, -1], jnp.arange(T - 1, -1, -1))
     return jnp.flip(outs, axis=0).transpose(1, 0, 2)
 
 
@@ -187,10 +187,10 @@ class MLPStack(nnx.Module):
 
 class DeterNet(nnx.Module):
     def __init__(self, deter, hidden, stoch_flat, action_dim, rngs):
-        self.in0 = MLPBlock(deter, hidden, rngs)
-        self.in1 = MLPBlock(stoch_flat, hidden, rngs)
-        self.in2 = MLPBlock(action_dim, hidden, rngs)
-        self.hid = MLPBlock(3 * hidden + deter, deter, rngs)
+        self.deter_proj = MLPBlock(deter, hidden, rngs)
+        self.stoch_proj = MLPBlock(stoch_flat, hidden, rngs)
+        self.action_proj = MLPBlock(action_dim, hidden, rngs)
+        self.hidden_layer = MLPBlock(3 * hidden + deter, deter, rngs)
         self.gru = nnx.Linear(
             deter,
             3 * deter,
@@ -200,11 +200,11 @@ class DeterNet(nnx.Module):
         )
 
     def __call__(self, stoch_flat, deter, action_oh):
-        x0 = self.in0(deter)
-        x1 = self.in1(stoch_flat)
-        x2 = self.in2(action_oh)
-        x = jnp.concatenate([x0, x1, x2, deter], axis=-1)
-        x = self.hid(x)
+        deter_embed = self.deter_proj(deter)
+        stoch_embed = self.stoch_proj(stoch_flat)
+        action_embed = self.action_proj(action_oh)
+        x = jnp.concatenate([deter_embed, stoch_embed, action_embed, deter], axis=-1)
+        x = self.hidden_layer(x)
         gates = self.gru(x)
         reset, cand, update = jnp.split(gates, 3, axis=-1)
         reset = jax.nn.sigmoid(reset)
@@ -512,7 +512,7 @@ def make_train(
 
     def train(config: DynamicConfig) -> Tuple[dict, dict]:
         rng = config.rng
-        disc = 1.0 - 1.0 / config.horizon
+        discount = 1.0 - 1.0 / config.horizon
         num_actions = env.action_space(config.env_params).n
 
         rng, model_rng = jax.random.split(rng)
@@ -584,17 +584,17 @@ def make_train(
 
             # ----- COLLECT -----
             def _env_step(carry, _):
-                (env_state, obs, st, dt, prev_act, rng) = carry
+                (env_state, obs, stoch_state, deter_state, prev_action, rng) = carry
                 rng, act_rng, step_rng, rssm_rng = jax.random.split(rng, 4)
 
                 embed = model.encode(obs)
                 reset = jnp.zeros(num_envs, dtype=jnp.bool_)
                 rssm_rngs = jax.random.split(rssm_rng, num_envs)
-                new_st, new_dt, _ = jax.vmap(model.obs_step)(
-                    st, dt, prev_act, embed, reset, rssm_rngs
+                new_stoch, new_deter, _ = jax.vmap(model.obs_step)(
+                    stoch_state, deter_state, prev_action, embed, reset, rssm_rngs
                 )
 
-                feat = model.get_feat(new_st, new_dt)
+                feat = model.get_feat(new_stoch, new_deter)
                 action_logits = model.actor(feat)
                 act_dist = distrax.Categorical(logits=action_logits)
                 action_int = act_dist.sample(seed=act_rng)
@@ -609,35 +609,42 @@ def make_train(
                 transition = Transition(
                     obs=obs, action=action_oh, reward=reward, done=done, info=info
                 )
-                carry = (env_state, next_obs, new_st, new_dt, action_oh, rng)
-                return carry, (transition, new_st, new_dt)
+                carry = (env_state, next_obs, new_stoch, new_deter, action_oh, rng)
+                return carry, (transition, new_stoch, new_deter)
 
             init_carry = (env_state, obs, rssm_stoch, rssm_deter, prev_action, rng)
-            final_carry, (traj, traj_st, traj_dt) = jax.lax.scan(
+            final_carry, (traj, traj_stoch, traj_deter) = jax.lax.scan(
                 _env_step, init_carry, None, train_freq
             )
             (env_state, obs, rssm_stoch, rssm_deter, prev_action, rng) = final_carry
 
             # ----- FILL BUFFER -----
             flat_obs = traj.obs.reshape(-1, obs_input_dim)
-            flat_act = traj.action.reshape(-1, num_actions)
-            flat_rew = traj.reward.reshape(-1)
-            flat_done = traj.done.reshape(-1)
-            flat_st = traj_st.reshape(-1, stoch, discrete)
-            flat_dt = traj_dt.reshape(-1, deter)
+            flat_actions = traj.action.reshape(-1, num_actions)
+            flat_rewards = traj.reward.reshape(-1)
+            flat_dones = traj.done.reshape(-1)
+            flat_stoch = traj_stoch.reshape(-1, stoch, discrete)
+            flat_deter = traj_deter.reshape(-1, deter)
             n_new = flat_obs.shape[0]
 
             def _store(carry, i):
-                b, ptr, count = carry
+                buffer, ptr, count = carry
                 idx = ptr % buf_size
-                b = {
-                    k: b[k].at[idx].set(v[i])
+                buffer = {
+                    k: buffer[k].at[idx].set(v[i])
                     for k, v in zip(
-                        b.keys(),
-                        [flat_obs, flat_act, flat_rew, flat_done, flat_st, flat_dt],
+                        buffer.keys(),
+                        [
+                            flat_obs,
+                            flat_actions,
+                            flat_rewards,
+                            flat_dones,
+                            flat_stoch,
+                            flat_deter,
+                        ],
                     )
                 }
-                return (b, ptr + 1, jnp.minimum(count + 1, buf_size)), None
+                return (buffer, ptr + 1, jnp.minimum(count + 1, buf_size)), None
 
             (buf, buf_ptr, buf_count), _ = jax.lax.scan(
                 _store, (buf, buf_ptr, buf_count), jnp.arange(n_new)
@@ -659,182 +666,226 @@ def make_train(
                     buf["deter"][idx[0]],
                 )
 
-            s_obs, s_act, s_rew, s_done, s_st0, s_dt0 = jax.vmap(_get_slice)(starts)
+            (
+                sampled_obs,
+                sampled_actions,
+                sampled_rewards,
+                sampled_dones,
+                init_stoch,
+                init_deter,
+            ) = jax.vmap(_get_slice)(starts)
 
-            def _loss_fn(params, slow_p, ret_ema, rng):
-                m = nnx.merge(graphdef, params)
-                m_slow = nnx.merge(graphdef, slow_p)
-                B, T = s_obs.shape[:2]
+            def _loss_fn(params, slow_params, ret_ema, rng):
+                model = nnx.merge(graphdef, params)
+                slow_model = nnx.merge(graphdef, slow_params)
+                B, T = sampled_obs.shape[:2]
                 BT = B * T
 
-                embed = m.encode(s_obs.reshape(BT, -1)).reshape(B, T, -1)
+                embed = model.encode(sampled_obs.reshape(BT, -1)).reshape(B, T, -1)
 
                 def _scan(carry, t):
-                    sp, dp, rng = carry
-                    rng, srng = jax.random.split(rng)
-                    srngs = jax.random.split(srng, B)
+                    prev_stoch, prev_deter, rng = carry
+                    rng, scan_rng = jax.random.split(rng)
+                    scan_rngs = jax.random.split(scan_rng, B)
                     is_first = jnp.where(
                         t == 0,
                         jnp.ones(B, dtype=jnp.bool_),
-                        s_done[:, jnp.maximum(t - 1, 0)],
+                        sampled_dones[:, jnp.maximum(t - 1, 0)],
                     )
-                    ns, nd, lg = jax.vmap(m.obs_step)(
-                        sp,
-                        dp,
-                        s_act[:, jnp.maximum(t - 1, 0)],
+                    new_stoch, new_deter, logits = jax.vmap(model.obs_step)(
+                        prev_stoch,
+                        prev_deter,
+                        sampled_actions[:, jnp.maximum(t - 1, 0)],
                         embed[:, t],
                         is_first,
-                        srngs,
+                        scan_rngs,
                     )
-                    return (ns, nd, rng), (ns, nd, lg)
+                    return (new_stoch, new_deter, rng), (new_stoch, new_deter, logits)
 
                 rng, rssm_rng = jax.random.split(rng)
-                _, (p_st, p_dt, p_lg) = jax.lax.scan(
-                    _scan, (s_st0, s_dt0, rssm_rng), jnp.arange(T)
+                _, (post_stoch, post_deter, post_logits) = jax.lax.scan(
+                    _scan, (init_stoch, init_deter, rssm_rng), jnp.arange(T)
                 )
-                p_st = jnp.moveaxis(p_st, 0, 1)
-                p_dt = jnp.moveaxis(p_dt, 0, 1)
-                p_lg = jnp.moveaxis(p_lg, 0, 1)
+                post_stoch = jnp.moveaxis(post_stoch, 0, 1)
+                post_deter = jnp.moveaxis(post_deter, 0, 1)
+                post_logits = jnp.moveaxis(post_logits, 0, 1)
 
-                pr_lg = jax.vmap(jax.vmap(m.prior))(p_dt)
+                prior_logits = jax.vmap(jax.vmap(model.prior))(post_deter)
 
                 dyn_kl = jnp.clip(
-                    categorical_kl(jax.lax.stop_gradient(p_lg), pr_lg).sum(-1),
+                    categorical_kl(
+                        jax.lax.stop_gradient(post_logits), prior_logits
+                    ).sum(-1),
                     a_min=config.kl_free,
                 )
                 rep_kl = jnp.clip(
-                    categorical_kl(p_lg, jax.lax.stop_gradient(pr_lg)).sum(-1),
+                    categorical_kl(
+                        post_logits, jax.lax.stop_gradient(prior_logits)
+                    ).sum(-1),
                     a_min=config.kl_free,
                 )
 
-                feat = m.get_feat(p_st, p_dt)
+                feat = model.get_feat(post_stoch, post_deter)
                 feat_flat = feat.reshape(BT, -1)
 
-                dec = m.decode(feat_flat).reshape(B, T, -1)
-                recon_loss = jnp.mean((dec - symlog(s_obs)) ** 2)
+                decoded = model.decode(feat_flat).reshape(B, T, -1)
+                recon_loss = jnp.mean((decoded - symlog(sampled_obs)) ** 2)
 
-                rew_lg = m.reward(feat_flat).reshape(B, T, -1)
-                rew_loss = -jnp.mean(twohot_log_prob(rew_lg, s_rew[..., None], bins))
+                reward_logits = model.reward(feat_flat).reshape(B, T, -1)
+                rew_loss = -jnp.mean(
+                    twohot_log_prob(reward_logits, sampled_rewards[..., None], bins)
+                )
 
-                cont_lg = m.cont(feat_flat).reshape(B, T)
-                cont_tgt = 1.0 - s_done.astype(jnp.float32)
+                cont_logits = model.cont(feat_flat).reshape(B, T)
+                cont_target = 1.0 - sampled_dones.astype(jnp.float32)
                 cont_loss = -jnp.mean(
-                    cont_tgt * jax.nn.log_sigmoid(cont_lg)
-                    + (1 - cont_tgt) * jax.nn.log_sigmoid(-cont_lg)
+                    cont_target * jax.nn.log_sigmoid(cont_logits)
+                    + (1 - cont_target) * jax.nn.log_sigmoid(-cont_logits)
                 )
 
                 # === IMAGINATION ===
                 rng, imag_rng = jax.random.split(rng)
-                i_st = jax.lax.stop_gradient(p_st.reshape(BT, stoch, discrete))
-                i_dt = jax.lax.stop_gradient(p_dt.reshape(BT, deter))
+                imag_start_stoch = jax.lax.stop_gradient(
+                    post_stoch.reshape(BT, stoch, discrete)
+                )
+                imag_start_deter = jax.lax.stop_gradient(post_deter.reshape(BT, deter))
 
                 def _imag(carry, _):
-                    s, d, rng = carry
-                    rng, ar, sr = jax.random.split(rng, 3)
-                    f = m.get_feat(s, d)
-                    act_logits = m.actor(f)
-                    act_rngs = jax.random.split(ar, BT)
-                    a = jax.vmap(gumbel_softmax)(act_rngs, act_logits)
-                    srngs = jax.random.split(sr, BT)
-                    ns, nd = jax.vmap(m.img_step)(s, d, a, srngs)
-                    return (ns, nd, rng), (f, a)
+                    stoch, deter, rng = carry
+                    rng, action_rng, step_rng = jax.random.split(rng, 3)
+                    feat = model.get_feat(stoch, deter)
+                    act_logits = model.actor(feat)
+                    act_rngs = jax.random.split(action_rng, BT)
+                    action = jax.vmap(gumbel_softmax)(act_rngs, act_logits)
+                    step_rngs = jax.random.split(step_rng, BT)
+                    new_stoch, new_deter = jax.vmap(model.img_step)(
+                        stoch, deter, action, step_rngs
+                    )
+                    return (new_stoch, new_deter, rng), (feat, action)
 
-                _, (im_f, im_a) = jax.lax.scan(
-                    _imag, (i_st, i_dt, imag_rng), None, imag_horizon + 1
+                _, (imag_feat, imag_actions) = jax.lax.scan(
+                    _imag,
+                    (imag_start_stoch, imag_start_deter, imag_rng),
+                    None,
+                    imag_horizon + 1,
                 )
-                im_f = jnp.moveaxis(im_f, 0, 1)
-                im_a = jnp.moveaxis(im_a, 0, 1)
-                im_f_sg = jax.lax.stop_gradient(im_f)
-                im_a_sg = jax.lax.stop_gradient(im_a)
-                H1 = imag_horizon + 1
+                imag_feat = jnp.moveaxis(imag_feat, 0, 1)
+                imag_actions = jnp.moveaxis(imag_actions, 0, 1)
+                imag_feat_sg = jax.lax.stop_gradient(imag_feat)
+                imag_actions_sg = jax.lax.stop_gradient(imag_actions)
+                imag_steps = imag_horizon + 1
 
-                im_f_flat = im_f_sg.reshape(-1, im_f_sg.shape[-1])
-                im_rew = twohot_decode(
-                    m.reward(im_f_flat).reshape(BT, H1, num_bins), bins
+                imag_feat_flat = imag_feat_sg.reshape(-1, imag_feat_sg.shape[-1])
+                imag_reward = twohot_decode(
+                    model.reward(imag_feat_flat).reshape(BT, imag_steps, num_bins), bins
                 )
-                im_cont = jax.nn.sigmoid(m.cont(im_f_flat).reshape(BT, H1, 1))
-                im_val = twohot_decode(
-                    m.critic(im_f_flat).reshape(BT, H1, num_bins), bins
+                imag_cont = jax.nn.sigmoid(
+                    model.cont(imag_feat_flat).reshape(BT, imag_steps, 1)
                 )
-                im_sval = twohot_decode(
-                    m_slow.critic(im_f_flat).reshape(BT, H1, num_bins), bins
+                imag_value = twohot_decode(
+                    model.critic(imag_feat_flat).reshape(BT, imag_steps, num_bins), bins
+                )
+                imag_slow_value = twohot_decode(
+                    slow_model.critic(imag_feat_flat).reshape(BT, imag_steps, num_bins),
+                    bins,
                 )
 
-                weight = jnp.cumprod(im_cont * disc, axis=1)
-                im_ret = lambda_return(
-                    jnp.zeros_like(im_cont),
-                    1.0 - im_cont,
-                    im_rew,
-                    im_val,
-                    im_val,
-                    disc,
+                weight = jnp.cumprod(imag_cont * discount, axis=1)
+                imag_returns = lambda_return(
+                    jnp.zeros_like(imag_cont),
+                    1.0 - imag_cont,
+                    imag_reward,
+                    imag_value,
+                    imag_value,
+                    discount,
                     config.gae_lambda,
                 )
 
                 # Return EMA normalization
-                new_ret_ema = update_return_ema(ret_ema, jax.lax.stop_gradient(im_ret))
+                new_ret_ema = update_return_ema(
+                    ret_ema, jax.lax.stop_gradient(imag_returns)
+                )
                 scale = return_scale(new_ret_ema)
-                adv = (im_ret - im_val[:, :-1]) / scale
+                advantages = (imag_returns - imag_value[:, :-1]) / scale
 
                 # Policy loss (Categorical)
-                act_logits = m.actor(im_f_sg)
+                act_logits = model.actor(imag_feat_sg)
                 pi = distrax.Categorical(logits=act_logits)
                 log_probs_all = jax.nn.log_softmax(act_logits, axis=-1)
-                logpi = (im_a_sg * log_probs_all).sum(axis=-1, keepdims=True)[:, :-1]
-                ent = pi.entropy()[..., None][:, :-1]
-                pol_loss = jnp.mean(
+                logpi = (imag_actions_sg * log_probs_all).sum(axis=-1, keepdims=True)[
+                    :, :-1
+                ]
+                entropy = pi.entropy()[..., None][:, :-1]
+                policy_loss = jnp.mean(
                     weight[:, :-1]
-                    * -(logpi * jax.lax.stop_gradient(adv) + config.entropy_coeff * ent)
+                    * -(
+                        logpi * jax.lax.stop_gradient(advantages)
+                        + config.entropy_coeff * entropy
+                    )
                 )
 
-                v_lg = m.critic(im_f_flat).reshape(BT, H1, num_bins)
-                ret_pad = jnp.concatenate([im_ret, jnp.zeros_like(im_ret[:, -1:])], 1)
-                vl_ret = -twohot_log_prob(v_lg, jax.lax.stop_gradient(ret_pad), bins)[
-                    :, :-1
-                ]
-                vl_slow = -twohot_log_prob(v_lg, jax.lax.stop_gradient(im_sval), bins)[
-                    :, :-1
-                ]
-                val_loss = jnp.mean(weight[:, :-1, 0] * (vl_ret + vl_slow))
+                value_logits = model.critic(imag_feat_flat).reshape(
+                    BT, imag_steps, num_bins
+                )
+                returns_padded = jnp.concatenate(
+                    [imag_returns, jnp.zeros_like(imag_returns[:, -1:])], 1
+                )
+                value_loss_returns = -twohot_log_prob(
+                    value_logits, jax.lax.stop_gradient(returns_padded), bins
+                )[:, :-1]
+                value_loss_slow = -twohot_log_prob(
+                    value_logits, jax.lax.stop_gradient(imag_slow_value), bins
+                )[:, :-1]
+                value_loss = jnp.mean(
+                    weight[:, :-1, 0] * (value_loss_returns + value_loss_slow)
+                )
 
                 # === REPLAY-BASED VALUE LEARNING (repval) ===
-                rv_feat = m.get_feat(p_st, p_dt)
-                rv_feat_flat = rv_feat.reshape(BT, -1)
+                repval_feat = model.get_feat(post_stoch, post_deter)
+                repval_feat_flat = repval_feat.reshape(BT, -1)
                 # Frozen current value for lambda return targets (no grad)
-                rv_val = twohot_decode(
-                    jax.lax.stop_gradient(m.critic(rv_feat_flat)).reshape(
+                repval_value = twohot_decode(
+                    jax.lax.stop_gradient(model.critic(repval_feat_flat)).reshape(
                         B, T, num_bins
                     ),
                     bins,
                 )
                 # Frozen slow value as additional target
-                rv_sval = twohot_decode(
-                    m_slow.critic(rv_feat_flat).reshape(B, T, num_bins), bins
+                repval_slow_value = twohot_decode(
+                    slow_model.critic(repval_feat_flat).reshape(B, T, num_bins), bins
                 )
-                rv_boot = im_ret[:, 0].reshape(B, T, 1)
-                rv_last = s_done.astype(jnp.float32)[..., None]
-                rv_term = s_done.astype(jnp.float32)[..., None]
-                rv_ret = lambda_return(
-                    rv_last,
-                    rv_term,
-                    s_rew[..., None],
-                    rv_val,
-                    rv_boot,
-                    disc,
+                repval_bootstrap = imag_returns[:, 0].reshape(B, T, 1)
+                repval_is_last = sampled_dones.astype(jnp.float32)[..., None]
+                repval_is_terminal = sampled_dones.astype(jnp.float32)[..., None]
+                repval_returns = lambda_return(
+                    repval_is_last,
+                    repval_is_terminal,
+                    sampled_rewards[..., None],
+                    repval_value,
+                    repval_bootstrap,
+                    discount,
                     config.gae_lambda,
                 )
-                rv_ret_pad = jnp.concatenate(
-                    [rv_ret, jnp.zeros_like(rv_ret[:, -1:])], 1
+                repval_returns_padded = jnp.concatenate(
+                    [repval_returns, jnp.zeros_like(repval_returns[:, -1:])], 1
                 )
-                rv_weight = (1.0 - rv_last)[:, :-1]
-                rv_v_lg = m.critic(rv_feat_flat).reshape(B, T, num_bins)
-                rv_loss_ret = -twohot_log_prob(
-                    rv_v_lg, jax.lax.stop_gradient(rv_ret_pad), bins
+                repval_weight = (1.0 - repval_is_last)[:, :-1]
+                repval_value_logits = model.critic(repval_feat_flat).reshape(
+                    B, T, num_bins
+                )
+                repval_loss_returns = -twohot_log_prob(
+                    repval_value_logits,
+                    jax.lax.stop_gradient(repval_returns_padded),
+                    bins,
                 )[:, :-1]
-                rv_loss_slow = -twohot_log_prob(
-                    rv_v_lg, jax.lax.stop_gradient(rv_sval[..., 0:1]), bins
+                repval_loss_slow = -twohot_log_prob(
+                    repval_value_logits,
+                    jax.lax.stop_gradient(repval_slow_value[..., 0:1]),
+                    bins,
                 )[:, :-1]
-                repval_loss = jnp.mean(rv_weight[..., 0] * (rv_loss_ret + rv_loss_slow))
+                repval_loss = jnp.mean(
+                    repval_weight[..., 0] * (repval_loss_returns + repval_loss_slow)
+                )
 
                 total = (
                     config.kl_dyn_scale * jnp.mean(dyn_kl)
@@ -842,30 +893,30 @@ def make_train(
                     + recon_loss
                     + rew_loss
                     + cont_loss
-                    + pol_loss
-                    + val_loss
+                    + policy_loss
+                    + value_loss
                     + config.repval_scale * repval_loss
                 )
 
-                mets = {
+                loss_metrics = {
                     "dyn_loss": jnp.mean(dyn_kl),
                     "rep_loss": jnp.mean(rep_kl),
                     "recon_loss": recon_loss,
                     "rew_loss": rew_loss,
                     "cont_loss": cont_loss,
-                    "policy_loss": pol_loss,
-                    "value_loss": val_loss,
+                    "policy_loss": policy_loss,
+                    "value_loss": value_loss,
                     "repval_loss": repval_loss,
                     "total_loss": total,
-                    "imag_reward": jnp.mean(im_rew),
-                    "imag_value": jnp.mean(im_val),
-                    "entropy": jnp.mean(ent),
+                    "imag_reward": jnp.mean(imag_reward),
+                    "imag_value": jnp.mean(imag_value),
+                    "entropy": jnp.mean(entropy),
                 }
-                return total, (mets, new_ret_ema)
+                return total, (loss_metrics, new_ret_ema)
 
-            (_, (mets, ret_ema)), grads = jax.value_and_grad(_loss_fn, has_aux=True)(
-                params, slow_params, ret_ema, train_rng
-            )
+            (_, (loss_metrics, ret_ema)), grads = jax.value_and_grad(
+                _loss_fn, has_aux=True
+            )(params, slow_params, ret_ema, train_rng)
             updates, opt_state_new = tx.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
 
@@ -879,7 +930,7 @@ def make_train(
             metrics = {
                 "episode_return": traj.info["returned_episode_returns"].mean(),
                 "episode_length": traj.info["returned_episode_lengths"].mean(),
-                **mets,
+                **loss_metrics,
             }
             carry = (
                 params,
