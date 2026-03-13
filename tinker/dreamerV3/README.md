@@ -43,6 +43,53 @@ Observation ──> Encoder (MLP + symlog) ──> Embedding
     (symlog MSE)     (TwoHot)     (Bernoulli)    (Normal/Categorical)
 ```
 
+## Training Loop
+
+Each training iteration consists of three phases:
+
+```
+for each update step:
+  ┌─────────────────────────────────────────────────────────────┐
+  │ 1. COLLECT: Run num_envs environments for train_freq steps  │
+  │    Actor samples actions from current policy                │
+  │    Transitions stored in replay buffer                      │
+  └──────────────────────────┬──────────────────────────────────┘
+                             │
+  ┌──────────────────────────▼──────────────────────────────────┐
+  │ 2. TRAIN: Repeat num_epochs times:                          │
+  │    Sample batch of trajectory slices from replay buffer     │
+  │                                                             │
+  │    ┌─ WM Loss ─────────────────────────────────────────┐    │
+  │    │  Posterior rollout on real observations             │    │
+  │    │  KL(posterior || prior) with free bits              │    │
+  │    │  Reconstruct obs (symlog MSE)                      │    │
+  │    │  Predict rewards (TwoHot) + continuation (BCE)     │    │
+  │    │  → updates: encoder, RSSM, decoder, reward, cont   │    │
+  │    └───────────────────────────────────────────────────┘    │
+  │                                                             │
+  │    ┌─ Actor Loss ──────────────────────────────────────┐    │
+  │    │  Imagine 15-step trajectories in latent space      │    │
+  │    │  Predict rewards, continuation, values (with grads)│    │
+  │    │  Compute λ-returns through differentiable dynamics │    │
+  │    │  Maximize returns / max(1, S) + entropy bonus      │    │
+  │    │  → updates: actor only (WM + critic frozen)        │    │
+  │    └───────────────────────────────────────────────────┘    │
+  │                                                             │
+  │    ┌─ Critic Loss ─────────────────────────────────────┐    │
+  │    │  Imagination: TwoHot regression on λ-returns       │    │
+  │    │  Repval: TwoHot regression on real-data returns    │    │
+  │    │  Both use stopped features (WM protected)          │    │
+  │    │  Batched forward pass (imag + repval concatenated) │    │
+  │    │  → updates: critic only (WM + actor frozen)        │    │
+  │    └───────────────────────────────────────────────────┘    │
+  │                                                             │
+  │    Combine gradients and apply single optimizer step         │
+  │    Update slow value target (EMA, τ=0.02)                   │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+The three loss functions compute gradients independently with strict isolation: each component's `stop_gradient` barriers ensure the world model stays grounded in reality, the actor can't hallucinate rewards, and the critic learns from both imagined and real data without corrupting representations.
+
 ## Key DreamerV3 Techniques
 
 - **Symlog/Symexp transforms**: Compress large value ranges for stable learning. Applied to encoder inputs, decoder targets, and reward/value bin spacing.
@@ -53,22 +100,26 @@ Observation ──> Encoder (MLP + symlog) ──> Embedding
 - **Separate dyn/rep KL losses**: Dynamics loss (trains prior toward posterior) scaled at 1.0, representation loss (trains posterior toward prior) scaled at 0.1.
 - **Imagination rollouts**: Actor-critic trained entirely in latent space over 15-step imagined trajectories.
 - **Lambda returns**: GAE-style returns with `lambda=0.95` and `discount = 1 - 1/333`.
-- **Return EMA normalization**: Advantages normalized by running 5th/95th percentile EMA of returns.
+- **Return EMA normalization**: Returns normalized by running 5th/95th percentile EMA range (eq. 12 in paper).
 - **Slow value target**: EMA copy of critic (tau=0.02) provides stable value targets.
-- **Replay-based value learning (repval)**: Additional value loss on real transitions (scale 0.3) with gradients flowing through the world model.
+- **Replay-based value learning (repval)**: Additional critic loss on real transitions (scale 0.3), anchoring the value function to observed data.
 - **LR warmup**: Linear warmup over 1000 optimizer steps.
+- **Gradient isolation**: Three separate gradient computations ensure the world model, actor, and critic are "trained concurrently without sharing gradients" (paper). Selective `stop_gradient` via NNX state partitioning prevents adversarial hallucination and representation collapse.
 
 ## Continuous vs Discrete
 
-The two files differ only in the actor and action handling:
+The two files differ in the actor, action handling, and policy gradient estimator:
 
 | | Continuous | Discrete |
 |---|---|---|
 | Actor output | mean + std | logits with unimix |
 | Distribution | `distrax.Normal` | `distrax.Categorical` |
-| Imagination sampling | Normal sample, clipped to [-1, 1] | Gumbel-Softmax (straight-through) |
+| Policy gradient | Stochastic backpropagation (pathwise) | REINFORCE (score function) |
+| Imagination sampling | Reparameterized Normal, clipped to [-1, 1] | Gumbel-Softmax (straight-through) |
 | Action in RSSM | float, normalized by max(abs, 1) | one-hot vector |
 | Default network size | deter=512, hidden=256 | deter=256, hidden=128 |
+
+Following the paper (eq. 11), the **continuous** actor uses **stochastic backpropagation**: actions are sampled via the reparameterization trick (`action = mean + std * noise`), and gradients flow through the differentiable world model dynamics back to the actor — including through the critic's value predictions, giving the actor foresight beyond the imagination horizon. The continuous implementation also supports a `use_model_grads=False` flag to fall back to REINFORCE. The **discrete** actor always uses **REINFORCE** since discrete sampling is not differentiable.
 
 ## Default Hyperparameters
 
@@ -76,12 +127,14 @@ Structural parameters are set via `make_train` (must be concrete at JIT trace ti
 
 | Parameter | Value | Notes |
 |---|---|---|
+| `num_epochs` | 1 | Gradient updates per collection phase |
 | `batch_size` | 16 | Trajectory slices per batch |
 | `batch_length` | 64 | Length of each slice |
 | `imag_horizon` | 15 | Imagination rollout length |
 | `stoch` | 32 | Stochastic state groups |
 | `discrete` | 16 | Categories per group |
 | `num_bins` | 255 | TwoHot bins for reward/value |
+| `use_model_grads` | True | Pathwise (True) or REINFORCE (False) |
 
 Training hyperparameters are set via `DynamicConfig` (can be swept across parallel runs with `vmap`):
 

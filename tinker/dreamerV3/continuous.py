@@ -24,7 +24,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from gymnax.environments.environment import Environment, EnvParams
-from safenax.wrappers import LogWrapper
+from safenax.wrappers import LogWrapper, BraxToGymnaxWrapper
+from safenax import EcoAntV2
 
 from tinker import log
 
@@ -43,18 +44,19 @@ def symexp(x):
 
 
 def twohot_encode(target, bins):
-    """Encode scalar targets into two-hot vectors over *bins*."""
+    """Encode scalar targets into two-hot vectors over *bins*.
+
+    The bins are already in symexp-transformed space, so targets are
+    compared directly against bin values without additional transformation.
+    """
     target = jnp.squeeze(target, axis=-1)
-    target_sq = symlog(target)
-    below = jnp.sum((bins <= target_sq[..., None]).astype(jnp.int32), axis=-1) - 1
-    above = len(bins) - jnp.sum(
-        (bins > target_sq[..., None]).astype(jnp.int32), axis=-1
-    )
+    below = jnp.sum((bins <= target[..., None]).astype(jnp.int32), axis=-1) - 1
+    above = len(bins) - jnp.sum((bins > target[..., None]).astype(jnp.int32), axis=-1)
     below = jnp.clip(below, 0, len(bins) - 1)
     above = jnp.clip(above, 0, len(bins) - 1)
     equal = below == above
-    dist_to_below = jnp.where(equal, 1.0, jnp.abs(bins[below] - target_sq))
-    dist_to_above = jnp.where(equal, 1.0, jnp.abs(bins[above] - target_sq))
+    dist_to_below = jnp.where(equal, 1.0, jnp.abs(bins[below] - target))
+    dist_to_above = jnp.where(equal, 1.0, jnp.abs(bins[above] - target))
     total = dist_to_below + dist_to_above
     weight_below = dist_to_above / total
     weight_above = dist_to_below / total
@@ -64,9 +66,13 @@ def twohot_encode(target, bins):
 
 
 def twohot_decode(logits, bins):
-    """Decode logits over bins back to scalar using weighted average."""
+    """Decode logits over bins back to scalar using weighted average.
+
+    The bins are already in symexp-transformed space, so the weighted
+    average directly gives the predicted value (no additional symexp).
+    """
     probs = jax.nn.softmax(logits, axis=-1)
-    return symexp((probs * bins).sum(axis=-1, keepdims=True))
+    return (probs * bins).sum(axis=-1, keepdims=True)
 
 
 def twohot_log_prob(logits, target, bins):
@@ -340,7 +346,7 @@ class DreamerV3(nnx.Module):
             kernel_init=dreamer_kernel_init,
             bias_init=dreamer_bias_init,
         )
-        self.actor_out.kernel.value = self.actor_out.kernel.value * 0.01
+        self.actor_out.kernel[...] = self.actor_out.kernel[...] * 0.01
 
         # Critic (outscale=0.0 -> zero init)
         self.critic_mlp = MLPStack(self.feat_size, hidden, 3, rngs)
@@ -483,6 +489,14 @@ def return_scale(state):
 
 
 # ---------------------------------------------------------------------------
+# Parameter group keys for gradient isolation
+# ---------------------------------------------------------------------------
+
+ACTOR_KEYS = {"actor_mlp", "actor_out"}
+CRITIC_KEYS = {"critic_mlp", "critic_out"}
+
+
+# ---------------------------------------------------------------------------
 # make_train
 # ---------------------------------------------------------------------------
 
@@ -492,6 +506,7 @@ def make_train(
     num_steps: int,
     num_envs: int,
     train_freq: int,
+    num_epochs: int = 1,
     batch_size: int = 16,
     batch_length: int = 64,
     imag_horizon: int = 15,
@@ -500,6 +515,7 @@ def make_train(
     deter: int = 512,
     hidden: int = 256,
     num_bins: int = 255,
+    use_model_grads: bool = True,
 ):
     """Generate a jitted JAX DreamerV3 train function for continuous actions.
 
@@ -507,6 +523,9 @@ def make_train(
     :param num_steps: Total number of environment steps.
     :param num_envs: Number of parallel environments.
     :param train_freq: Steps between training updates.
+    :param num_epochs: Gradient updates per collection phase. Each epoch
+        samples a fresh batch from the replay buffer and updates all
+        parameters (world model, actor, critic) jointly.
     :param batch_size: Number of trajectory slices per training batch.
     :param batch_length: Length of each trajectory slice.
     :param imag_horizon: Imagination rollout length.
@@ -515,6 +534,9 @@ def make_train(
     :param deter: Deterministic state dimension.
     :param hidden: Hidden layer width.
     :param num_bins: Number of bins for TwoHot distributions.
+    :param use_model_grads: If True, use stochastic backpropagation through
+        the world model for the policy gradient (paper eq. 11). If False,
+        use REINFORCE (score function estimator) as in r2dreamer.
     """
     num_updates = num_steps // train_freq
     env = LogWrapper(env)
@@ -647,18 +669,12 @@ def make_train(
                 buffer, ptr, count = carry
                 idx = ptr % buf_size
                 buffer = {
-                    k: buffer[k].at[idx].set(v[i])
-                    for k, v in zip(
-                        buffer.keys(),
-                        [
-                            flat_obs,
-                            flat_actions,
-                            flat_rewards,
-                            flat_dones,
-                            flat_stoch,
-                            flat_deter,
-                        ],
-                    )
+                    "obs": buffer["obs"].at[idx].set(flat_obs[i]),
+                    "action": buffer["action"].at[idx].set(flat_actions[i]),
+                    "reward": buffer["reward"].at[idx].set(flat_rewards[i]),
+                    "done": buffer["done"].at[idx].set(flat_dones[i]),
+                    "stoch": buffer["stoch"].at[idx].set(flat_stoch[i]),
+                    "deter": buffer["deter"].at[idx].set(flat_deter[i]),
                 }
                 return (buffer, ptr + 1, jnp.minimum(count + 1, buf_size)), None
 
@@ -666,296 +682,499 @@ def make_train(
                 _store, (buf, buf_ptr, buf_count), jnp.arange(n_new)
             )
 
-            # ----- SAMPLE & TRAIN -----
-            rng, sample_rng, train_rng = jax.random.split(rng, 3)
-            valid = jnp.maximum(buf_count - batch_length - 1, 1)
-            starts = jax.random.randint(sample_rng, (batch_size,), 0, valid)
+            # ----- SAMPLE & TRAIN (num_epochs gradient steps) -----
+            def _train_epoch(train_carry, _):
+                params, slow_params, opt_state, ret_ema, rng = train_carry
+                rng, sample_rng, train_rng = jax.random.split(rng, 3)
+                valid = jnp.maximum(buf_count - batch_length - 1, 1)
+                starts = jax.random.randint(sample_rng, (batch_size,), 0, valid)
 
-            def _get_slice(start):
-                idx = (start + jnp.arange(batch_length)) % buf_size
-                return (
-                    buf["obs"][idx],
-                    buf["action"][idx],
-                    buf["reward"][idx],
-                    buf["done"][idx],
-                    buf["stoch"][idx[0]],
-                    buf["deter"][idx[0]],
-                )
+                def _get_slice(start):
+                    idx = (start + jnp.arange(batch_length)) % buf_size
+                    return (
+                        buf["obs"][idx],
+                        buf["action"][idx],
+                        buf["reward"][idx],
+                        buf["done"][idx],
+                        buf["stoch"][idx[0]],
+                        buf["deter"][idx[0]],
+                    )
 
-            (
-                sampled_obs,
-                sampled_actions,
-                sampled_rewards,
-                sampled_dones,
-                init_stoch,
-                init_deter,
-            ) = jax.vmap(_get_slice)(starts)
+                (
+                    sampled_obs,
+                    sampled_actions,
+                    sampled_rewards,
+                    sampled_dones,
+                    init_stoch,
+                    init_deter,
+                ) = jax.vmap(_get_slice)(starts)
 
-            def _loss_fn(params, slow_params, ret_ema, rng):
-                model = nnx.merge(graphdef, params)
-                slow_model = nnx.merge(graphdef, slow_params)
                 B, T = sampled_obs.shape[:2]
                 BT = B * T
 
-                # Encode
-                embed = model.encode(sampled_obs.reshape(BT, -1)).reshape(B, T, -1)
+                # === Helper: run posterior rollout (shared by WM and imagination) ===
+                def _posterior_rollout(model, rng):
+                    embed = model.encode(sampled_obs.reshape(BT, -1)).reshape(B, T, -1)
 
-                # Posterior rollout
-                def _scan(carry, t):
-                    prev_stoch, prev_deter, rng = carry
-                    rng, scan_rng = jax.random.split(rng)
-                    scan_rngs = jax.random.split(scan_rng, B)
-                    is_first = jnp.where(
-                        t == 0,
-                        jnp.ones(B, dtype=jnp.bool_),
-                        sampled_dones[:, jnp.maximum(t - 1, 0)],
+                    def _scan(carry, t):
+                        prev_stoch, prev_deter, rng = carry
+                        rng, scan_rng = jax.random.split(rng)
+                        scan_rngs = jax.random.split(scan_rng, B)
+                        is_first = jnp.where(
+                            t == 0,
+                            jnp.ones(B, dtype=jnp.bool_),
+                            sampled_dones[:, jnp.maximum(t - 1, 0)],
+                        )
+                        new_stoch, new_deter, logits = jax.vmap(model.obs_step)(
+                            prev_stoch,
+                            prev_deter,
+                            sampled_actions[:, jnp.maximum(t - 1, 0)],
+                            embed[:, t],
+                            is_first,
+                            scan_rngs,
+                        )
+                        return (new_stoch, new_deter, rng), (
+                            new_stoch,
+                            new_deter,
+                            logits,
+                        )
+
+                    _, (post_stoch, post_deter, post_logits) = jax.lax.scan(
+                        _scan, (init_stoch, init_deter, rng), jnp.arange(T)
                     )
-                    new_stoch, new_deter, logits = jax.vmap(model.obs_step)(
-                        prev_stoch,
-                        prev_deter,
-                        sampled_actions[:, jnp.maximum(t - 1, 0)],
-                        embed[:, t],
-                        is_first,
-                        scan_rngs,
+                    post_stoch = jnp.moveaxis(post_stoch, 0, 1)
+                    post_deter = jnp.moveaxis(post_deter, 0, 1)
+                    post_logits = jnp.moveaxis(post_logits, 0, 1)
+                    return embed, post_stoch, post_deter, post_logits
+
+                # === Helper: imagination rollout ===
+                def _imagine(model, post_stoch, post_deter, rng):
+                    imag_start_stoch = jax.lax.stop_gradient(
+                        post_stoch.reshape(BT, stoch, discrete)
                     )
-                    return (new_stoch, new_deter, rng), (new_stoch, new_deter, logits)
-
-                rng, rssm_rng = jax.random.split(rng)
-                _, (post_stoch, post_deter, post_logits) = jax.lax.scan(
-                    _scan, (init_stoch, init_deter, rssm_rng), jnp.arange(T)
-                )
-                post_stoch = jnp.moveaxis(post_stoch, 0, 1)
-                post_deter = jnp.moveaxis(post_deter, 0, 1)
-                post_logits = jnp.moveaxis(post_logits, 0, 1)
-
-                # Prior
-                prior_logits = jax.vmap(jax.vmap(model.prior))(post_deter)
-
-                # KL losses
-                dyn_kl = jnp.clip(
-                    categorical_kl(
-                        jax.lax.stop_gradient(post_logits), prior_logits
-                    ).sum(-1),
-                    a_min=config.kl_free,
-                )
-                rep_kl = jnp.clip(
-                    categorical_kl(
-                        post_logits, jax.lax.stop_gradient(prior_logits)
-                    ).sum(-1),
-                    a_min=config.kl_free,
-                )
-
-                feat = model.get_feat(post_stoch, post_deter)
-                feat_flat = feat.reshape(BT, -1)
-
-                # Decoder (symlog MSE)
-                decoded = model.decode(feat_flat).reshape(B, T, -1)
-                recon_loss = jnp.mean((decoded - symlog(sampled_obs)) ** 2)
-
-                # Reward (TwoHot)
-                reward_logits = model.reward(feat_flat).reshape(B, T, -1)
-                rew_loss = -jnp.mean(
-                    twohot_log_prob(reward_logits, sampled_rewards[..., None], bins)
-                )
-
-                # Continuation (BCE)
-                cont_logits = model.cont(feat_flat).reshape(B, T)
-                cont_target = 1.0 - sampled_dones.astype(jnp.float32)
-                cont_loss = -jnp.mean(
-                    cont_target * jax.nn.log_sigmoid(cont_logits)
-                    + (1 - cont_target) * jax.nn.log_sigmoid(-cont_logits)
-                )
-
-                # === IMAGINATION ===
-                rng, imag_rng = jax.random.split(rng)
-                imag_start_stoch = jax.lax.stop_gradient(
-                    post_stoch.reshape(BT, stoch, discrete)
-                )
-                imag_start_deter = jax.lax.stop_gradient(post_deter.reshape(BT, deter))
-
-                def _imag(carry, _):
-                    stoch, deter, rng = carry
-                    rng, action_rng, step_rng = jax.random.split(rng, 3)
-                    feat = model.get_feat(stoch, deter)
-                    mean, std = model.actor(feat)
-                    dist = distrax.Independent(
-                        distrax.Normal(mean, std), reinterpreted_batch_ndims=1
+                    imag_start_deter = jax.lax.stop_gradient(
+                        post_deter.reshape(BT, deter)
                     )
-                    action = jnp.clip(dist.sample(seed=action_rng), -1.0, 1.0)
-                    step_rngs = jax.random.split(step_rng, BT)
-                    new_stoch, new_deter = jax.vmap(model.img_step)(
-                        stoch, deter, action, step_rngs
+
+                    def _imag(carry, _):
+                        s, d, rng = carry
+                        rng, action_rng, step_rng = jax.random.split(rng, 3)
+                        feat = model.get_feat(s, d)
+                        mean, std = model.actor(feat)
+                        noise = jax.random.normal(action_rng, mean.shape)
+                        action = jnp.clip(mean + std * noise, -1.0, 1.0)
+                        step_rngs = jax.random.split(step_rng, BT)
+                        ns, nd = jax.vmap(model.img_step)(s, d, action, step_rngs)
+                        return (ns, nd, rng), (feat, action)
+
+                    _, (imag_feat, imag_actions) = jax.lax.scan(
+                        _imag,
+                        (imag_start_stoch, imag_start_deter, rng),
+                        None,
+                        imag_horizon + 1,
                     )
-                    return (new_stoch, new_deter, rng), (feat, action)
-
-                _, (imag_feat, imag_actions) = jax.lax.scan(
-                    _imag,
-                    (imag_start_stoch, imag_start_deter, imag_rng),
-                    None,
-                    imag_horizon + 1,
-                )
-                imag_feat = jnp.moveaxis(imag_feat, 0, 1)
-                imag_actions = jnp.moveaxis(imag_actions, 0, 1)
-                imag_feat_sg = jax.lax.stop_gradient(imag_feat)
-                imag_actions_sg = jax.lax.stop_gradient(imag_actions)
-                imag_steps = imag_horizon + 1
-
-                imag_feat_flat = imag_feat_sg.reshape(-1, imag_feat_sg.shape[-1])
-                imag_reward = twohot_decode(
-                    model.reward(imag_feat_flat).reshape(BT, imag_steps, num_bins), bins
-                )
-                imag_cont = jax.nn.sigmoid(
-                    model.cont(imag_feat_flat).reshape(BT, imag_steps, 1)
-                )
-                imag_value = twohot_decode(
-                    model.critic(imag_feat_flat).reshape(BT, imag_steps, num_bins), bins
-                )
-                imag_slow_value = twohot_decode(
-                    slow_model.critic(imag_feat_flat).reshape(BT, imag_steps, num_bins),
-                    bins,
-                )
-
-                weight = jnp.cumprod(imag_cont * discount, axis=1)
-                imag_returns = lambda_return(
-                    jnp.zeros_like(imag_cont),
-                    1.0 - imag_cont,
-                    imag_reward,
-                    imag_value,
-                    imag_value,
-                    discount,
-                    config.gae_lambda,
-                )
-
-                # Return EMA for advantage normalization
-                new_ret_ema = update_return_ema(
-                    ret_ema, jax.lax.stop_gradient(imag_returns)
-                )
-                scale = return_scale(new_ret_ema)
-                advantages = (imag_returns - imag_value[:, :-1]) / scale
-
-                # Policy loss (distrax Normal)
-                imag_mean, imag_std = model.actor(imag_feat_sg)
-                pi = distrax.Independent(
-                    distrax.Normal(imag_mean, imag_std), reinterpreted_batch_ndims=1
-                )
-                logpi = pi.log_prob(imag_actions_sg)[:, :-1, None]
-                entropy = pi.entropy()[:, :-1, None]
-                policy_loss = jnp.mean(
-                    weight[:, :-1]
-                    * -(
-                        logpi * jax.lax.stop_gradient(advantages)
-                        + config.entropy_coeff * entropy
+                    return jnp.moveaxis(imag_feat, 0, 1), jnp.moveaxis(
+                        imag_actions, 0, 1
                     )
-                )
 
-                # Value loss (TwoHot)
-                value_logits = model.critic(imag_feat_flat).reshape(
-                    BT, imag_steps, num_bins
-                )
-                returns_padded = jnp.concatenate(
-                    [imag_returns, jnp.zeros_like(imag_returns[:, -1:])], 1
-                )
-                value_loss_returns = -twohot_log_prob(
-                    value_logits, jax.lax.stop_gradient(returns_padded), bins
-                )[:, :-1]
-                value_loss_slow = -twohot_log_prob(
-                    value_logits, jax.lax.stop_gradient(imag_slow_value), bins
-                )[:, :-1]
-                value_loss = jnp.mean(
-                    weight[:, :-1, 0] * (value_loss_returns + value_loss_slow)
-                )
+                # ===============================================================
+                # LOSS 1: World Model (encoder, RSSM, decoder, reward, cont heads)
+                # Only updates WM params. Actor/critic not in the compute graph.
+                # ===============================================================
+                def _wm_loss_fn(params, slow_params, rng):
+                    model = nnx.merge(graphdef, params)
+                    slow_model = nnx.merge(graphdef, slow_params)
+                    rng, rssm_rng = jax.random.split(rng)
+                    embed, post_stoch, post_deter, post_logits = _posterior_rollout(
+                        model, rssm_rng
+                    )
+                    prior_logits = jax.vmap(jax.vmap(model.prior))(post_deter)
 
-                # === REPLAY-BASED VALUE LEARNING (repval) ===
-                # Gradients flow through world model (feat is attached to encoder+rssm)
-                repval_feat = model.get_feat(
-                    post_stoch, post_deter
-                )  # (B, T, F) - with WM grads
-                repval_feat_flat = repval_feat.reshape(BT, -1)
-                # Frozen current value for lambda return targets (no grad)
-                repval_value = twohot_decode(
-                    jax.lax.stop_gradient(model.critic(repval_feat_flat)).reshape(
+                    dyn_kl = jnp.clip(
+                        categorical_kl(
+                            jax.lax.stop_gradient(post_logits), prior_logits
+                        ).sum(-1),
+                        a_min=config.kl_free,
+                    )
+                    rep_kl = jnp.clip(
+                        categorical_kl(
+                            post_logits, jax.lax.stop_gradient(prior_logits)
+                        ).sum(-1),
+                        a_min=config.kl_free,
+                    )
+
+                    feat_flat = model.get_feat(post_stoch, post_deter).reshape(BT, -1)
+                    decoded = model.decode(feat_flat).reshape(B, T, -1)
+                    recon_loss = jnp.mean((decoded - symlog(sampled_obs)) ** 2)
+                    reward_logits = model.reward(feat_flat).reshape(B, T, -1)
+                    rew_loss = -jnp.mean(
+                        twohot_log_prob(reward_logits, sampled_rewards[..., None], bins)
+                    )
+                    cont_logits = model.cont(feat_flat).reshape(B, T)
+                    cont_target = 1.0 - sampled_dones.astype(jnp.float32)
+                    cont_loss = -jnp.mean(
+                        cont_target * jax.nn.log_sigmoid(cont_logits)
+                        + (1 - cont_target) * jax.nn.log_sigmoid(-cont_logits)
+                    )
+
+                    wm_loss = (
+                        config.kl_dyn_scale * jnp.mean(dyn_kl)
+                        + config.kl_rep_scale * jnp.mean(rep_kl)
+                        + recon_loss
+                        + rew_loss
+                        + cont_loss
+                    )
+
+                    wm_metrics = {
+                        "dyn_loss": jnp.mean(dyn_kl),
+                        "rep_loss": jnp.mean(rep_kl),
+                        "recon_loss": recon_loss,
+                        "rew_loss": rew_loss,
+                        "cont_loss": cont_loss,
+                    }
+                    return wm_loss, (post_stoch, post_deter, wm_metrics)
+
+                # ===============================================================
+                # LOSS 2: Actor (pathwise gradients through frozen WM + critic)
+                # Only updates actor params. WM/critic params are stop_gradient'd.
+                # ===============================================================
+                def _actor_loss_fn(params, slow_params, ret_ema, rng):
+                    # Freeze WM and critic params so actor loss can't update them.
+                    # stop_gradient must be applied INSIDE the grad function.
+                    frozen = jax.lax.stop_gradient(params)
+                    merged_dict = {}
+                    for k in params.keys():
+                        if k in ACTOR_KEYS:
+                            merged_dict[k] = params[k]  # actor: live gradients
+                        else:
+                            merged_dict[k] = frozen[k]  # WM/critic: frozen
+                    model = nnx.merge(graphdef, nnx.State(merged_dict))
+
+                    rng, rssm_rng, imag_rng = jax.random.split(rng, 3)
+                    _, post_stoch, post_deter, _ = _posterior_rollout(model, rssm_rng)
+                    imag_feat, imag_actions = _imagine(
+                        model, post_stoch, post_deter, imag_rng
+                    )
+                    imag_steps = imag_horizon + 1
+
+                    # Reward/cont with gradients flowing to actor through dynamics
+                    imag_feat_flat = imag_feat.reshape(-1, imag_feat.shape[-1])
+                    if use_model_grads:
+                        imag_reward = twohot_decode(
+                            model.reward(imag_feat_flat).reshape(
+                                BT, imag_steps, num_bins
+                            ),
+                            bins,
+                        )
+                        imag_cont = jax.nn.sigmoid(
+                            model.cont(imag_feat_flat).reshape(BT, imag_steps, 1)
+                        )
+                        # Value WITH gradients: actor can see beyond the horizon
+                        imag_value = twohot_decode(
+                            model.critic(imag_feat_flat).reshape(
+                                BT, imag_steps, num_bins
+                            ),
+                            bins,
+                        )
+                    else:
+                        imag_feat_flat_sg = jax.lax.stop_gradient(imag_feat_flat)
+                        imag_reward = twohot_decode(
+                            model.reward(imag_feat_flat_sg).reshape(
+                                BT, imag_steps, num_bins
+                            ),
+                            bins,
+                        )
+                        imag_cont = jax.nn.sigmoid(
+                            model.cont(imag_feat_flat_sg).reshape(BT, imag_steps, 1)
+                        )
+                        imag_value = twohot_decode(
+                            model.critic(imag_feat_flat_sg).reshape(
+                                BT, imag_steps, num_bins
+                            ),
+                            bins,
+                        )
+
+                    weight = jnp.cumprod(
+                        jax.lax.stop_gradient(imag_cont) * discount, axis=1
+                    )
+
+                    if use_model_grads:
+                        # Lambda returns with active value gradients for actor
+                        imag_returns = lambda_return(
+                            jnp.zeros_like(imag_cont),
+                            1.0 - imag_cont,
+                            imag_reward,
+                            imag_value,
+                            imag_value,
+                            discount,
+                            config.gae_lambda,
+                        )
+                    else:
+                        imag_returns = lambda_return(
+                            jnp.zeros_like(imag_cont),
+                            1.0 - imag_cont,
+                            imag_reward,
+                            jax.lax.stop_gradient(imag_value),
+                            jax.lax.stop_gradient(imag_value),
+                            discount,
+                            config.gae_lambda,
+                        )
+
+                    new_ret_ema = update_return_ema(
+                        ret_ema, jax.lax.stop_gradient(imag_returns)
+                    )
+                    scale = return_scale(new_ret_ema)
+
+                    # Entropy from stopped features (closed-form gradient)
+                    imag_feat_sg = jax.lax.stop_gradient(imag_feat)
+                    imag_mean, imag_std = model.actor(imag_feat_sg)
+                    pi = distrax.Independent(
+                        distrax.Normal(imag_mean, imag_std), reinterpreted_batch_ndims=1
+                    )
+                    entropy = pi.entropy()[:, :-1, None]
+
+                    if use_model_grads:
+                        policy_loss = -jnp.mean(
+                            jax.lax.stop_gradient(weight[:, :-1]) * imag_returns / scale
+                        ) - config.entropy_coeff * jnp.mean(entropy)
+                    else:
+                        advantages = (
+                            jax.lax.stop_gradient(imag_returns)
+                            - jax.lax.stop_gradient(imag_value[:, :-1])
+                        ) / scale
+                        imag_actions_sg = jax.lax.stop_gradient(imag_actions)
+                        logpi = pi.log_prob(imag_actions_sg)[:, :-1, None]
+                        policy_loss = jnp.mean(
+                            jax.lax.stop_gradient(weight[:, :-1])
+                            * -(logpi * advantages + config.entropy_coeff * entropy)
+                        )
+
+                    actor_metrics = {
+                        "policy_loss": policy_loss,
+                        "imag_reward": jnp.mean(jax.lax.stop_gradient(imag_reward)),
+                        "imag_value": jnp.mean(jax.lax.stop_gradient(imag_value)),
+                        "entropy": jnp.mean(entropy),
+                    }
+                    return policy_loss, (
+                        actor_metrics,
+                        new_ret_ema,
+                        jax.lax.stop_gradient(imag_feat),
+                        jax.lax.stop_gradient(imag_returns),
+                        jax.lax.stop_gradient(imag_cont),
+                    )
+
+                # ===============================================================
+                # LOSS 3: Critic (TwoHot regression on stopped features/returns)
+                # Only updates critic params.
+                # ===============================================================
+                def _critic_loss_fn(
+                    params,
+                    slow_params,
+                    imag_feat_sg,
+                    imag_returns_sg,
+                    imag_cont_sg,
+                    post_stoch_sg,
+                    post_deter_sg,
+                    sampled_rewards_sg,
+                    sampled_dones_sg,
+                ):
+                    # Freeze everything except critic params
+                    frozen = jax.lax.stop_gradient(params)
+                    merged_dict = {}
+                    for k in params.keys():
+                        if k in CRITIC_KEYS:
+                            merged_dict[k] = params[k]
+                        else:
+                            merged_dict[k] = frozen[k]
+                    model = nnx.merge(graphdef, nnx.State(merged_dict))
+                    slow_model = nnx.merge(graphdef, slow_params)
+                    imag_steps = imag_horizon + 1
+
+                    # --- Prepare features for a single batched forward pass ---
+                    imag_feat_flat_sg = imag_feat_sg.reshape(-1, imag_feat_sg.shape[-1])
+                    repval_feat_flat = model.get_feat(
+                        post_stoch_sg, post_deter_sg
+                    ).reshape(BT, -1)
+                    combined_feats = jnp.concatenate(
+                        [imag_feat_flat_sg, repval_feat_flat], axis=0
+                    )
+
+                    # Single forward pass through critic and slow critic
+                    combined_logits = model.critic(combined_feats)
+                    combined_slow_logits = slow_model.critic(combined_feats)
+
+                    # Split back into imagination and repval components
+                    n_imag = imag_feat_flat_sg.shape[0]
+                    imag_logits, repval_logits_for_targets = jnp.split(
+                        combined_logits, [n_imag], axis=0
+                    )
+                    imag_slow_logits, repval_slow_logits = jnp.split(
+                        combined_slow_logits, [n_imag], axis=0
+                    )
+
+                    # --- Imagination value loss ---
+                    weight = jnp.cumprod(imag_cont_sg * discount, axis=1)
+                    value_logits = imag_logits.reshape(BT, imag_steps, num_bins)
+                    imag_slow_value = twohot_decode(
+                        imag_slow_logits.reshape(BT, imag_steps, num_bins), bins
+                    )
+                    returns_padded = jnp.concatenate(
+                        [imag_returns_sg, jnp.zeros_like(imag_returns_sg[:, -1:])], 1
+                    )
+                    value_loss_returns = -twohot_log_prob(
+                        value_logits, returns_padded, bins
+                    )[:, :-1]
+                    value_loss_slow = -twohot_log_prob(
+                        value_logits, jax.lax.stop_gradient(imag_slow_value), bins
+                    )[:, :-1]
+                    imag_value_loss = jnp.mean(
+                        jax.lax.stop_gradient(weight[:, :-1, 0])
+                        * (value_loss_returns + value_loss_slow)
+                    )
+
+                    # --- Repval: critic loss on real replay data ---
+                    repval_value = twohot_decode(
+                        jax.lax.stop_gradient(repval_logits_for_targets).reshape(
+                            B, T, num_bins
+                        ),
+                        bins,
+                    )
+                    repval_slow_value = twohot_decode(
+                        repval_slow_logits.reshape(B, T, num_bins), bins
+                    )
+                    repval_is_last = sampled_dones_sg.astype(jnp.float32)[..., None]
+                    repval_bootstrap = jnp.zeros((B, T, 1))
+                    repval_returns = lambda_return(
+                        repval_is_last,
+                        repval_is_last,
+                        sampled_rewards_sg[..., None],
+                        repval_value,
+                        repval_bootstrap,
+                        discount,
+                        config.gae_lambda,
+                    )
+                    repval_returns_padded = jnp.concatenate(
+                        [repval_returns, jnp.zeros_like(repval_returns[:, -1:])], 1
+                    )
+                    repval_weight = (1.0 - repval_is_last)[:, :-1]
+                    repval_value_logits = repval_logits_for_targets.reshape(
                         B, T, num_bins
+                    )
+                    repval_loss = jnp.mean(
+                        repval_weight[..., 0]
+                        * (
+                            -twohot_log_prob(
+                                repval_value_logits,
+                                jax.lax.stop_gradient(repval_returns_padded),
+                                bins,
+                            )[:, :-1]
+                            - twohot_log_prob(
+                                repval_value_logits,
+                                jax.lax.stop_gradient(repval_slow_value[..., 0:1]),
+                                bins,
+                            )[:, :-1]
+                        )
+                    )
+
+                    total_critic_loss = (
+                        imag_value_loss + config.repval_scale * repval_loss
+                    )
+                    return total_critic_loss, {
+                        "value_loss": imag_value_loss,
+                        "repval_loss": repval_loss,
+                    }
+
+                # ===============================================================
+                # Compute gradients for each component separately
+                # ===============================================================
+                rng, wm_rng, actor_rng = jax.random.split(train_rng, 3)
+
+                # 1. World model
+                (_, (post_stoch, post_deter, wm_metrics)), wm_grads = (
+                    jax.value_and_grad(_wm_loss_fn, has_aux=True)(
+                        params, slow_params, wm_rng
+                    )
+                )
+
+                # 2. Actor
+                (
+                    (
+                        _,
+                        (
+                            actor_metrics,
+                            ret_ema,
+                            imag_feat_sg,
+                            imag_returns_sg,
+                            imag_cont_sg,
+                        ),
                     ),
-                    bins,
-                )
-                # Frozen slow value as additional target
-                repval_slow_value = twohot_decode(
-                    slow_model.critic(repval_feat_flat).reshape(B, T, num_bins), bins
-                )
-                # Bootstrap from first imagined return
-                repval_bootstrap = imag_returns[:, 0].reshape(B, T, 1)
-                repval_is_last = sampled_dones.astype(jnp.float32)[..., None]
-                repval_is_terminal = sampled_dones.astype(jnp.float32)[..., None]
-                repval_returns = lambda_return(
-                    repval_is_last,
-                    repval_is_terminal,
-                    sampled_rewards[..., None],
-                    repval_value,
-                    repval_bootstrap,
-                    discount,
-                    config.gae_lambda,
-                )
-                repval_returns_padded = jnp.concatenate(
-                    [repval_returns, jnp.zeros_like(repval_returns[:, -1:])], 1
-                )
-                repval_weight = (1.0 - repval_is_last)[:, :-1]
-                repval_value_logits = model.critic(repval_feat_flat).reshape(
-                    B, T, num_bins
-                )  # with grads
-                repval_loss_returns = -twohot_log_prob(
-                    repval_value_logits,
-                    jax.lax.stop_gradient(repval_returns_padded),
-                    bins,
-                )[:, :-1]
-                repval_loss_slow = -twohot_log_prob(
-                    repval_value_logits,
-                    jax.lax.stop_gradient(repval_slow_value[..., 0:1]),
-                    bins,
-                )[:, :-1]
-                repval_loss = jnp.mean(
-                    repval_weight[..., 0] * (repval_loss_returns + repval_loss_slow)
+                    actor_grads,
+                ) = jax.value_and_grad(_actor_loss_fn, has_aux=True)(
+                    params, slow_params, ret_ema, actor_rng
                 )
 
-                total = (
-                    config.kl_dyn_scale * jnp.mean(dyn_kl)
-                    + config.kl_rep_scale * jnp.mean(rep_kl)
-                    + recon_loss
-                    + rew_loss
-                    + cont_loss
-                    + policy_loss
-                    + value_loss
-                    + config.repval_scale * repval_loss
+                # 3. Critic (uses stopped outputs from actor + WM steps)
+                post_stoch_sg = jax.lax.stop_gradient(post_stoch)
+                post_deter_sg = jax.lax.stop_gradient(post_deter)
+                (critic_loss, critic_metrics), critic_grads = jax.value_and_grad(
+                    _critic_loss_fn, has_aux=True
+                )(
+                    params,
+                    slow_params,
+                    imag_feat_sg,
+                    imag_returns_sg,
+                    imag_cont_sg,
+                    post_stoch_sg,
+                    post_deter_sg,
+                    jax.lax.stop_gradient(sampled_rewards),
+                    jax.lax.stop_gradient(sampled_dones),
                 )
 
-                loss_metrics = {
-                    "dyn_loss": jnp.mean(dyn_kl),
-                    "rep_loss": jnp.mean(rep_kl),
-                    "recon_loss": recon_loss,
-                    "rew_loss": rew_loss,
-                    "cont_loss": cont_loss,
-                    "policy_loss": policy_loss,
-                    "value_loss": value_loss,
-                    "repval_loss": repval_loss,
-                    "total_loss": total,
-                    "imag_reward": jnp.mean(imag_reward),
-                    "imag_value": jnp.mean(imag_value),
-                    "entropy": jnp.mean(entropy),
+                # Combine: each gradient set only has non-zero values for its
+                # component (WM grads zero for actor/critic, actor grads zero for
+                # WM/critic due to stop_gradient, critic grads zero for WM/actor
+                # due to stopped features)
+                grads = jax.tree_util.tree_map(
+                    lambda w, a, c: w + a + c, wm_grads, actor_grads, critic_grads
+                )
+
+                updates, opt_state = tx.update(grads, opt_state, params)
+                params = optax.apply_updates(params, updates)
+
+                # Slow target EMA
+                slow_params = jax.tree_util.tree_map(
+                    lambda s, v: config.slow_target_frac * v
+                    + (1 - config.slow_target_frac) * s,
+                    slow_params,
+                    params,
+                )
+
+                epoch_metrics = {
+                    **wm_metrics,
+                    **actor_metrics,
+                    **critic_metrics,
+                    "total_loss": (
+                        wm_metrics["dyn_loss"]
+                        + wm_metrics["rep_loss"]
+                        + wm_metrics["recon_loss"]
+                        + wm_metrics["rew_loss"]
+                        + wm_metrics["cont_loss"]
+                        + actor_metrics["policy_loss"]
+                        + critic_loss
+                    ),
                 }
-                return total, (loss_metrics, new_ret_ema)
+                train_carry = (params, slow_params, opt_state, ret_ema, rng)
+                return train_carry, epoch_metrics
 
-            (_, (loss_metrics, ret_ema)), grads = jax.value_and_grad(
-                _loss_fn, has_aux=True
-            )(params, slow_params, ret_ema, train_rng)
-            updates, opt_state_new = tx.update(grads, opt_state, params)
-            params = optax.apply_updates(params, updates)
-
-            # Slow target EMA
-            slow_params = jax.tree_util.tree_map(
-                lambda s, v: config.slow_target_frac * v
-                + (1 - config.slow_target_frac) * s,
-                slow_params,
-                params,
+            # Run num_epochs gradient steps
+            train_carry = (params, slow_params, opt_state, ret_ema, rng)
+            train_carry, epoch_metrics = jax.lax.scan(
+                _train_epoch, train_carry, None, num_epochs
             )
+            params, slow_params, opt_state, ret_ema, rng = train_carry
+
+            # Use metrics from last epoch for logging
+            loss_metrics = jax.tree_util.tree_map(lambda x: x[-1], epoch_metrics)
 
             metrics = {
                 "episode_return": traj.info["returned_episode_returns"].mean(),
@@ -965,7 +1184,7 @@ def make_train(
             carry = (
                 params,
                 slow_params,
-                opt_state_new,
+                opt_state,
                 env_state,
                 obs,
                 rssm_stoch,
@@ -999,3 +1218,61 @@ def make_train(
         return final_carry, metrics
 
     return train
+
+
+if __name__ == "__main__":
+    SEED = 0
+    NUM_RUNS = 5
+
+    brax_env = EcoAntV2(battery_limit=500.0)
+    env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
+    env_params = [env.default_params] * NUM_RUNS
+
+    rng = jax.random.PRNGKey(SEED)
+    rngs = jax.random.split(rng, NUM_RUNS)
+
+    dynamic_config = DynamicConfig(
+        rng=rngs,
+        env_params=jax.tree.map(lambda *xs: jnp.stack(xs), *env_params),
+        lr=jnp.ones(NUM_RUNS) * 4e-5,
+        kl_free=jnp.ones(NUM_RUNS) * 1.0,
+        kl_dyn_scale=jnp.ones(NUM_RUNS) * 1.0,
+        kl_rep_scale=jnp.ones(NUM_RUNS) * 0.1,
+        horizon=jnp.ones(NUM_RUNS) * 333,
+        gae_lambda=jnp.ones(NUM_RUNS) * 0.95,
+        entropy_coeff=jnp.ones(NUM_RUNS) * 3e-4,
+        slow_target_frac=jnp.ones(NUM_RUNS) * 0.02,
+        repval_scale=jnp.ones(NUM_RUNS) * 0.3,
+        warmup_steps=jnp.ones(NUM_RUNS) * 1000,
+    )
+
+    # num_envs=25, train_freq=100 → 2500 env steps per collection.
+    # num_epochs=50 → 50 grad steps per collection.
+    # Train ratio = 50 / 2500 = 0.02 (vs old 0.0004).
+    # Total grad steps = (1M / 100) * 50 = 500k.
+    train_fn = make_train(
+        env,
+        num_steps=int(500_000),
+        num_envs=25,
+        train_freq=100,
+        num_epochs=50,
+        use_model_grads=True,
+    )
+    train_vjit = jax.jit(jax.vmap(train_fn))
+    start_time = time.perf_counter()
+    runner_states, all_metrics = jax.block_until_ready(train_vjit(dynamic_config))
+    runtime = time.perf_counter() - start_time
+    print(f"Runtime: {runtime:.2f}s")
+
+    log.save_local(
+        algo_name="dreamerV3",
+        env_name=brax_env.name,
+        metrics=all_metrics,
+    )
+
+    log.save_wandb(
+        project="EcoAnt",
+        algo_name="dreamerV3",
+        env_name=brax_env.name,
+        metrics=all_metrics,
+    )
