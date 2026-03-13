@@ -7,13 +7,13 @@ DreamerV3 is a model-based RL algorithm that learns a world model from experienc
 For continuous action space environments, run:
 
 ```bash
-uv run -m tinker.dreamer.continuous
+uv run -m tinker.dreamerV3.continuous
 ```
 
 For discrete action space environments, run:
 
 ```bash
-uv run -m tinker.dreamer.discrete
+uv run -m tinker.dreamerV3.discrete
 ```
 
 ## Architecture
@@ -72,18 +72,31 @@ The two files differ only in the actor and action handling:
 
 ## Default Hyperparameters
 
+Structural parameters are set via `make_train` (must be concrete at JIT trace time):
+
 | Parameter | Value | Notes |
 |---|---|---|
+| `batch_size` | 16 | Trajectory slices per batch |
+| `batch_length` | 64 | Length of each slice |
+| `imag_horizon` | 15 | Imagination rollout length |
 | `stoch` | 32 | Stochastic state groups |
 | `discrete` | 16 | Categories per group |
 | `num_bins` | 255 | TwoHot bins for reward/value |
-| `imag_horizon` | 15 | Imagination rollout length |
+
+Training hyperparameters are set via `DynamicConfig` (can be swept across parallel runs with `vmap`):
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `lr` | 4e-5 | Learning rate |
 | `kl_free` | 1.0 | Free nats for KL loss |
 | `kl_dyn_scale` | 1.0 | Dynamics KL loss scale |
 | `kl_rep_scale` | 0.1 | Representation KL loss scale |
-| `lr` | 4e-5 | Learning rate |
-| `batch_size` | 16 | Trajectory slices per batch |
-| `batch_length` | 64 | Length of each slice |
+| `horizon` | 333 | Planning horizon (discount = 1 - 1/horizon) |
+| `gae_lambda` | 0.95 | Lambda for GAE-style returns |
+| `entropy_coeff` | 3e-4 | Policy entropy regularization |
+| `slow_target_frac` | 0.02 | EMA rate for slow value target |
+| `repval_scale` | 0.3 | Replay-based value loss weight |
+| `warmup_steps` | 1000 | Linear LR warmup steps |
 
 ## Links
 

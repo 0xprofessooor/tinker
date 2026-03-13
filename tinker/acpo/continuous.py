@@ -1032,7 +1032,7 @@ def make_train(
             )
 
             sparse_battery_used = jnp.where(
-                is_terminal, 100 - traj_batch.info["battery"], 0
+                is_terminal, 100.0 - traj_batch.info["battery"], 0
             )
             episode_battery_used = sparse_battery_used.sum() / num_episodes
             metrics = {
@@ -1073,7 +1073,7 @@ def make_train(
 
 if __name__ == "__main__":
     SEED = 0
-    NUM_RUNS = 1
+    NUM_RUNS = 5
 
     brax_env = EcoAntV2(battery_limit=100.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
@@ -1085,7 +1085,7 @@ if __name__ == "__main__":
     dynamic_config = DynamicConfig(
         rng=rngs,
         env_params=jax.tree.map(lambda *xs: jnp.stack(xs), *env_params),
-        cost_limit=jnp.ones(NUM_RUNS) * 50.0,
+        cost_limit=jnp.ones(NUM_RUNS) * 40.0,
         critic_lr=jnp.ones(NUM_RUNS) * 3e-4,
         state_model_lr=jnp.ones(NUM_RUNS) * 5e-4,
         gae_gamma=jnp.ones(NUM_RUNS) * 0.99,
@@ -1104,11 +1104,11 @@ if __name__ == "__main__":
     train_fn = make_train(
         env,
         num_steps=int(200000),
-        num_envs=128,
+        num_envs=25,
         train_freq=100,
         critic_epochs=10,
         state_model_epochs=10,
-        model_objective=ModelObjective.REWARD,
+        model_objective=ModelObjective.BOTH,
     )
     train_vjit = jax.jit(jax.vmap(train_fn))
     start_time = time.perf_counter()
@@ -1117,14 +1117,14 @@ if __name__ == "__main__":
     print(f"Runtime: {runtime:.2f}s")
 
     log.save_local(
-        algo_name="acpo_reward",
+        algo_name="acpo_both",
         env_name=brax_env.name,
         metrics=all_metrics,
     )
 
     log.save_wandb(
-        project="EcoAnt",
-        algo_name="acpo_reward",
+        project="EcoAnt50",
+        algo_name="acpo_both",
         env_name=brax_env.name,
         metrics=all_metrics,
     )

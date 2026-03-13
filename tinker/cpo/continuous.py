@@ -662,7 +662,7 @@ def make_train(
             )
 
             sparse_battery_used = jnp.where(
-                is_terminal, 50 - traj_batch.info["battery"], 0
+                is_terminal, 100 - traj_batch.info["battery"], 0
             )
             episode_battery_used = sparse_battery_used.sum() / num_episodes
 
@@ -680,6 +680,8 @@ def make_train(
                 "episode_length": traj_batch.info["returned_episode_lengths"].mean(),
                 "episode_budget_used": episode_battery_used,
                 "accepted": accepted,
+                "value_loss": value_losses.mean(),
+                "cost_value_loss": cost_value_losses.mean(),
             }
 
             runner_state = (
@@ -717,7 +719,7 @@ def make_train(
 
 if __name__ == "__main__":
     SEED = 0
-    NUM_RUNS = 1
+    NUM_RUNS = 5
 
     brax_env = EcoAntV2(battery_limit=100.0)
     env = BraxToGymnaxWrapper(env=brax_env, episode_length=1000)
@@ -729,7 +731,7 @@ if __name__ == "__main__":
     dynamic_config = DynamicConfig(
         rng=rngs,
         env_params=jax.tree.map(lambda *xs: jnp.stack(xs), *env_params),
-        cost_limit=jnp.ones(NUM_RUNS) * 50.0,
+        cost_limit=jnp.ones(NUM_RUNS) * 40.0,
         lr=jnp.ones(NUM_RUNS) * 3e-4,
         gae_gamma=jnp.ones(NUM_RUNS) * 0.99,
         gae_lambda=jnp.ones(NUM_RUNS) * 0.95,
@@ -746,7 +748,7 @@ if __name__ == "__main__":
     train_fn = make_train(
         env,
         num_steps=int(200000),
-        num_envs=256,
+        num_envs=25,
         train_freq=100,
         critic_epochs=10,
     )
@@ -763,7 +765,7 @@ if __name__ == "__main__":
     )
 
     log.save_wandb(
-        project="EcoAnt",
+        project="EcoAnt50",
         algo_name="cpo",
         env_name=brax_env.name,
         metrics=all_metrics,

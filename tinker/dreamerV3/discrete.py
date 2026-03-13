@@ -404,12 +404,34 @@ class Transition:
 
 @struct.dataclass
 class DynamicConfig:
+    """Holds dynamic configuration parameters for DreamerV3 training.
+
+    :param rng: Random number generator key.
+    :param env_params: Environment parameters.
+    :param lr: Learning rate.
+    :param kl_free: Free nats for KL loss.
+    :param kl_dyn_scale: Scale for dynamics KL loss (default 1.0).
+    :param kl_rep_scale: Scale for representation KL loss (default 0.1).
+    :param horizon: Effective planning horizon (discount = 1 - 1/horizon).
+    :param gae_lambda: Lambda for GAE-style lambda returns.
+    :param entropy_coeff: Policy entropy regularization weight.
+    :param slow_target_frac: EMA rate for slow value target.
+    :param repval_scale: Loss scale for replay-based value learning.
+    :param warmup_steps: Linear LR warmup steps.
+    """
+
     rng: jax.Array
     env_params: EnvParams
     lr: jax.Array
     kl_free: jax.Array
     kl_dyn_scale: jax.Array
     kl_rep_scale: jax.Array
+    horizon: jax.Array
+    gae_lambda: jax.Array
+    entropy_coeff: jax.Array
+    slow_target_frac: jax.Array
+    repval_scale: jax.Array
+    warmup_steps: jax.Array
 
 
 class ReturnEMAState(NamedTuple):
@@ -438,13 +460,6 @@ def return_scale(state):
 # make_train
 # ---------------------------------------------------------------------------
 
-HORIZON = 333
-LAMBDA = 0.95
-ENTROPY_COEFF = 3e-4
-SLOW_TARGET_FRAC = 0.02
-REPVAL_SCALE = 0.3
-WARMUP_STEPS = 1000
-
 
 def make_train(
     env: Environment,
@@ -460,11 +475,24 @@ def make_train(
     hidden: int = 128,
     num_bins: int = 255,
 ):
-    """Generate a jitted JAX DreamerV3 train function for discrete actions."""
+    """Generate a jitted JAX DreamerV3 train function for discrete actions.
+
+    :param env: Gymnax environment.
+    :param num_steps: Total number of environment steps.
+    :param num_envs: Number of parallel environments.
+    :param train_freq: Steps between training updates.
+    :param batch_size: Number of trajectory slices per training batch.
+    :param batch_length: Length of each trajectory slice.
+    :param imag_horizon: Imagination rollout length.
+    :param stoch: Number of stochastic state groups.
+    :param discrete: Categories per stochastic group.
+    :param deter: Deterministic state dimension.
+    :param hidden: Hidden layer width.
+    :param num_bins: Number of bins for TwoHot distributions.
+    """
     num_updates = num_steps // train_freq
     env = LogWrapper(env)
     bins = make_symexp_bins(num_bins)
-    disc = 1.0 - 1.0 / HORIZON
 
     obs_space = env.observation_space(env.default_params)
     if isinstance(obs_space, spaces.Discrete):
@@ -484,6 +512,7 @@ def make_train(
 
     def train(config: DynamicConfig) -> Tuple[dict, dict]:
         rng = config.rng
+        disc = 1.0 - 1.0 / config.horizon
         num_actions = env.action_space(config.env_params).n
 
         rng, model_rng = jax.random.split(rng)
@@ -500,7 +529,7 @@ def make_train(
         graphdef, params = nnx.split(model)
         slow_params = jax.tree_util.tree_map(jnp.copy, params)
 
-        warmup_fn = lambda step: jnp.minimum(step / WARMUP_STEPS, 1.0)
+        warmup_fn = lambda step: jnp.minimum(step / config.warmup_steps, 1.0)
         tx = optax.chain(
             optax.clip_by_global_norm(100.0),
             optax.scale_by_adam(b1=0.9, b2=0.999, eps=1e-8),
@@ -739,7 +768,7 @@ def make_train(
                     im_val,
                     im_val,
                     disc,
-                    LAMBDA,
+                    config.gae_lambda,
                 )
 
                 # Return EMA normalization
@@ -755,7 +784,7 @@ def make_train(
                 ent = pi.entropy()[..., None][:, :-1]
                 pol_loss = jnp.mean(
                     weight[:, :-1]
-                    * -(logpi * jax.lax.stop_gradient(adv) + ENTROPY_COEFF * ent)
+                    * -(logpi * jax.lax.stop_gradient(adv) + config.entropy_coeff * ent)
                 )
 
                 v_lg = m.critic(im_f_flat).reshape(BT, H1, num_bins)
@@ -786,7 +815,13 @@ def make_train(
                 rv_last = s_done.astype(jnp.float32)[..., None]
                 rv_term = s_done.astype(jnp.float32)[..., None]
                 rv_ret = lambda_return(
-                    rv_last, rv_term, s_rew[..., None], rv_val, rv_boot, disc, LAMBDA
+                    rv_last,
+                    rv_term,
+                    s_rew[..., None],
+                    rv_val,
+                    rv_boot,
+                    disc,
+                    config.gae_lambda,
                 )
                 rv_ret_pad = jnp.concatenate(
                     [rv_ret, jnp.zeros_like(rv_ret[:, -1:])], 1
@@ -809,7 +844,7 @@ def make_train(
                     + cont_loss
                     + pol_loss
                     + val_loss
-                    + REPVAL_SCALE * repval_loss
+                    + config.repval_scale * repval_loss
                 )
 
                 mets = {
@@ -835,7 +870,8 @@ def make_train(
             params = optax.apply_updates(params, updates)
 
             slow_params = jax.tree_util.tree_map(
-                lambda s, v: SLOW_TARGET_FRAC * v + (1 - SLOW_TARGET_FRAC) * s,
+                lambda s, v: config.slow_target_frac * v
+                + (1 - config.slow_target_frac) * s,
                 slow_params,
                 params,
             )
