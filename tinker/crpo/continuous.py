@@ -139,7 +139,8 @@ class DynamicConfig:
     :param entropy_coeff: Coefficient for entropy bonus.
     :param value_coeff: Coefficient for value loss.
     :param max_grad_norm: Maximum gradient norm for clipping.
-    :param ratio_clip: Clipping factor for PPO objective.
+    :param reward_ratio_clip: Clipping factor for PPO objective.
+    :param cost_ratio_clip: Clipping factor for PPO objective.
     """
 
     rng: jax.Array
@@ -152,7 +153,8 @@ class DynamicConfig:
     entropy_coeff: jax.Array
     value_coeff: jax.Array
     max_grad_norm: jax.Array
-    ratio_clip: jax.Array
+    reward_ratio_clip: jax.Array
+    cost_ratio_clip: jax.Array
 
 
 @struct.dataclass
@@ -364,7 +366,7 @@ def make_train(
                     # CALCULATE VALUE LOSS
                     value_pred_clipped = transitions.value + (
                         value - transitions.value
-                    ).clip(-config.ratio_clip, config.ratio_clip)
+                    ).clip(-config.reward_ratio_clip, config.reward_ratio_clip)
                     value_losses = jnp.square(value - value_targets)
                     value_losses_clipped = jnp.square(
                         value_pred_clipped - value_targets
@@ -379,8 +381,8 @@ def make_train(
                     loss_actor2 = (
                         jnp.clip(
                             ratio,
-                            1.0 - config.ratio_clip,
-                            1.0 + config.ratio_clip,
+                            1.0 - config.reward_ratio_clip,
+                            1.0 + config.reward_ratio_clip,
                         )
                         * reward_advantages
                     )
@@ -403,7 +405,7 @@ def make_train(
                     # CALCULATE VALUE LOSS
                     value_pred_clipped = transitions.cost_value + (
                         cost_value - transitions.cost_value
-                    ).clip(-config.ratio_clip, config.ratio_clip)
+                    ).clip(-config.cost_ratio_clip, config.cost_ratio_clip)
                     value_losses = jnp.square(cost_value - cost_value_targets)
                     value_losses_clipped = jnp.square(
                         value_pred_clipped - cost_value_targets
@@ -418,8 +420,8 @@ def make_train(
                     loss_actor2 = (
                         jnp.clip(
                             ratio,
-                            1.0 - config.ratio_clip,
-                            1.0 + config.ratio_clip,
+                            1.0 - config.cost_ratio_clip,
+                            1.0 + config.cost_ratio_clip,
                         )
                         * cost_advantages
                     )
@@ -608,7 +610,8 @@ if __name__ == "__main__":
         "GAMMA": 0.99,
         "COST_GAMMA": 0.999,
         "GAE_LAMBDA": 0.95,
-        "CLIP_EPS": 0.2,
+        "REWARD_CLIP_EPS": 0.2,
+        "COST_CLIP_EPS": 0.05,
         "ENT_COEF": 0.0075,
         "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5,
@@ -635,7 +638,8 @@ if __name__ == "__main__":
         entropy_coeff=jnp.ones(config["NUM_RUNS"]) * config["ENT_COEF"],
         value_coeff=jnp.ones(config["NUM_RUNS"]) * config["VF_COEF"],
         max_grad_norm=jnp.ones(config["NUM_RUNS"]) * config["MAX_GRAD_NORM"],
-        ratio_clip=jnp.ones(config["NUM_RUNS"]) * config["CLIP_EPS"],
+        reward_ratio_clip=jnp.ones(config["NUM_RUNS"]) * config["REWARD_CLIP_EPS"],
+        cost_ratio_clip=jnp.ones(config["NUM_RUNS"]) * config["COST_CLIP_EPS"],
         cost_limit=jnp.ones(config["NUM_RUNS"]) * config["COST_LIMIT"],
     )
 
